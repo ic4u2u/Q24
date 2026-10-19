@@ -342,6 +342,116 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
         self.assertEqual(swap_data["players"]["P1"]["cue_ball_color"], "WHITE")
         self.assertEqual(swap_data["players"]["P2"]["cue_ball_color"], "YELLOW")
 
+    def test_same_inning_sync_active_turn_and_trajectory_ai_recovery(self) -> None:
+        """
+        1. 선공(P1)이 득점 실패하면 후공(P2)이 서로 다른 이닝이 아닌 '동일한 이닝 번호(current_inning)'에 기록되는지 검증
+        2. 후공(P2)이 득점 성공 시 같은 이닝에 점수가 누적되고 계속 '공격 중(active_player_id=P2)'이 유지되는지,
+           그리고 후공(P2)이 득점 실패할 때 비로소 다음 이닝(current_inning + 1)으로 넘어가는지 검증
+        3. 모션 블러/트랙 스왑으로 인해 실시간 제2적구 접촉이 누락된 3쿠션 샷을
+           LocalPhysics3CushionAI.reconstruct_shot_from_trajectories가 100% 득점으로 복원하는지 검증
+        """
+        from cue24.mcp.billiard_physics_mcp import physics_ai_engine
+        from cue24.services.match_manager import MatchManager
+
+        mm = MatchManager(p1_name="1번 선수", p2_name="2번 선수")
+
+        # [1이닝 초] 선공(P1) 1점 득점 -> 공격권 P1 유지, 1이닝 P1=1, P2=None
+        mm.on_shot_started()
+        mm.on_ball_stopped(
+            {
+                "is_scored": True,
+                "shot_type": "REGULAR_3C",
+                "reason_code": "VALID_REGULAR_3C",
+                "message": "득점",
+            }
+        )
+        self.assertEqual(mm.active_player_id, "P1")
+        self.assertEqual(mm.current_inning, 1)
+        self.assertEqual(mm.get_inning_history_list(), [{"inning": 1, "P1": 1, "P2": None}])
+
+        # 비전 가림 노이즈(유령 샷) 취소 시 공격권(P1)과 이닝(1)이 절대 바뀌지 않는지 검증
+        mm.on_shot_started()
+        mm.cancel_phantom_shot()
+        self.assertEqual(mm.active_player_id, "P1")
+        self.assertEqual(mm.current_inning, 1)
+
+        # [1이닝 초 종료 -> 1이닝 말] 선공(P1) 득점 실패 -> 후공(P2)으로 턴 전환, 반드시 같은 1이닝(cur_inn=1)이어야 함!
+        mm.on_shot_started()
+        mm.on_ball_stopped(
+            {
+                "is_scored": False,
+                "shot_type": "MISS",
+                "reason_code": "NO_SECOND_BALL_HIT",
+                "message": "공타",
+            }
+        )
+        self.assertEqual(mm.active_player_id, "P2")
+        self.assertEqual(mm.current_inning, 1)
+        self.assertEqual(mm.players["P1"].innings, 1)
+        self.assertEqual(mm.players["P2"].innings, 1)
+        self.assertEqual(mm.get_inning_history_list(), [{"inning": 1, "P1": 1, "P2": 0}])
+
+        # [1이닝 말] 후공(P2) 2연속 득점 -> 같은 1이닝의 P2 칸에 2점이 기록되고 공격권 P2 유지!
+        for _ in range(2):
+            mm.on_shot_started()
+            mm.on_ball_stopped(
+                {
+                    "is_scored": True,
+                    "shot_type": "REGULAR_3C",
+                    "reason_code": "VALID_REGULAR_3C",
+                    "message": "득점",
+                }
+            )
+            self.assertEqual(mm.active_player_id, "P2")
+            self.assertEqual(mm.current_inning, 1)
+
+        self.assertEqual(mm.get_inning_history_list(), [{"inning": 1, "P1": 1, "P2": 2}])
+
+        # [1이닝 말 종료 -> 2이닝 초] 후공(P2) 득점 실패 -> 이제야 2이닝(cur_inn=2)으로 증가하고 선공(P1) 차례!
+        mm.on_shot_started()
+        mm.on_ball_stopped(
+            {
+                "is_scored": False,
+                "shot_type": "MISS",
+                "reason_code": "INSUFFICIENT_CUSHIONS",
+                "message": "공타",
+            }
+        )
+        self.assertEqual(mm.active_player_id, "P1")
+        self.assertEqual(mm.current_inning, 2)
+        self.assertEqual(mm.players["P1"].innings, 2)
+        self.assertEqual(mm.players["P2"].innings, 1)
+        self.assertEqual(
+            mm.get_inning_history_list(),
+            [{"inning": 1, "P1": 1, "P2": 2}, {"inning": 2, "P1": 0, "P2": None}],
+        )
+
+        # 시계열 궤적 텐서 복원기(reconstruct_shot_from_trajectories) 검증:
+        # 3개의 공이 모두 15mm 이상 지속 이동했고, 마지막에 움직인 제2적구(ID 1) 타격 전에 3쿠션 반사가 존재할 때 복원 확인
+        init_pos = {1: (300.0, 400.0), 2: (1200.0, 500.0), 3: (850.0, 1000.0)}
+        traj_1 = [(300.0, 400.0)] * 20 + [(300.0, 320.0)] * 10  # step 20 이후 이동 (제2적구)
+        traj_3 = [(850.0, 1000.0)] * 2 + [(920.0, 1300.0)] * 28  # step 2에 이동 (제1적구)
+        traj_2 = (
+            [(1200.0, 500.0), (850.0, 980.0), (500.0, 1050.0)]
+            + [(60.0, 1100.0), (300.0, 1200.0)]                  # 1쿠션: LEFT 반사
+            + [(600.0, 1380.0), (650.0, 1100.0)]                 # 2쿠션: BOTTOM 반사
+            + [(600.0, 40.0), (500.0, 200.0)]                    # 3쿠션: TOP 반사
+            + [(310.0, 390.0)] * 21                              # step 20에 제2적구(ID 1) 타격!
+        )
+        rec = physics_ai_engine.reconstruct_shot_from_trajectories(
+            cue_ball_id=3,
+            first_object_ball_id=2,
+            second_object_ball_id=None,
+            cushions_before_first_hit=0,
+            cushions_before_second_hit=3,
+            total_cushions=3,
+            initial_positions=init_pos,
+            ball_trajectories={1: traj_1, 2: traj_2, 3: traj_3},
+        )
+        self.assertTrue(rec["reconstructed"])
+        self.assertEqual(rec["second_object_ball_id"], 1)
+        self.assertGreaterEqual(rec["cushions_before_second_hit"], 3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -95,6 +95,7 @@ class ScoringEngine:
         self._prev_cue_vel: Optional[Point2D] = None
         self._prev_ball_positions: Dict[int, Point2D] = {}
         self._initial_ball_positions: Dict[int, Point2D] = {}
+        self._ball_trajectories: Dict[int, List[Point2D]] = {}
         self._target_first_move_frame: Dict[int, int] = {}
         self._last_rail_hit: Optional[str] = None
         self._last_cushion_frame: Dict[str, int] = {
@@ -295,6 +296,14 @@ class ScoringEngine:
             self._initial_ball_positions = {
                 bid: (float(pt[0]), float(pt[1])) for bid, pt in ball_positions.items()
             }
+            self._ball_trajectories = {
+                bid: [(float(pt[0]), float(pt[1]))] for bid, pt in ball_positions.items()
+            }
+        else:
+            for bid, pt in ball_positions.items():
+                if bid not in self._ball_trajectories:
+                    self._ball_trajectories[bid] = []
+                self._ball_trajectories[bid].append((float(pt[0]), float(pt[1])))
 
         cue_pos = ball_positions[self.cue_ball_id]
 
@@ -316,7 +325,20 @@ class ScoringEngine:
             )
 
         # 1. 4면 쿠션 법선 속도 부호 반전(Velocity Reversal) + 물리 충격량(Impulse) 판정
-        self._check_cushion_velocity_reversal(frame_idx, cue_pos, cue_vel)
+        triggered_rails = self._check_cushion_velocity_reversal(frame_idx, cue_pos, cue_vel)
+
+        # 수구의 허공 진행 각도 변화량(Deflection Angle) 계산 (쿠션 반사 프레임이 아닐 때)
+        cue_deflection_deg = 0.0
+        if not triggered_rails and self._prev_cue_vel is not None:
+            v1_norm = math.hypot(self._prev_cue_vel[0], self._prev_cue_vel[1])
+            v2_norm = math.hypot(cue_vel[0], cue_vel[1])
+            if v1_norm >= 3.0 and v2_norm >= 3.0:
+                cos_ang = (
+                    self._prev_cue_vel[0] * cue_vel[0]
+                    + self._prev_cue_vel[1] * cue_vel[1]
+                ) / (v1_norm * v2_norm)
+                cos_ang = max(-1.0, min(1.0, cos_ang))
+                cue_deflection_deg = math.degrees(math.acos(cos_ang))
 
         # 2. 목적구(제1적구, 제2적구) 충돌 판정 (수구 직접 접촉 + 스플라인 복원 + 적구 간 키스 분리 검증)
         spline_pts: List[Point2D] = []
@@ -360,7 +382,7 @@ class ScoringEngine:
             if bid in self._initial_ball_positions:
                 init_t = self._initial_ball_positions[bid]
                 curr_init_disp = math.hypot(pos[0] - init_t[0], pos[1] - init_t[1])
-                if curr_init_disp >= 20.0 and bid not in self._target_first_move_frame:
+                if curr_init_disp >= 18.0 and bid not in self._target_first_move_frame:
                     self._target_first_move_frame[bid] = frame_idx
 
                 prev_t = self._prev_ball_positions.get(bid, init_t)
@@ -377,6 +399,7 @@ class ScoringEngine:
                 other_object_to_target_dist_mm=other_obj_dist,
                 contact_threshold_mm=self.ball_contact_th,
                 is_first_object_hit_Done=(self.first_object_ball_id is not None),
+                cue_deflection_deg=cue_deflection_deg,
             )
 
             if is_direct_hit:
@@ -394,7 +417,7 @@ class ScoringEngine:
 
     def evaluate_shot(self, has_double_touch_foul: bool = False) -> Dict[str, object]:
         """
-        샷이 완전히 정지한 후 기록된 물리 이벤트 시퀀스를 기반으로
+        샷이 완전히 정지한 후 기록된 물리 이벤트 시퀀스 및 전체 시계열 궤적 텐서를 기반으로
         로컬 물리/AI 3쿠션 검증 엔진(LocalPhysics3CushionAI)을 통해 최종 3쿠션 룰을 평가합니다.
 
         - 일반 3C: 1적구 충돌 -> (2적구 충돌 전 총 쿠션 접촉 >= 3회) -> 2적구 충돌 성립 시에만 득점 인정
@@ -402,6 +425,32 @@ class ScoringEngine:
         - 그 외: 2쿠션 이하에서 제2적구를 맞혔거나 제2적구를 맞히지 못한 경우 엄격히 공타(MISS) 처리
         """
         from cue24.mcp.billiard_physics_mcp import physics_ai_engine
+
+        # 시계열 궤적 텐서 역추적을 통해 모션 블러/충돌 직후 트랙 스왑으로 누락된 실제 3쿠션 타격을 복원
+        reconstructed = physics_ai_engine.reconstruct_shot_from_trajectories(
+            cue_ball_id=self.cue_ball_id,
+            first_object_ball_id=self.first_object_ball_id,
+            second_object_ball_id=self.second_object_ball_id,
+            cushions_before_first_hit=self.cushion_count_before_first_hit,
+            cushions_before_second_hit=self.cushion_count_before_second_hit,
+            total_cushions=self.total_cushion_count,
+            initial_positions=self._initial_ball_positions,
+            ball_trajectories=self._ball_trajectories,
+            left_bound=self.left_bound,
+            right_bound=self.right_bound,
+            top_bound=self.top_bound,
+            bottom_bound=self.bottom_bound,
+        )
+        if bool(reconstructed.get("reconstructed", False)):
+            self.first_object_ball_id = reconstructed["first_object_ball_id"]
+            self.second_object_ball_id = reconstructed["second_object_ball_id"]
+            self.cushion_count_before_first_hit = int(
+                reconstructed["cushions_before_first_hit"]
+            )
+            self.cushion_count_before_second_hit = int(
+                reconstructed["cushions_before_second_hit"]
+            )
+            self.total_cushion_count = int(reconstructed["total_cushions"])
 
         verified = physics_ai_engine.verify_3cushion_shot(
             first_object_ball_id=self.first_object_ball_id,

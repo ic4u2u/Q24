@@ -115,8 +115,8 @@ class LiveStreamReader:
     VISION_START_DISP_MM: float = 14.0
     MOTION_BLUR_CIRC_TH: float = 0.42
     # 테스트 녹화 영상(L-billiard.mp4)에서 경기 초기화/화면 리플레시 즉시 3구 색상 잠금 ->
-    # 약 0.5초 후 수구가 출발하여 연속 득점과 공타가 이어지는 하이라이트 타구 준비 프레임
-    ACTIVE_SHOT_START_FRAME: int = 6325
+    # 선공 첫 샷 3쿠션 득점 성공(공격 중 유지) -> 다음 샷 공타(같은 1이닝 후공 전환) -> 후공 연속 득점이 이어지는 프레임
+    ACTIVE_SHOT_START_FRAME: int = 7915
 
     def __init__(
         self,
@@ -580,25 +580,36 @@ class LiveStreamReader:
         elif self.tracker.balls and len(self.tracker.balls) == 3:
             detected_pts = [(float(c["x"]), float(c["y"])) for c in strict_candidates]
             remaining_ids = set(self.tracker.balls.keys())
+            unassigned_pts = list(detected_pts)
             pts = list(detected_pts)
 
-            for pt in detected_pts:
-                if not remaining_ids:
+            # 정지해 있는 목적구가 자신의 트랙 ID를 뺏기지 않도록 모든 (검출점, 트랙ID) 쌍 중 최단 거리부터 우선 매칭
+            while unassigned_pts and remaining_ids:
+                best_pair: Optional[Tuple[int, int]] = None
+                best_dist = float("inf")
+                for pt_idx, pt in enumerate(unassigned_pts):
+                    for bid in remaining_ids:
+                        d = math.hypot(
+                            pt[0] - float(self.tracker.balls[bid].position[0]),
+                            pt[1] - float(self.tracker.balls[bid].position[1]),
+                        )
+                        if d < best_dist:
+                            best_dist = d
+                            best_pair = (pt_idx, bid)
+                if best_pair is None:
                     break
-                nearest_id = min(
-                    remaining_ids,
-                    key=lambda bid: math.hypot(
-                        pt[0] - float(self.tracker.balls[bid].position[0]),
-                        pt[1] - float(self.tracker.balls[bid].position[1]),
-                    ),
-                )
-                remaining_ids.remove(nearest_id)
-                self._missing_streak_by_id[nearest_id] = 0
+                pt_idx, matched_bid = best_pair
+                unassigned_pts.pop(pt_idx)
+                remaining_ids.remove(matched_bid)
+                self._missing_streak_by_id[matched_bid] = 0
 
             search_radius = (
-                320.0
-                if self.match_manager.fsm_state == MatchState.WAIT_SHOT
-                else 220.0
+                620.0
+                if (
+                    self.match_manager.fsm_state == MatchState.WAIT_SHOT
+                    or len(self._cue_trajectory) <= 12
+                )
+                else 260.0
             )
             for missing_id in sorted(remaining_ids):
                 st = self.tracker.balls[missing_id]
@@ -897,19 +908,13 @@ class LiveStreamReader:
                 self.color_locker.set_shot_lock(True)
                 self.bulletproof_tracker.is_shot_in_progress = True
 
-                # [절대 원칙] 선공(P1=WHITE)과 후공(P2=YELLOW)의 수구 색상은 절대로 바꾸지 않음!
-                # 실제 카메라/영상 스트림(require_rest_displacement=True)에서 만약 흰공이 출발하면 P1 턴,
-                # 노란공이 단독 출발하면 P2 턴으로 공격권만 일치시키고 공 색깔은 절대 스왑하지 않습니다.
+                # [절대 원칙] 선공(P1=WHITE)과 후공(P2=YELLOW)의 수구 색상은 절대로 바꾸지 않으며,
+                # 공격권(active_player_id) 역시 비전 조명 노이즈로 임의 변경하지 않고 공식 경기 규칙(득점 시 유지, 공타 시 전환)을 따릅니다.
                 self.match_manager.players["P1"].cue_ball_color = "WHITE"
                 self.match_manager.players["P2"].cue_ball_color = "YELLOW"
-                if require_rest_displacement and cue_state.color in ("WHITE", "YELLOW"):
-                    owner_pid = "P1" if cue_state.color == "WHITE" else "P2"
-                    if self.match_manager.active_player_id != owner_pid:
-                        self.match_manager.active_player_id = owner_pid
-                        owner_player = self.match_manager.players[owner_pid]
-                        if owner_player.innings <= 0:
-                            owner_player.innings = 1
-                            owner_player.inning_scores[1] = 0
+                self.match_manager.sync_active_player_to_current_inning(
+                    self.match_manager.active_player_id
+                )
 
                 # 수구가 움직였으므로 샷 클락(카운트) 작동을 즉시 멈추고 득점 알고리즘 가동
                 self.match_manager.on_shot_started()
@@ -919,10 +924,15 @@ class LiveStreamReader:
                 self.scoring_engine.reset_shot(
                     cue_ball_id=cue_id, object_ball_ids=obj_ids
                 )
-                # 샷 출발 전 정지 기준점(_rest_positions)이 존재하면 득점 엔진 초기 위치로 보존
+                # 샷 출발 전 정지 기준점(_rest_positions)이 존재하면 득점 엔진 초기 위치 및 시계열 궤적 시작점으로 보존
                 if self._rest_positions and len(self._rest_positions) == 3:
                     self.scoring_engine._initial_ball_positions = {
                         bid: self._rest_positions[bid]
+                        for bid in ball_states.keys()
+                        if bid in self._rest_positions
+                    }
+                    self.scoring_engine._ball_trajectories = {
+                        bid: [self._rest_positions[bid]]
                         for bid in ball_states.keys()
                         if bid in self._rest_positions
                     }
@@ -941,7 +951,8 @@ class LiveStreamReader:
                     ]
                     for bid in obj_ids
                 }
-                cue_ko = COLOR_KO_LABELS.get(cue_state.color, cue_state.color)
+                active_cue_color = self.match_manager.active_cue_ball_color
+                cue_ko = COLOR_KO_LABELS.get(active_cue_color, active_cue_color)
                 self.match_manager.last_shot_result = {
                     "is_scored": False,
                     "points_awarded": 0,
@@ -1028,6 +1039,41 @@ class LiveStreamReader:
                 shot_eval = self.scoring_engine.evaluate_shot(
                     has_double_touch_foul=has_double_touch_foul
                 )
+
+                # [유령 샷(Phantom Trigger) 필터]
+                # 실제 카메라/영상 스트림(require_rest_displacement=True)에서 선수가 당구대 옆을 지나가거나
+                # 큐대 그림자 가림으로 인해 공이 제자리에서 잠깐 흔들렸다가 아무 목적구도 맞히지 않고 멈춘 경우,
+                # 공격권(턴)이나 이닝을 절대 변경하지 않고 기존 선수의 '공격 중' 상태를 그대로 복원합니다!
+                if require_rest_displacement and not bool(shot_eval.get("is_scored", False)):
+                    init_map = self.scoring_engine._initial_ball_positions
+                    max_net_disp = 0.0
+                    for bid, st in ball_states.items():
+                        if bid in init_map:
+                            d_net = math.hypot(
+                                float(st.position[0]) - init_map[bid][0],
+                                float(st.position[1]) - init_map[bid][1],
+                            )
+                            if d_net > max_net_disp:
+                                max_net_disp = d_net
+
+                    is_phantom_occlusion = (
+                        max_net_disp < 38.0
+                        or (
+                            self.scoring_engine.first_object_ball_id is None
+                            and self.scoring_engine.cue_travel_distance_mm < 550.0
+                        )
+                    )
+                    if is_phantom_occlusion:
+                        self._rest_positions = {
+                            bid: (float(st.position[0]), float(st.position[1]))
+                            for bid, st in ball_states.items()
+                        }
+                        restored_payload = self.match_manager.cancel_phantom_shot()
+                        await self.ws_manager.broadcast_event(
+                            "SCORE_UPDATED", restored_payload
+                        )
+                        return None
+
                 transition = self.match_manager.on_ball_stopped(shot_eval)
 
                 self.match_manager.players["P1"].cue_ball_color = "WHITE"
