@@ -31,7 +31,7 @@ class TestStep6FrontendAndMain(unittest.IsolatedAsyncioTestCase):
         html = index_path.read_text(encoding="utf-8")
         self.assertIn("CUE24 HAWK-EYE VAR", html)
         self.assertIn("/ws/scoreboard", html)
-        self.assertIn("CUSHIONS:", html)
+        self.assertNotIn("cushion-counter-box", html)
         self.assertIn("PLAYER 1", html)
         self.assertIn("PLAYER 2", html)
 

@@ -113,9 +113,9 @@ class LiveStreamReader:
     VISION_START_SPEED_TH: float = 4.5
     VISION_START_DISP_MM: float = 14.0
     MOTION_BLUR_CIRC_TH: float = 0.42
-    # 테스트 녹화 영상(L-billiard.mp4)에서 초반 20초 대기 구간을 건너뛰고
-    # 경기 초기화/화면 리플레시 즉시 3구 색상 잠금 -> 샷 클락 작동 -> 약 1.1초 후 수구 출발이 시작되는 준비 프레임
-    ACTIVE_SHOT_START_FRAME: int = 620
+    # 테스트 녹화 영상(L-billiard.mp4)에서 경기 초기화/화면 리플레시 즉시 3구 색상 잠금 ->
+    # 약 0.5초 후 수구가 출발하여 연속 득점과 공타가 이어지는 하이라이트 타구 준비 프레임
+    ACTIVE_SHOT_START_FRAME: int = 6325
 
     def __init__(
         self,
@@ -156,6 +156,8 @@ class LiveStreamReader:
         self._morph_kernel: np.ndarray = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._vision_tracks_synced: bool = False
         self._rest_positions: Dict[int, Point2D] = {}
+        self._missing_streak_by_id: Dict[int, int] = {}
+        self._last_missing_wait_id: Optional[int] = None
         self.detected_ball_colors: Dict[int, str] = {
             1: "WHITE",
             2: "YELLOW",
@@ -339,12 +341,14 @@ class LiveStreamReader:
         self.color_locker.set_shot_lock(False)
         self.bulletproof_tracker.is_shot_in_progress = False
         self.spin_detector.reset()
+        self._missing_streak_by_id.clear()
+        self._last_missing_wait_id = None
         self._reset_wall_clock_sync()
 
         if self.is_real_video_loaded and self._video_cap is not None:
             if self.camera_index is None:
                 cur_pos = int(self._video_cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                if seek_to_active_shot or cur_pos < 580 or cur_pos > 1600:
+                if seek_to_active_shot or cur_pos < 580:
                     self._video_cap.set(
                         cv2.CAP_PROP_POS_FRAMES, self.ACTIVE_SHOT_START_FRAME
                     )
@@ -568,6 +572,7 @@ class LiveStreamReader:
 
         # [2단계 & 4단계] 주행 중 모션 블러 구출 및 칼만 필터 예측 위치 복원
         if len(strict_candidates) == 3:
+            self._missing_streak_by_id.clear()
             pts: List[Point2D] = [
                 (float(c["x"]), float(c["y"])) for c in strict_candidates
             ]
@@ -587,21 +592,32 @@ class LiveStreamReader:
                     ),
                 )
                 remaining_ids.remove(nearest_id)
+                self._missing_streak_by_id[nearest_id] = 0
 
+            search_radius = (
+                320.0
+                if self.match_manager.fsm_state == MatchState.WAIT_SHOT
+                else 220.0
+            )
             for missing_id in sorted(remaining_ids):
                 st = self.tracker.balls[missing_id]
-                kalman_pt = st.predict_kalman_position()
-                # 주행 중이면 칼만 예측 위치 반경 160mm 이내의 모션 블러 타원 후보를 우선 구출
-                rescued_pt: Optional[Point2D] = None
+                self._missing_streak_by_id[missing_id] = (
+                    self._missing_streak_by_id.get(missing_id, 0) + 1
+                )
                 if (
-                    self.match_manager.fsm_state == MatchState.SHOT_IN_PROGRESS
-                    and blur_candidates
+                    self.match_manager.fsm_state == MatchState.WAIT_SHOT
+                    and st.color in ("WHITE", "YELLOW")
                 ):
+                    self._last_missing_wait_id = missing_id
+
+                kalman_pt = st.predict_kalman_position()
+                rescued_pt: Optional[Point2D] = None
+                if blur_candidates:
                     near_blurs = [
                         bc
                         for bc in blur_candidates
                         if math.hypot(bc["x"] - kalman_pt[0], bc["y"] - kalman_pt[1])
-                        <= 160.0
+                        <= search_radius
                         and all(
                             math.hypot(bc["x"] - ep[0], bc["y"] - ep[1]) >= 45.0
                             for ep in pts
@@ -839,6 +855,27 @@ class LiveStreamReader:
                 moving_candidates.sort(reverse=True)
                 first_moving_id = moving_candidates[0][1]
 
+                # 만약 초고속 타구 블러로 인해 정지 위치에서 먼저 사라졌던 수구(_last_missing_wait_id)가 있거나
+                # 피격된 적구(RED)가 먼저 감지된 경우 진짜 수구(WHITE/YELLOW)로 바로잡음
+                if (
+                    require_rest_displacement
+                    and self._last_missing_wait_id is not None
+                    and self._last_missing_wait_id in ball_states
+                    and ball_states[self._last_missing_wait_id].color in ("WHITE", "YELLOW")
+                ):
+                    first_moving_id = self._last_missing_wait_id
+                elif ball_states[first_moving_id].color == "RED":
+                    active_color = self.match_manager.active_cue_ball_color
+                    for bid, st in ball_states.items():
+                        if st.color == active_color:
+                            first_moving_id = bid
+                            break
+                    else:
+                        for bid, st in ball_states.items():
+                            if st.color in ("WHITE", "YELLOW"):
+                                first_moving_id = bid
+                                break
+
                 # 처음 움직이는 공을 이번 샷의 수구(Cue Ball)로 영구 고정!
                 self.tracker.cue_ball_id = first_moving_id
                 cue_id = first_moving_id
@@ -861,6 +898,13 @@ class LiveStreamReader:
                 self.scoring_engine.reset_shot(
                     cue_ball_id=cue_id, object_ball_ids=obj_ids
                 )
+                # 샷 출발 전 정지 기준점(_rest_positions)이 존재하면 득점 엔진 초기 위치로 보존
+                if self._rest_positions and len(self._rest_positions) == 3:
+                    self.scoring_engine._initial_positions = {
+                        bid: self._rest_positions[bid]
+                        for bid in ball_states.keys()
+                        if bid in self._rest_positions
+                    }
                 self._cue_trajectory = [
                     (
                         float(cue_state.prev_position[0]),
@@ -953,6 +997,8 @@ class LiveStreamReader:
             if bool(spin_status["is_fully_stopped"]):
                 self.color_locker.set_shot_lock(False)
                 self.bulletproof_tracker.is_shot_in_progress = False
+                self._missing_streak_by_id.clear()
+                self._last_missing_wait_id = None
 
                 shot_eval = self.scoring_engine.evaluate_shot(
                     has_double_touch_foul=has_double_touch_foul
@@ -1204,29 +1250,15 @@ async def stream_live_video() -> StreamingResponse:
 
 async def _mjpeg_replay_generator(speed: float = 1.0) -> AsyncGenerator[bytes, None]:
     """
-    3공 정지 후 확정된 직전 샷 클립(원본 해상도)을 지정된 배속(1.0x / 0.5x / 0.25x)으로 정확히 재생하며,
-    동시에 카메라의 다음 샷(수구 출발)을 감시하여 수구가 움직이면 즉시 LIVE 및 득점 판독으로 전환합니다.
+    3공 정지 후 확정된 직전 샷 클립(원본 해상도)을 지정된 배속(1.0x / 0.5x / 0.25x)으로 **단 1회만** 재생하며,
+    1회 재생 완료 시(또는 도중 다음 샷 출발 시) 즉시 LIVE 화면 및 실시간 득점 판독으로 자동 복귀합니다.
     """
     fps = max(15.0, min(60.0, stream_reader.video_fps))
     base_interval = 1.0 / fps
     target_interval = max(0.015, min(0.35, base_interval / max(0.25, speed)))
 
-    while True:
-        clip = stream_reader.replay_buffer.get_locked_clip()
-        if not clip:
-            t0 = time.perf_counter()
-            jpg = await stream_reader.read_and_process_live_frame()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-            )
-            rem = base_interval - (time.perf_counter() - t0)
-            if rem > 0.002:
-                await asyncio.sleep(rem)
-            else:
-                await asyncio.sleep(0)
-            continue
-
+    clip = stream_reader.replay_buffer.get_locked_clip()
+    if clip:
         for jpg in clip:
             t0 = time.perf_counter()
             # 리플레이 재생 중에도 실시간 카메라 프레임을 감시하여 수구 출발 시 즉시 SHOT_IN_PROGRESS로 전환
@@ -1243,12 +1275,35 @@ async def _mjpeg_replay_generator(speed: float = 1.0) -> AsyncGenerator[bytes, N
                 await asyncio.sleep(rem)
             else:
                 await asyncio.sleep(0)
-        await asyncio.sleep(0.25)
+
+        # 직전 샷 리플레이 1회 재생 완료 즉시 클라이언트에 실시간 복귀 신호 브로드캐스트
+        meta = stream_reader.replay_buffer.get_last_shot_meta()
+        await stream_reader.ws_manager.broadcast_event(
+            "REPLAY_FINISHED",
+            {
+                "clip_id": meta.get("clip_id", 0),
+                "frame_count": len(clip),
+            },
+        )
+
+    # 1회 재생 완료 후(또는 클립이 없을 때)에는 반복 재생 없이 실시간 LIVE 프레임을 송출
+    while True:
+        t0 = time.perf_counter()
+        jpg = await stream_reader.read_and_process_live_frame()
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+        )
+        rem = base_interval - (time.perf_counter() - t0)
+        if rem > 0.002:
+            await asyncio.sleep(rem)
+        else:
+            await asyncio.sleep(0)
 
 
 @app.get("/api/video/replay")
 async def stream_replay_video(speed: float = 1.0) -> StreamingResponse:
-    """3공 완전 정지 시 직전 샷을 자동으로 반복 보여주는 MJPEG 리플레이 엔드포인트"""
+    """3공 완전 정지 시 직전 샷을 딱 1번만 보여주는 MJPEG 리플레이 엔드포인트"""
     return StreamingResponse(
         _mjpeg_replay_generator(speed=speed),
         media_type="multipart/x-mixed-replace; boundary=frame",

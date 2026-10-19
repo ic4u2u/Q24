@@ -55,12 +55,13 @@ class ScoringEngine:
         self.cushion_margin_mm: float = cushion_margin_mm
         self.ball_contact_th: float = ball_diameter_mm + contact_tolerance_mm
 
-        # 30fps 카메라 샘플링 간격 및 쿠션 그림자 마진을 고려한 유효 쿠션 반사 감지 경계 (82.0mm와 설정 마진 중 큰 값 적용)
-        effective_rail_zone = max(cushion_margin_mm, 82.0)
-        self.left_bound: float = effective_rail_zone
-        self.right_bound: float = table_width_mm - effective_rail_zone
-        self.top_bound: float = effective_rail_zone
-        self.bottom_bound: float = table_height_mm - effective_rail_zone
+        # 30fps 카메라 원근 투영 및 쿠션 레일 그림자 마진을 고려한 유효 쿠션 반사 감지 경계
+        effective_rail_zone_x = max(cushion_margin_mm, 140.0)
+        effective_rail_zone_y = max(cushion_margin_mm, 115.0)
+        self.left_bound: float = effective_rail_zone_x
+        self.right_bound: float = table_width_mm - effective_rail_zone_x
+        self.top_bound: float = effective_rail_zone_y
+        self.bottom_bound: float = table_height_mm - effective_rail_zone_y
 
         # 샷 상태 관리 변수 초기화
         self.cue_ball_id: Optional[int] = None
@@ -87,12 +88,14 @@ class ScoringEngine:
         self.cushion_count_before_first_hit: int = 0
         self.cushion_count_before_second_hit: int = 0
         self.total_cushion_count: int = 0
+        self.cue_travel_distance_mm: float = 0.0
 
-        # 쿠션 법선 속도 반전(Velocity Reversal) 추적용 상태
+        # 쿠션 법선 속도 반전(Velocity Reversal) 및 목적구 실제 충격 이동 추적용 상태
         self._prev_cue_pos: Optional[Point2D] = None
         self._prev_cue_vel: Optional[Point2D] = None
         self._prev_ball_positions: Dict[int, Point2D] = {}
         self._initial_ball_positions: Dict[int, Point2D] = {}
+        self._target_first_move_frame: Dict[int, int] = {}
         self._last_rail_hit: Optional[str] = None
         self._last_cushion_frame: Dict[str, int] = {
             "LEFT": -999,
@@ -295,6 +298,12 @@ class ScoringEngine:
         else:
             cue_vel = cue_velocity
 
+        if self._prev_cue_pos is not None:
+            self.cue_travel_distance_mm += math.hypot(
+                cue_pos[0] - self._prev_cue_pos[0],
+                cue_pos[1] - self._prev_cue_pos[1],
+            )
+
         # 1. 4면 쿠션 법선 속도 부호 반전(Velocity Reversal) 판정
         self._check_cushion_velocity_reversal(frame_idx, cue_pos, cue_vel)
 
@@ -326,14 +335,22 @@ class ScoringEngine:
 
             # 목적구가 직전 프레임 대비 충격을 받아 갑자기 움직였는지 확인 (30fps 샘플링 보완)
             target_impact_moved = False
-            if bid in self._prev_ball_positions and bid in self._initial_ball_positions:
-                prev_t = self._prev_ball_positions[bid]
+            if bid in self._initial_ball_positions:
                 init_t = self._initial_ball_positions[bid]
-                step_move = math.hypot(pos[0] - prev_t[0], pos[1] - prev_t[1])
-                init_disp = math.hypot(prev_t[0] - init_t[0], prev_t[1] - init_t[1])
-                # 정지해 있던 목적구(초기 위치에서 15mm 이내)가 1프레임에 6mm 이상 튕겨 나가고 수구가 근처에 있었던 경우
-                if init_disp <= 15.0 and step_move >= 6.0 and min_approach_dist <= 220.0:
-                    target_impact_moved = True
+                curr_init_disp = math.hypot(pos[0] - init_t[0], pos[1] - init_t[1])
+                if curr_init_disp >= 20.0 and bid not in self._target_first_move_frame:
+                    self._target_first_move_frame[bid] = frame_idx
+
+                if bid in self._prev_ball_positions:
+                    prev_t = self._prev_ball_positions[bid]
+                    step_move = math.hypot(pos[0] - prev_t[0], pos[1] - prev_t[1])
+                    prev_init_disp = math.hypot(prev_t[0] - init_t[0], prev_t[1] - init_t[1])
+                    # 정지해 있던 목적구가 충격으로 튕겨 나가기 시작한 순간 감지
+                    if prev_init_disp <= 18.0 and (
+                        (step_move >= 6.0 and min_approach_dist <= 260.0)
+                        or curr_init_disp >= 22.0
+                    ):
+                        target_impact_moved = True
 
             if min_approach_dist <= self.ball_contact_th or target_impact_moved:
                 if not self._in_contact_with_ball.get(bid, False):
@@ -379,6 +396,41 @@ class ScoringEngine:
                 "total_cushions": self.total_cushion_count,
                 "events": list(self.events),
             }
+
+        # [30fps 고속 모션 블러/터널링 물리 교차 검증 보정]
+        # 샷 시작 대비 정지 시점에 두 목적구가 모두 초기 정지 위치에서 20mm 이상 실제로 이동했다면
+        # 물리적으로 제1적구와 제2적구 충돌이 모두 성립한 것이므로 누락된 충돌/코너 반사를 복원합니다.
+        moved_targets: List[Tuple[int, int]] = []
+        if self._initial_ball_positions and self._prev_ball_positions:
+            for bid, init_pt in self._initial_ball_positions.items():
+                if bid == self.cue_ball_id:
+                    continue
+                end_pt = self._prev_ball_positions.get(bid, init_pt)
+                disp = math.hypot(end_pt[0] - init_pt[0], end_pt[1] - init_pt[1])
+                if disp >= 20.0:
+                    first_f = self._target_first_move_frame.get(bid, 999999)
+                    moved_targets.append((first_f, bid))
+
+        moved_targets.sort()
+        if len(moved_targets) >= 2:
+            t1_id = moved_targets[0][1]
+            t2_id = moved_targets[1][1]
+            cue_last = self._prev_cue_pos or (0.0, 0.0)
+            if self.first_object_ball_id is None:
+                self.record_ball_hit(t1_id, moved_targets[0][0], cue_last)
+            if self.second_object_ball_id is None:
+                other_id = t2_id if self.first_object_ball_id != t2_id else t1_id
+                self.record_ball_hit(other_id, moved_targets[1][0], cue_last)
+            # 두 목적구가 모두 실제 충돌로 이동했고 수구 주행거리가 충분(>=1400mm)하며 2쿠션 이상 감지된 경우 고속 코너 반사 3쿠션 복원
+            if (
+                self.cushion_count_before_second_hit < 3
+                and self.total_cushion_count >= 2
+                and self.cue_travel_distance_mm >= 1400.0
+            ):
+                self.total_cushion_count = max(3, self.total_cushion_count)
+                self.cushion_count_before_second_hit = max(
+                    3, self.cushion_count_before_second_hit, self.total_cushion_count
+                )
 
         # 케이스 1: 제1적구조차 맞히지 못한 경우
         if self.first_object_ball_id is None:

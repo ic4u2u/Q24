@@ -205,14 +205,17 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
         self.assertAlmostEqual(spline_pts[-1][0], 200.0, places=3)
         self.assertAlmostEqual(spline_pts[-1][1], 120.0, places=3)
 
-        # 화면 UI 한글화 요소 검증
+        # 화면 UI 한글화 요소 및 실시간 쿠션 수 삭제 / 1회 리플레이 복귀 검증
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         self.assertIn("스마트 3쿠션 디지털 점수판", html)
         self.assertIn("1번 선수", html)
         self.assertIn("2번 선수", html)
         self.assertIn("애버리지", html)
         self.assertIn("하이런 (연속득점)", html)
-        self.assertIn("실시간 쿠션 수:", html)
+        self.assertNotIn("실시간 쿠션 수:", html)
+        self.assertNotIn("cushion-counter-box", html)
+        self.assertIn("REPLAY_FINISHED", html)
+        self.assertIn("replayOneShotTimerId", html)
         self.assertIn("이닝별 득점 기록표", html)
         self.assertIn("작전타임 (+40초)", html)
 
