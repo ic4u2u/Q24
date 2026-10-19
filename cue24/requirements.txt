@@ -1,0 +1,8 @@
+# CUE24 대대 3쿠션 무인 관제 및 자동 판독 SaaS 필수 의존성 패키지
+opencv-python>=4.8.0
+numpy>=1.24.0
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+websockets>=11.0
+pydantic>=2.0.0
+torch>=2.0.0
