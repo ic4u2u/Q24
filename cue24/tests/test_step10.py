@@ -289,6 +289,59 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
         self.assertTrue(score_check["is_scored"])
         self.assertEqual(score_check["shot_type"], "REGULAR_3C")
 
+    def test_match_elapsed_timer_30_innings_shift_and_player_swap(self) -> None:
+        """
+        1. 중앙 상단 누적 경기 타이머(match_timer.elapsed_sec, formatted, matchElapsedDigits) 증가 및 리셋 검증
+        2. 하단 이닝별 득점 기록표 30이닝 표시(VISIBLE_INNINGS = 30) 및 30이닝 초과 시 좌측 쉬프트 로직 검증
+        3. 1번 선수/2번 선수 이름 변경(/api/match/player-name) 및 자리바꿈(/api/match/swap-players) 시
+           선공(P1)=흰공(WHITE), 후공(P2)=노란공(YELLOW) 수구 색상이 절대 바뀌지 않는지 검증
+        """
+        from fastapi.testclient import TestClient
+        from cue24.api.server import STATIC_DIR, app
+        from cue24.services.match_manager import MatchManager
+
+        # 1) HTML 내 중앙 상단 누적 타이머, 30이닝 쉬프트, 선수 변경 모달 및 자리바꿈 요소 검증
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="matchElapsedTimerBox"', html)
+        self.assertIn('id="matchElapsedDigits"', html)
+        self.assertIn("VISIBLE_INNINGS = 30", html)
+        self.assertIn("maxInning > VISIBLE_INNINGS ? maxInning - VISIBLE_INNINGS + 1 : 1", html)
+        self.assertIn("openPlayerNameModal", html)
+        self.assertIn("swapPlayerSeats", html)
+
+        # 2) MatchManager 누적 타이머 및 32이닝 진행 시 이닝 기록 검증
+        mm = MatchManager(p1_name="홍길동", p2_name="이순신")
+        self.assertEqual(mm.formatted_match_time, "00:00:00")
+        mm.tick_timer(65.0)
+        self.assertEqual(mm.formatted_match_time, "00:01:05")
+
+        # 3) REST API를 통한 선수 이름 변경 및 자리바꿈 검증
+        client = TestClient(app)
+        client.post("/api/match/reset")
+
+        r1 = client.post(
+            "/api/match/player-name",
+            json={"player_id": "P1", "name": "조재호"},
+        )
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r1.json()["players"]["P1"]["name"], "조재호")
+
+        r2 = client.post(
+            "/api/match/player-name",
+            json={"player_id": "P2", "name": "쿠드롱"},
+        )
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.json()["players"]["P2"]["name"], "쿠드롱")
+
+        # 자리바꿈 수행 -> P1은 '쿠드롱'(흰공 WHITE), P2는 '조재호'(노란공 YELLOW)가 되어야 함
+        swap_resp = client.post("/api/match/swap-players")
+        self.assertEqual(swap_resp.status_code, 200)
+        swap_data = swap_resp.json()
+        self.assertEqual(swap_data["players"]["P1"]["name"], "쿠드롱")
+        self.assertEqual(swap_data["players"]["P2"]["name"], "조재호")
+        self.assertEqual(swap_data["players"]["P1"]["cue_ball_color"], "WHITE")
+        self.assertEqual(swap_data["players"]["P2"]["cue_ball_color"], "YELLOW")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

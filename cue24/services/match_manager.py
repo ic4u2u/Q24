@@ -289,22 +289,75 @@ class MatchManager:
         p1.cue_ball_color, p2.cue_ball_color = p2.cue_ball_color, p1.cue_ball_color
         return self.get_match_payload()
 
+    def sync_active_player_to_current_inning(self, target_player_id: str) -> None:
+        """
+        현재 통합 이닝(self.current_inning)을 기준으로 공격권이 부여된 선수의 이닝 번호와
+        이닝 기록표(inning_scores) 슬롯을 어긋남 없이 동기화합니다.
+        - P1(선공) 공격 시: current_inning의 P1 슬롯 보장
+        - P2(후공) 공격 시: 같은 current_inning에서 P1 슬롯과 P2 슬롯이 모두 존재하도록 보장
+        """
+        self.current_inning = max(1, self.current_inning)
+        p1 = self.players["P1"]
+        p2 = self.players["P2"]
+
+        if target_player_id == "P1":
+            self.active_player_id = "P1"
+            p1.innings = self.current_inning
+            if self.current_inning not in p1.inning_scores:
+                p1.inning_scores[self.current_inning] = 0
+        else:
+            self.active_player_id = "P2"
+            p1.innings = max(p1.innings, self.current_inning)
+            if self.current_inning not in p1.inning_scores:
+                p1.inning_scores[self.current_inning] = 0
+            p2.innings = self.current_inning
+            if self.current_inning not in p2.inning_scores:
+                p2.inning_scores[self.current_inning] = 0
+
+    def cancel_phantom_shot(self) -> Dict[str, object]:
+        """
+        카메라 조명 반사나 선수 손/큐대 가림으로 인해 실제 타구가 아닌 미세 흔들림이 감지되었을 때,
+        공격권(active_player_id)이나 이닝 번호를 절대 변경하지 않고 기존 공격 선수의 '공격 중' 상태를 그대로 복원합니다.
+        """
+        self.fsm_state = MatchState.WAIT_SHOT
+        self.is_timer_paused = False
+        self.players["P1"].cue_ball_color = "WHITE"
+        self.players["P2"].cue_ball_color = "YELLOW"
+        self.sync_active_player_to_current_inning(self.active_player_id)
+        return self.get_match_payload()
+
     def force_switch_turn(self) -> Dict[str, object]:
-        """수동으로 공격 턴을 상대방에게 넘기고 타이머를 40초로 리셋합니다."""
-        current_player = self.players[self.active_player_id]
+        """
+        수동으로 공격 턴을 상대방에게 넘기고 타이머를 40초로 리셋합니다.
+        - 선공(P1)에서 후공(P2)으로 넘어갈 때는 같은 이닝(self.current_inning 유지)의 후공 칸으로 이동합니다.
+        - 후공(P2)에서 선공(P1)으로 넘어갈 때는 다음 이닝(self.current_inning + 1)으로 이동합니다.
+        """
+        self.current_inning = max(1, self.current_inning)
+        prev_player_id = self.active_player_id
+        current_player = self.players[prev_player_id]
+        current_player.innings = self.current_inning
+        if self.current_inning not in current_player.inning_scores:
+            current_player.inning_scores[self.current_inning] = 0
         current_player.current_run = 0
-        next_player_id = "P2" if self.active_player_id == "P1" else "P1"
-        self.active_player_id = next_player_id
 
-        next_player = self.players[self.active_player_id]
-        next_player.innings += 1
-        next_player.current_run = 0
-        if next_player.innings not in next_player.inning_scores:
-            next_player.inning_scores[next_player.innings] = 0
+        if prev_player_id == "P1":
+            # 선공(P1) 턴 종료 -> 같은 이닝(current_inning)의 후공(P2) 차례
+            self.active_player_id = "P2"
+            p2 = self.players["P2"]
+            p2.innings = self.current_inning
+            p2.current_run = 0
+            if self.current_inning not in p2.inning_scores:
+                p2.inning_scores[self.current_inning] = 0
+        else:
+            # 후공(P2) 턴 종료 -> 다음 이닝(current_inning + 1)의 선공(P1) 차례
+            self.current_inning += 1
+            self.active_player_id = "P1"
+            p1 = self.players["P1"]
+            p1.innings = self.current_inning
+            p1.current_run = 0
+            if self.current_inning not in p1.inning_scores:
+                p1.inning_scores[self.current_inning] = 0
 
-        self.current_inning = max(
-            self.players["P1"].innings, self.players["P2"].innings
-        )
         self.remaining_timer_sec = float(self.default_shot_timer)
         self.is_timer_paused = False
         self.fsm_state = MatchState.WAIT_SHOT
@@ -316,6 +369,7 @@ class MatchManager:
         수구가 움직이기 시작하면 FSM을 SHOT_IN_PROGRESS로 전환하고,
         진행 중이던 40초 샷 타이머를 즉시 일시 정지(Pause)합니다.
         """
+        self.sync_active_player_to_current_inning(self.active_player_id)
         self.fsm_state = MatchState.SHOT_IN_PROGRESS
         self.is_timer_paused = True
         return self.get_match_payload()
@@ -347,20 +401,23 @@ class MatchManager:
 
         - 득점 성공(is_scored == True):
           일반 룰("STANDARD")은 +1점, PBA 룰("PBA")에서 BANK_SHOT일 때는 +2점 가산,
-          런/하이런/에버리지 및 이닝별 히스토리 갱신, 타이머 40초 리셋 후 재시작, 공격권 유지.
+          현재 이닝(self.current_inning)의 본인 칸에 점수 누적, 타이머 40초 리셋 후 재시작,
+          공격권(active_player_id) 및 '공격 중' 표시를 절대 변경하지 않고 그대로 유지!
         - 공타 실패(is_scored == False):
-          상대방으로 턴 자동 교체, 수구 색상 스위칭(WHITE <-> YELLOW), 이닝 수 +1, 타이머 40초 리셋 후 재시작.
+          * 선공(P1)이 실패한 경우: 같은 이닝(self.current_inning 유지)의 후공(P2)으로 턴 전환!
+            (P2의 같은 이닝 칸이 0점으로 생성되어 P1과 동일한 이닝 열에 기록됨)
+          * 후공(P2)이 실패한 경우: 해당 이닝이 종료되므로 다음 이닝(self.current_inning + 1)으로 증가하며 선공(P1)으로 턴 전환!
         """
         self.fsm_state = MatchState.BALL_STOPPED
         is_scored = bool(shot_eval.get("is_scored", False))
         shot_type = str(shot_eval.get("shot_type", "MISS"))
         prev_player_id = self.active_player_id
-        current_player = self.players[self.active_player_id]
 
-        if current_player.innings <= 0:
-            current_player.innings = 1
-        if current_player.innings not in current_player.inning_scores:
-            current_player.inning_scores[current_player.innings] = 0
+        self.current_inning = max(1, self.current_inning)
+        current_player = self.players[prev_player_id]
+        current_player.innings = self.current_inning
+        if self.current_inning not in current_player.inning_scores:
+            current_player.inning_scores[self.current_inning] = 0
 
         points_awarded = 0
         if is_scored:
@@ -375,28 +432,36 @@ class MatchManager:
 
             current_player.score += points_awarded
             current_player.current_run += points_awarded
-            current_player.inning_scores[current_player.innings] = (
-                current_player.inning_scores.get(current_player.innings, 0)
+            current_player.inning_scores[self.current_inning] = (
+                current_player.inning_scores.get(self.current_inning, 0)
                 + points_awarded
             )
             if current_player.current_run > current_player.high_run:
                 current_player.high_run = current_player.current_run
 
+            # 득점 성공 시 반드시 현재 공격 선수의 턴과 '공격 중' 상태를 유지!
+            self.active_player_id = prev_player_id
             event_type = "SCORE_UPDATED"
         else:
             current_player.current_run = 0
-            next_player_id = "P2" if self.active_player_id == "P1" else "P1"
-            self.active_player_id = next_player_id
+            if prev_player_id == "P1":
+                # 선공(P1) 득점 실패 -> 같은 이닝(self.current_inning)의 후공(P2) 차례로 턴 교체
+                self.active_player_id = "P2"
+                p2 = self.players["P2"]
+                p2.innings = self.current_inning
+                p2.current_run = 0
+                if self.current_inning not in p2.inning_scores:
+                    p2.inning_scores[self.current_inning] = 0
+            else:
+                # 후공(P2) 득점 실패 -> 다음 이닝(self.current_inning + 1)의 선공(P1) 차례로 턴 교체
+                self.current_inning += 1
+                self.active_player_id = "P1"
+                p1 = self.players["P1"]
+                p1.innings = self.current_inning
+                p1.current_run = 0
+                if self.current_inning not in p1.inning_scores:
+                    p1.inning_scores[self.current_inning] = 0
 
-            next_player = self.players[self.active_player_id]
-            next_player.innings += 1
-            next_player.current_run = 0
-            if next_player.innings not in next_player.inning_scores:
-                next_player.inning_scores[next_player.innings] = 0
-
-            self.current_inning = max(
-                self.players["P1"].innings, self.players["P2"].innings
-            )
             event_type = "TURN_CHANGED"
 
         self.remaining_timer_sec = float(self.default_shot_timer)

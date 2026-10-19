@@ -1871,16 +1871,56 @@
       barEl.classList.toggle('yellow-bar', isYellow);
     }
 
-    function renderInningSheet(historyList, p1Name, p2Name) {
+    const VISIBLE_INNINGS = 30;
+    let matchElapsedSec = 0;
+    let matchElapsedIntervalId = null;
+    let editingPlayerId = 'P1';
+
+    function formatElapsedTime(sec) {
+      const total = Math.max(0, Math.floor(Number(sec) || 0));
+      const h = String(Math.floor(total / 3600)).padStart(2, '0');
+      const m = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+      const s = String(total % 60).padStart(2, '0');
+      return `${h}:${m}:${s}`;
+    }
+
+    function startLocalMatchTimerLoop() {
+      if (matchElapsedIntervalId) clearInterval(matchElapsedIntervalId);
+      matchElapsedIntervalId = setInterval(() => {
+        matchElapsedSec += 1;
+        const el = document.getElementById('matchElapsedDigits');
+        if (el) {
+          el.textContent = formatElapsedTime(matchElapsedSec);
+        }
+      }, 1000);
+    }
+
+    function renderInningSheet(historyList, p1Name, p2Name, activeInning = 1) {
       const headRow = document.getElementById('sheetHeadRow');
       const p1Row = document.getElementById('sheetP1Row');
       const p2Row = document.getElementById('sheetP2Row');
+      const rangeBadge = document.getElementById('sheetRangeBadge');
 
-      const minCols = Math.max(12, (historyList || []).length);
       const mapByInning = {};
+      let maxRecordedInning = 1;
       (historyList || []).forEach((item) => {
         mapByInning[item.inning] = item;
+        if (item.inning > maxRecordedInning) {
+          maxRecordedInning = item.inning;
+        }
       });
+
+      const maxInning = Math.max(1, Number(activeInning) || 1, maxRecordedInning);
+      // 30이닝까지는 1~30이닝을 고정 표시하고, 30이닝 초과 시(31이닝~) 좌측으로 쉬프트하여 최근 30이닝 표시
+      const startInning = maxInning > VISIBLE_INNINGS ? maxInning - VISIBLE_INNINGS + 1 : 1;
+      const endInning = startInning + VISIBLE_INNINGS - 1;
+
+      if (rangeBadge) {
+        rangeBadge.textContent =
+          startInning > 1
+            ? `◀ ${startInning} ~ ${endInning} 이닝 (좌측 쉬프트)`
+            : `1 ~ ${VISIBLE_INNINGS} 이닝 표시 중`;
+      }
 
       const p1Display = formatPlayerNameKo(p1Name);
       const p2Display = formatPlayerNameKo(p2Name);
@@ -1889,13 +1929,17 @@
       let p1Html = `<td class="sheet-player-col">${p1Display}</td>`;
       let p2Html = `<td class="sheet-player-col">${p2Display}</td>`;
 
-      for (let i = 1; i <= minCols; i++) {
-        headHtml += `<th>${i}</th>`;
+      for (let i = startInning; i <= endInning; i++) {
+        const isCurrent = i === maxInning;
+        const colClass = isCurrent ? 'current-inning-col' : '';
+        headHtml += `<th class="${colClass}">${i}</th>`;
         const rec = mapByInning[i];
         const v1 = rec && rec.P1 !== null && rec.P1 !== undefined ? rec.P1 : '-';
         const v2 = rec && rec.P2 !== null && rec.P2 !== undefined ? rec.P2 : '-';
-        p1Html += `<td class="${Number(v1) > 0 ? 'pts-positive' : ''}">${v1}</td>`;
-        p2Html += `<td class="${Number(v2) > 0 ? 'pts-positive' : ''}">${v2}</td>`;
+        const c1 = [colClass, Number(v1) > 0 ? 'pts-positive' : ''].filter(Boolean).join(' ');
+        const c2 = [colClass, Number(v2) > 0 ? 'pts-positive' : ''].filter(Boolean).join(' ');
+        p1Html += `<td class="${c1}">${v1}</td>`;
+        p2Html += `<td class="${c2}">${v2}</td>`;
       }
 
       headRow.innerHTML = headHtml;
@@ -1910,6 +1954,15 @@
       const p2 = data.players.P2;
       const p1NameKo = formatPlayerNameKo(p1.name);
       const p2NameKo = formatPlayerNameKo(p2.name);
+
+      // 중앙 상단 누적 경기 타이머 동기화
+      if (data.match_timer && data.match_timer.elapsed_sec !== undefined) {
+        matchElapsedSec = Number(data.match_timer.elapsed_sec) || 0;
+        const elapsedEl = document.getElementById('matchElapsedDigits');
+        if (elapsedEl) {
+          elapsedEl.textContent = data.match_timer.formatted || formatElapsedTime(matchElapsedSec);
+        }
+      }
 
       // 새로운 샷이 출발(SHOT_IN_PROGRESS)하면 자동으로 실시간 라이브캠으로 복귀
       if (data.fsm_state === 'SHOT_IN_PROGRESS' && prevFsmState !== 'SHOT_IN_PROGRESS') {
@@ -1989,8 +2042,8 @@
       document.getElementById('p2To1').classList.toggle('on', (p2.timeouts_remaining ?? 2) >= 1);
       document.getElementById('p2To2').classList.toggle('on', (p2.timeouts_remaining ?? 2) >= 2);
 
-      // 이닝 기록지 업데이트
-      renderInningSheet(data.inning_history || [], p1NameKo, p2NameKo);
+      // 30이닝 기록지 업데이트 (30이닝 초과 시 좌측 자동 쉬프트)
+      renderInningSheet(data.inning_history || [], p1NameKo, p2NameKo, data.current_inning || 1);
 
       // 40초 원형 프로그레스 타이머 렌더링
       const timer = data.shot_timer || { remaining_sec: 40, default_sec: 40, is_paused: false };
@@ -2020,6 +2073,65 @@
       document.getElementById('bannerMsg').textContent = rawMsg
         .replace('P1 선공 - WHITE 수구', '1번 선수 선공 - 흰공 수구')
         .replace('P2 선공 - YELLOW 수구', '2번 선수 선공 - 노란공 수구');
+    }
+
+    function openPlayerNameModal(playerId) {
+      editingPlayerId = playerId === 'P2' ? 'P2' : 'P1';
+      const heading = document.getElementById('playerModalHeading');
+      const input = document.getElementById('playerNameInput');
+      const currentName =
+        editingPlayerId === 'P1'
+          ? document.getElementById('p1Name').textContent
+          : document.getElementById('p2Name').textContent;
+
+      heading.textContent =
+        editingPlayerId === 'P1'
+          ? '✏️ 1번 선수 (선공 · 흰공) 이름 변경'
+          : '✏️ 2번 선수 (후공 · 노란공) 이름 변경';
+      input.value = currentName || '';
+      document.getElementById('playerModalOverlay').classList.add('show');
+      setTimeout(() => {
+        input.focus();
+        input.select();
+      }, 40);
+    }
+
+    function closePlayerNameModal() {
+      document.getElementById('playerModalOverlay').classList.remove('show');
+    }
+
+    function selectPresetPlayerName(presetName) {
+      const input = document.getElementById('playerNameInput');
+      input.value = presetName;
+      submitPlayerNameModal();
+    }
+
+    async function submitPlayerNameModal() {
+      const input = document.getElementById('playerNameInput');
+      const newName = (input.value || '').trim() || (editingPlayerId === 'P1' ? '1번 선수' : '2번 선수');
+      closePlayerNameModal();
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'SET_PLAYER_NAME', player_id: editingPlayerId, name: newName }));
+      } else {
+        const res = await fetch('/api/match/player-name', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ player_id: editingPlayerId, name: newName }),
+        });
+        const data = await res.json();
+        renderScoreboard(data);
+      }
+    }
+
+    async function swapPlayerSeats() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'SWAP_PLAYERS' }));
+      } else {
+        const res = await fetch('/api/match/swap-players', { method: 'POST' });
+        const data = await res.json();
+        renderScoreboard(data);
+      }
     }
 
     function showVarPopup(varData) {
@@ -2110,8 +2222,12 @@
 
     async function resetMatch() {
       hideVarPopup();
+      closePlayerNameModal();
       resetCamZoom();
       switchToLiveCam();
+      matchElapsedSec = 0;
+      const elapsedEl = document.getElementById('matchElapsedDigits');
+      if (elapsedEl) elapsedEl.textContent = '00:00:00';
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ action: 'RESET_MATCH' }));
       } else {
@@ -2120,6 +2236,8 @@
     }
 
     window.addEventListener('DOMContentLoaded', () => {
+      renderInningSheet([], '1번 선수', '2번 선수', 1);
+      startLocalMatchTimerLoop();
       initCamInteractiveEvents();
       connectWebSocket();
     });
