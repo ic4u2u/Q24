@@ -80,20 +80,29 @@ class ConnectionManager:
 
 
 import math
+import time
 import cv2
+from cue24.core.physics_tracker import BulletproofBallTracker
+
+COLOR_KO_LABELS: Dict[str, str] = {
+    "WHITE": "흰공",
+    "YELLOW": "노란공",
+    "RED": "빨간공",
+}
 
 
 class LiveStreamReader:
     """
     실제 당구대 카메라 스트림 또는 카메라 대용 테스트 녹화 영상("J:\\내 드라이브\\L-billiard.mp4")을
-    원본 해상도(1920x1080) 크기·비율 변동 없이 공급하고,
-    Step 2~4 컴퓨터 비전·물리·VAR 모듈, Step 5 MatchManager, Step 7 ReplayRingBuffer를
+    원본 해상도(1920x1080) 크기·비율 변동 없이 실시간 1.0배속으로 공급하고,
+    5단계 철통 3구 추적 알고리즘(BulletproofBallTracker + PhysicsTracker + ScoringEngine)을
     실시간 연동하는 파이프라인 리더입니다.
     """
 
     # 실제 카메라/비디오 비전 스트림에서 예비 큐질(그림자 흔들림)을 배제하고 실제 수구 출발만 감지하기 위한 임계값
     VISION_START_SPEED_TH: float = 4.5
     VISION_START_DISP_MM: float = 14.0
+    MOTION_BLUR_CIRC_TH: float = 0.42
 
     def __init__(
         self,
@@ -109,7 +118,7 @@ class LiveStreamReader:
         self.is_running: bool = False
         self.frame_counter: int = 0
 
-        # Step 2 ~ Step 4 핵심 코어 모듈 및 Step 7 리플레이 버퍼 초기화
+        # Step 2 ~ Step 4 핵심 코어 모듈, 5단계 BulletproofBallTracker 및 Step 7 리플레이 버퍼 초기화
         default_corners = [
             (0.0, 0.0),
             (settings.TABLE_WIDTH_MM, 0.0),
@@ -120,14 +129,17 @@ class LiveStreamReader:
         self.color_locker = ColorLocker()
         self.detector = BallCandidateDetector()
         self.tracker = PhysicsTracker()
+        self.bulletproof_tracker = BulletproofBallTracker()
         self.spin_detector = SpinDetector()
         self.scoring_engine = ScoringEngine()
         self.var_referee = VARReferee()
         self.replay_buffer = ReplayRingBuffer(max_frames=300)
         self.cam_generator = SyntheticCamGenerator(width=960, height=480)
 
-        # 비전 자동 캘리브레이션 및 정지 기준 위치 상태
+        # 비전 자동 캘리브레이션, 캐싱 행렬 및 정지 기준 위치 상태
         self._table_calibrated: bool = False
+        self._cached_half_H: Optional[np.ndarray] = None
+        self._morph_kernel: np.ndarray = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self._vision_tracks_synced: bool = False
         self._rest_positions: Dict[int, Point2D] = {}
         self.detected_ball_colors: Dict[int, str] = {
@@ -162,6 +174,15 @@ class LiveStreamReader:
         )
         self.scoring_engine.reset_shot(cue_ball_id=1, object_ball_ids=[2, 3])
 
+    def _update_cached_half_homography(self) -> None:
+        """0.5x 고속 워프용 호모그래피 행렬을 사전 계산하여 프레임당 연산 시간을 단축합니다."""
+        scale_mat = np.array(
+            [[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+        self._cached_half_H = scale_mat @ self.calibrator.homography_matrix.astype(
+            np.float64
+        )
+
     def _init_video_capture(self, path_str: str) -> None:
         """
         실제 카메라(camera_index) 또는 카메라 대용 테스트 영상 파일(예: J:\\내 드라이브\\L-billiard.mp4)을 오픈하고,
@@ -190,10 +211,11 @@ class LiveStreamReader:
                     break
                 if idx == 0:
                     self.calibrator.auto_detect_table_corners(raw_frame)
+                    self._update_cached_half_homography()
                     self._table_calibrated = True
                 self._latest_raw_frame = raw_frame
                 ok, buf = cv2.imencode(
-                    ".jpg", raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88]
+                    ".jpg", raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82]
                 )
                 if ok:
                     jpg_bytes = buf.tobytes()
@@ -233,13 +255,12 @@ class LiveStreamReader:
         """
         평면 보정 영상에서 당구공 3개를 검출하되,
         주행 중 고속 이동 잔상이나 두 공 충돌/큐대 가림으로 1~2개만 검출된 경우
-        완화된 진원도 후보 및 직전 추적 위치를 결합하여 3개 공의 좌표를 끊김 없이 반환합니다.
+        칼만 필터 예측 위치(predict_kalman_position)를 결합하여 3개 공의 좌표를 끊김 없이 반환합니다.
         """
         candidates = self.detector.detect(warped_bgr, max_balls=3)
         if len(candidates) == 3:
             return [(float(c["x"]), float(c["y"])) for c in candidates]
 
-        # 아직 비전 트랙이 초기화되지 않았으면 3개가 온전히 검출될 때까지 빈 리스트 반환
         if not self.tracker.balls or len(self.tracker.balls) != 3:
             return []
 
@@ -248,11 +269,10 @@ class LiveStreamReader:
         ]
         if not detected_pts:
             return [
-                (float(st.position[0]), float(st.position[1]))
+                st.predict_kalman_position()
                 for st in self.tracker.balls.values()
             ]
 
-        # 검출된 점들과 가장 가까운 기존 트랙을 먼저 매칭하고, 누락된 공은 직전 위치로 유지
         remaining_ids = set(self.tracker.balls.keys())
         completed_pts: List[Point2D] = list(detected_pts)
 
@@ -270,7 +290,7 @@ class LiveStreamReader:
 
         for missing_id in sorted(remaining_ids):
             st = self.tracker.balls[missing_id]
-            completed_pts.append((float(st.position[0]), float(st.position[1])))
+            completed_pts.append(st.predict_kalman_position())
 
         return completed_pts[:3]
 
@@ -278,66 +298,70 @@ class LiveStreamReader:
         self, raw_frame: np.ndarray
     ) -> Optional[Dict[str, Any]]:
         """
-        실제 카메라(또는 카메라 대용 영상) 단일 BGR 프레임을 입력받아:
-        1) 당구대 내경 2840x1420mm 호모그래피 보정
-        2) 진원도 필터 기반 당구공 3개 검출 및 ColorLocker 3색(WHITE, YELLOW, RED) 분류
-        3) 처음 움직이는 공을 수구로 자동 인식 -> 샷 클락 정지 -> 3쿠션 득점 판정 -> 모든 공 정지 시 득점/턴 전환 & 샷 클락 재작동
-        전체 비전 파이프라인을 실시간 구동합니다.
+        실제 카메라(또는 카메라 대용 영상) 단일 BGR 프레임을 입력받아
+        5단계 철통 3구 추적 알고리즘을 실시간 구동합니다:
+        - [1단계] 정지 상태(WAIT_SHOT): 도넛 마스크 + 다중 프레임 투표로 WHITE, YELLOW, RED 확정 및 잠금
+        - [2단계] 타구 순간(SHOT_IN_PROGRESS): 색상 감지기 완전 OFF! 위치만 초고속 추적
+        - [3단계] 공-공 충돌 순간: 운동량 보존 법칙(법선 벡터 N)으로 ID 스왑 강제 원복
+        - [4단계] 카메라 블러/터널링: 타원 블러 후보 구출 + 칼만 필터 예측 + 3차 스플라인 궤적 복원
+        - [5단계] 완전 정지 확인: 이동+스핀 정지 시 득점 판정 및 수구 핸드오버
         """
         if raw_frame is None or raw_frame.size == 0:
             return None
 
-        if not self._table_calibrated:
+        if not self._table_calibrated or self._cached_half_H is None:
             self.calibrator.auto_detect_table_corners(raw_frame)
+            self._update_cached_half_homography()
             self._table_calibrated = True
 
-        # 고속 비전 처리를 위해 0.5x 스케일(1420x710) 행렬로 단일 패스 워프 후 2.0x(2840x1420mm) 물리 좌표로 변환
-        scale_mat = np.array([[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-        half_H = scale_mat @ self.calibrator.homography_matrix.astype(np.float64)
+        assert self._cached_half_H is not None
         warped_half = cv2.warpPerspective(
             raw_frame,
-            half_H,
+            self._cached_half_H,
             dsize=(1420, 710),
             flags=cv2.INTER_LINEAR,
         )
 
-        # 1420x710 영상에서 검출할 때는 면적이 1/4이므로 스케일 보정 검출 수행
+        # 1420x710 영상에서 파란색 라사지 차분 및 전경 컨투어 추출
         hsv = cv2.cvtColor(warped_half, cv2.COLOR_BGR2HSV)
         cloth_mask = cv2.inRange(hsv, self.detector.hsv_blue_lower, self.detector.hsv_blue_upper)
         fg_mask = cv2.bitwise_not(cloth_mask)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self._morph_kernel)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, self._morph_kernel)
 
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         strict_candidates: List[Dict[str, float]] = []
+        blur_candidates: List[Dict[str, float]] = []
+
         for cnt in contours:
             raw_area = float(cv2.contourArea(cnt))
             area = raw_area * 4.0
-            if area < self.detector.min_area or area > self.detector.max_area:
+            if area < self.detector.min_area or area > self.detector.max_area * 1.35:
                 continue
             perim = float(cv2.arcLength(cnt, True))
             if perim <= 0.0:
                 continue
             circ = (4.0 * math.pi * raw_area) / (perim * perim)
-            if circ <= self.detector.CIRCULARITY_TH:
-                continue
             (cx, cy), rad = cv2.minEnclosingCircle(cnt)
-            strict_candidates.append(
-                {
-                    "x": float(cx) * 2.0,
-                    "y": float(cy) * 2.0,
-                    "radius": float(rad) * 2.0,
-                    "circularity": float(circ),
-                    "area": area,
-                }
-            )
+            cand_item = {
+                "x": float(cx) * 2.0,
+                "y": float(cy) * 2.0,
+                "radius": float(rad) * 2.0,
+                "circularity": float(circ),
+                "area": area,
+            }
+            if circ > self.detector.CIRCULARITY_TH and area <= self.detector.max_area:
+                strict_candidates.append(cand_item)
+            elif circ > self.MOTION_BLUR_CIRC_TH:
+                # [4단계 강화] 고속 주행 중 모션 블러로 인해 길쭉해진 타원형 공 후보 보관
+                blur_candidates.append(cand_item)
+
         strict_candidates.sort(
             key=lambda c: (-c["circularity"], abs(c["area"] - self.detector.ideal_area))
         )
         strict_candidates = strict_candidates[:3]
 
-        # 최초 비전 동기화: 3개의 공이 온전히 검출되었을 때 색상(WHITE, YELLOW, RED)과 초기 위치를 확정
+        # [1단계: 최초 비전 동기화] 3개의 공이 온전히 검출되었을 때 도넛 마스크로 색상(WHITE, YELLOW, RED)과 초기 ID 잠금
         if not self._vision_tracks_synced:
             if len(strict_candidates) == 3:
                 init_pts: Dict[int, Point2D] = {
@@ -350,8 +374,19 @@ class LiveStreamReader:
                     )
                     for bid, pt in init_pts.items()
                 }
-                colors = self.color_locker.classify_balls(init_crops)
+                self.color_locker.set_shot_lock(False)
+                colors = self.color_locker.classify_balls(
+                    init_crops, use_temporal_smoothing=True
+                )
                 self.detected_ball_colors = colors.copy()
+
+                # BulletproofBallTracker 1단계 동기화
+                self.bulletproof_tracker.phase1_lock_balls_before_shot(
+                    [
+                        {"center": init_pts[bid], "crop_img": init_crops[bid]}
+                        for bid in sorted(init_pts.keys())
+                    ]
+                )
 
                 active_color = self.match_manager.active_cue_ball_color
                 cue_id = 1
@@ -373,6 +408,7 @@ class LiveStreamReader:
                 self._vision_tracks_synced = True
             return None
 
+        # [2단계 & 4단계] 주행 중 모션 블러 구출 및 칼만 필터 예측 위치 복원
         if len(strict_candidates) == 3:
             pts: List[Point2D] = [
                 (float(c["x"]), float(c["y"])) for c in strict_candidates
@@ -381,6 +417,7 @@ class LiveStreamReader:
             detected_pts = [(float(c["x"]), float(c["y"])) for c in strict_candidates]
             remaining_ids = set(self.tracker.balls.keys())
             pts = list(detected_pts)
+
             for pt in detected_pts:
                 if not remaining_ids:
                     break
@@ -392,21 +429,50 @@ class LiveStreamReader:
                     ),
                 )
                 remaining_ids.remove(nearest_id)
+
             for missing_id in sorted(remaining_ids):
                 st = self.tracker.balls[missing_id]
-                pts.append((float(st.position[0]), float(st.position[1])))
+                kalman_pt = st.predict_kalman_position()
+                # 주행 중이면 칼만 예측 위치 반경 160mm 이내의 모션 블러 타원 후보를 우선 구출
+                rescued_pt: Optional[Point2D] = None
+                if (
+                    self.match_manager.fsm_state == MatchState.SHOT_IN_PROGRESS
+                    and blur_candidates
+                ):
+                    near_blurs = [
+                        bc
+                        for bc in blur_candidates
+                        if math.hypot(bc["x"] - kalman_pt[0], bc["y"] - kalman_pt[1])
+                        <= 160.0
+                        and all(
+                            math.hypot(bc["x"] - ep[0], bc["y"] - ep[1]) >= 45.0
+                            for ep in pts
+                        )
+                    ]
+                    if near_blurs:
+                        best_b = min(
+                            near_blurs,
+                            key=lambda bc: math.hypot(
+                                bc["x"] - kalman_pt[0], bc["y"] - kalman_pt[1]
+                            ),
+                        )
+                        rescued_pt = (float(best_b["x"]), float(best_b["y"]))
+
+                pts.append(rescued_pt if rescued_pt is not None else kalman_pt)
             pts = pts[:3]
         else:
             return None
 
-        # 정지 대기 상태(WAIT_SHOT)이고 3개 공이 모두 선명하게 검출되었을 때 ColorLocker로 색상 지속 검증
+        # [1단계 vs 2단계 분리]
+        # WAIT_SHOT(정지 상태)일 때만 도넛 마스크 색상 확정(1단계)을 수행하고,
+        # SHOT_IN_PROGRESS(주행 중)일 때는 색상 감지기를 완전히 OFF(2단계)합니다!
         detected_colors: Optional[Dict[int, str]] = None
         if (
             self.match_manager.fsm_state == MatchState.WAIT_SHOT
+            and not self.color_locker.is_color_locked_for_shot
             and len(strict_candidates) == 3
         ):
             matched_preview = self.tracker._match_nearest_positions(pts)
-            # 두 공이 너무 밀착해 있지 않을 때만 색상 재분류 (영역 침범 방지)
             min_pair_dist = min(
                 math.hypot(p1[0] - p2[0], p1[1] - p2[1])
                 for i, p1 in enumerate(pts)
@@ -419,10 +485,11 @@ class LiveStreamReader:
                     )
                     for bid, coord in matched_preview.items()
                 }
-                detected_colors = self.color_locker.classify_balls(crops_by_id)
+                detected_colors = self.color_locker.classify_balls(
+                    crops_by_id, use_temporal_smoothing=True
+                )
                 self.detected_ball_colors = detected_colors.copy()
 
-                # 모든 공이 정지해 있는 동안 기준 정지 위치를 부드럽게 유지 (큐대 근접 시 미세 흔들림 기준점)
                 max_step = max(
                     math.hypot(
                         coord[0] - float(self.tracker.balls[bid].position[0]),
@@ -448,23 +515,28 @@ class LiveStreamReader:
             require_rest_displacement=True,
         )
 
-    def read_live_frame_jpeg(self) -> bytes:
+    def read_live_frame_jpeg(self, skip_frames: int = 0) -> bytes:
         """
         실제 카메라 또는 테스트 녹화 영상(L-billiard.mp4)에서 다음 프레임을 원본 해상도(1920x1080) 그대로 읽어
         크기/비율 변형 없이 JPEG 바이트로 반환하며, 링버퍼에 상시 기록합니다.
+        skip_frames > 0 인 경우 실시간 1.0배속(Wall-Clock) 동기화를 위해 지연된 프레임만큼 가볍게 grab()합니다.
         """
         if self.is_real_video_loaded and self._video_cap is not None:
+            for _ in range(max(0, min(2, skip_frames))):
+                self._video_cap.grab()
+
             ret, raw_frame = self._video_cap.read()
             if not ret or raw_frame is None:
                 self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 self._vision_tracks_synced = False
+                self.color_locker.set_shot_lock(False)
                 ret, raw_frame = self._video_cap.read()
 
             if ret and raw_frame is not None:
                 self._latest_raw_frame = raw_frame
-                # 카메라/비디오 원본 해상도 그대로 인코딩 (리사이즈/크롭 절대 없음)
+                # 카메라/비디오 원본 해상도 그대로 고속 JPEG 인코딩 (리사이즈/크롭 절대 없음)
                 ok, buf = cv2.imencode(
-                    ".jpg", raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88]
+                    ".jpg", raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82]
                 )
                 if ok:
                     jpg_bytes = buf.tobytes()
@@ -483,11 +555,11 @@ class LiveStreamReader:
         self.replay_buffer.push_frame(fallback_jpg)
         return fallback_jpg
 
-    async def read_and_process_live_frame(self) -> bytes:
+    async def read_and_process_live_frame(self, skip_frames: int = 0) -> bytes:
         """
-        실시간 스트림에서 프레임을 읽고 즉시 비전·물리·3쿠션 득점 파이프라인을 구동한 뒤 JPEG 바이트를 반환합니다.
+        실시간 스트림에서 프레임을 읽고 즉시 5단계 비전·물리·3쿠션 득점 파이프라인을 구동한 뒤 JPEG 바이트를 반환합니다.
         """
-        jpg_bytes = self.read_live_frame_jpeg()
+        jpg_bytes = self.read_live_frame_jpeg(skip_frames=skip_frames)
         if self.is_real_video_loaded and self._latest_raw_frame is not None:
             await self.process_video_frame(self._latest_raw_frame)
         return jpg_bytes
@@ -503,22 +575,28 @@ class LiveStreamReader:
         require_rest_displacement: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
-        단일 프레임에서 검출된 공 3개의 물리 좌표를 받아:
+        단일 프레임에서 검출된 공 3개의 물리 좌표를 받아 5단계 파이프라인을 수행합니다:
         1) WAIT_SHOT 상태에서 처음 움직이는 공을 수구(Cue Ball)로 자동 인식하고,
-           샷 클락(타이머)을 즉시 멈춘 뒤 3쿠션 득점 알고리즘(ScoringEngine)을 가동합니다.
-        2) SHOT_IN_PROGRESS 상태에서 쿠션 반사 및 제1·2적구 충돌을 실시간 카운트합니다.
-        3) 모든 공이 멈추면(BALL_STOPPED) 득점 성공 시 점수 가산, 실패 시 자동 턴 전환 후 샷 클락을 재작동합니다.
+           색상 감지기를 즉시 잠근(OFF) 뒤 샷 클락을 멈추고 3쿠션 득점 알고리즘을 가동합니다.
+        2) SHOT_IN_PROGRESS 상태에서 색상 무시 위치 추적 + 물리 충돌 가드(ID 스왑 원복) + 3차 스플라인 판독을 수행합니다.
+        3) 모든 공이 멈추면(BALL_STOPPED) 색상 잠금을 풀고 득점 가산 또는 자동 턴 전환 후 샷 클락을 재작동합니다.
         """
         self.frame_counter += 1
 
-        # 1. 물리 충돌 가드 위치 추적기 업데이트 및 감지된 공 색상 반영
+        # 1. [2단계 & 3단계] 색상 무시 최단 거리 위치 추적 및 물리 충돌 가드(법선 벡터 N 기반 ID 스왑 원복) 업데이트
         ball_states = self.tracker.update(detected_points)
-        if detected_colors:
+
+        # 정지 상태(1단계)에서만 색상 갱신 허용, 주행 중(2단계)에는 기존 잠긴 색상 100% 유지
+        if (
+            detected_colors
+            and self.match_manager.fsm_state == MatchState.WAIT_SHOT
+            and not self.color_locker.is_color_locked_for_shot
+        ):
             for bid, col in detected_colors.items():
                 if bid in ball_states:
                     ball_states[bid].color = col
 
-        # 2. WAIT_SHOT 상태에서 처음 움직이는 공을 수구(Cue Ball)로 인식 및 샷 시작/타이머 정지
+        # 2. WAIT_SHOT 상태에서 처음 움직이는 공을 수구(Cue Ball)로 인식 및 2단계(색상 감지기 OFF + 타이머 정지) 진입
         if self.match_manager.fsm_state == MatchState.WAIT_SHOT:
             vel_th = (
                 start_velocity_th
@@ -537,7 +615,6 @@ class LiveStreamReader:
                     )
                     if disp < self.VISION_START_DISP_MM:
                         continue
-                # WHITE 또는 YELLOW 공에 우선순위를 부여하되 가장 빠르게 출발한 공을 선택
                 color_bonus = 1000.0 if st.color in ("WHITE", "YELLOW") else 0.0
                 moving_candidates.append((color_bonus + st.speed, bid))
 
@@ -545,10 +622,14 @@ class LiveStreamReader:
                 moving_candidates.sort(reverse=True)
                 first_moving_id = moving_candidates[0][1]
 
-                # 처음 움직이는 공을 이번 샷의 수구(Cue Ball)로 고정!
+                # 처음 움직이는 공을 이번 샷의 수구(Cue Ball)로 영구 고정!
                 self.tracker.cue_ball_id = first_moving_id
                 cue_id = first_moving_id
                 cue_state = ball_states[cue_id]
+
+                # [2단계 핵심] 수구가 출발했으므로 샷이 끝날 때까지 색상 감지기를 완전히 OFF!
+                self.color_locker.set_shot_lock(True)
+                self.bulletproof_tracker.is_shot_in_progress = True
 
                 # 현재 공격 플레이어의 수구 색상 표시를 실제 출발한 수구 색상(WHITE/YELLOW)과 동기화
                 if cue_state.color in ("WHITE", "YELLOW"):
@@ -578,13 +659,14 @@ class LiveStreamReader:
                     ]
                     for bid in obj_ids
                 }
+                cue_ko = COLOR_KO_LABELS.get(cue_state.color, cue_state.color)
                 self.match_manager.last_shot_result = {
                     "is_scored": False,
                     "points_awarded": 0,
                     "shot_type": "IN_PROGRESS",
                     "reason_code": "CUE_MOVING",
                     "message": (
-                        f"수구({cue_state.color}) 출발 감지 — 샷 클락 정지 및 3쿠션 판독 가동 중"
+                        f"수구({cue_ko}) 출발 감지 — 타이머 일시정지 및 5단계 초고속 궤적 추적 중"
                     ),
                     "cushions_before_second_hit": 0,
                     "total_cushions": 0,
@@ -593,7 +675,7 @@ class LiveStreamReader:
                     "SCORE_UPDATED", self.match_manager.get_match_payload()
                 )
 
-        # 3. 샷 진행 중(SHOT_IN_PROGRESS)일 때 3쿠션 이벤트 기록 및 정지 감지
+        # 3. 샷 진행 중(SHOT_IN_PROGRESS)일 때 3쿠션 이벤트 기록 및 5단계 완전 정지 감지
         if self.match_manager.fsm_state == MatchState.SHOT_IN_PROGRESS:
             cue_id = self.tracker.cue_ball_id or 1
             cue_state = ball_states[cue_id]
@@ -622,16 +704,16 @@ class LiveStreamReader:
                 self.scoring_engine.total_cushion_count != prev_cushions
                 or len(self.scoring_engine.events) != prev_events_count
             ):
-                hit1 = "완료" if self.scoring_engine.first_object_ball_id is not None else "대기"
-                hit2 = "완료" if self.scoring_engine.second_object_ball_id is not None else "대기"
+                hit1 = "접촉완료" if self.scoring_engine.first_object_ball_id is not None else "대기"
+                hit2 = "접촉완료" if self.scoring_engine.second_object_ball_id is not None else "대기"
                 self.match_manager.last_shot_result = {
                     "is_scored": False,
                     "points_awarded": 0,
                     "shot_type": "IN_PROGRESS",
                     "reason_code": "TRACKING",
                     "message": (
-                        f"판독 중: {self.scoring_engine.total_cushion_count}쿠션 "
-                        f"| 1적구({hit1}) · 2적구({hit2})"
+                        f"실시간 추적 중: {self.scoring_engine.total_cushion_count}쿠션 "
+                        f"| 제1적구({hit1}) · 제2적구({hit2})"
                     ),
                     "cushions_before_second_hit": self.scoring_engine.cushion_count_before_second_hit,
                     "total_cushions": self.scoring_engine.total_cushion_count,
@@ -644,14 +726,17 @@ class LiveStreamReader:
             if var_alert_payload is not None and var_alert_payload.get("var_triggered"):
                 await self.ws_manager.broadcast_event("VAR_ALERT", var_alert_payload)
 
-            # 스핀 및 선속도 정지 감지 업데이트
+            # [5단계: 완전 정지 확인] 이동 속도 + 제자리 팽이 회전(스핀) 정지 감지 업데이트
             spin_status = self.spin_detector.update(
                 ball_states=ball_states,
                 ball_crops_gray=ball_crops_gray,
             )
 
-            # 15프레임 연속 정지 확정(BALL_STOPPED) 시 룰 평가 및 스코어/턴 갱신 + 샷 클락 재작동
+            # 15프레임(0.5초) 연속 정지 확정(BALL_STOPPED) 시 룰 평가 및 스코어/턴 갱신 + 신분증 반납/인계
             if bool(spin_status["is_fully_stopped"]):
+                self.color_locker.set_shot_lock(False)
+                self.bulletproof_tracker.is_shot_in_progress = False
+
                 shot_eval = self.scoring_engine.evaluate_shot(
                     has_double_touch_foul=has_double_touch_foul
                 )
@@ -706,7 +791,7 @@ class LiveStreamReader:
                         "points_awarded": 0,
                         "shot_type": "TIME_OUT_FOUL",
                         "reason_code": "SHOT_CLOCK_EXPIRED",
-                        "message": "40초 샷 클락 시간 초과 — 상대 선수로 자동 턴 교체!",
+                        "message": "40초 공격 제한시간 초과 — 상대 선수로 공격권이 자동 교체되었습니다!",
                         "cushions_before_second_hit": 0,
                         "total_cushions": 0,
                     }
@@ -850,20 +935,42 @@ async def get_single_live_frame() -> Response:
 
 
 async def _mjpeg_live_generator() -> AsyncGenerator[bytes, None]:
-    """실시간 카메라 또는 테스트 녹화 영상(L-billiard.mp4 원본 1920x1080) MJPEG 스트림 및 비전 판독 제너레이터"""
-    frame_interval = 1.0 / max(15.0, min(60.0, stream_reader.video_fps))
+    """
+    실시간 카메라 또는 테스트 녹화 영상(L-billiard.mp4 원본 1920x1080)을
+    절대 시계(Wall-Clock, time.perf_counter) 기준으로 처리 시간을 자동 보정하여
+    정확히 실시간 1.0배속(정배속)으로 스트리밍 및 판독하는 제너레이터입니다.
+    """
+    fps = max(15.0, min(60.0, stream_reader.video_fps))
+    frame_interval = 1.0 / fps
+    next_frame_deadline = time.perf_counter()
+
     while True:
-        jpg = await stream_reader.read_and_process_live_frame()
+        now = time.perf_counter()
+        # 만약 이전 프레임 연산이 길어져 실제 시간(1.0배속)보다 뒤처졌다면 지연 프레임 수 계산
+        lag_sec = now - next_frame_deadline
+        skip_count = 0
+        if lag_sec > frame_interval * 1.5:
+            skip_count = min(2, int(lag_sec // frame_interval))
+            next_frame_deadline = now
+
+        jpg = await stream_reader.read_and_process_live_frame(skip_frames=skip_count)
         yield (
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
         )
-        await asyncio.sleep(frame_interval)
+
+        next_frame_deadline += frame_interval
+        sleep_sec = next_frame_deadline - time.perf_counter()
+        if sleep_sec > 0.001:
+            await asyncio.sleep(sleep_sec)
+        else:
+            # 이벤트 루프 양보 (블로킹 방지)
+            await asyncio.sleep(0.001)
 
 
 @app.get("/api/video/live")
 async def stream_live_video() -> StreamingResponse:
-    """보드 중앙 상단 모니터용 실시간 MJPEG 라이브캠 스트림 엔드포인트"""
+    """보드 중앙 상단 모니터용 실시간 1.0배속 MJPEG 라이브캠 스트림 엔드포인트"""
     return StreamingResponse(
         _mjpeg_live_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
@@ -872,23 +979,28 @@ async def stream_live_video() -> StreamingResponse:
 
 async def _mjpeg_replay_generator(speed: float = 1.0) -> AsyncGenerator[bytes, None]:
     """
-    3공 정지 후 확정된 직전 샷 클립(원본 해상도)을 반복 재생하며,
+    3공 정지 후 확정된 직전 샷 클립(원본 해상도)을 지정된 배속(1.0x / 0.5x / 0.25x)으로 정확히 재생하며,
     동시에 카메라의 다음 샷(수구 출발)을 감시하여 수구가 움직이면 즉시 LIVE 및 득점 판독으로 전환합니다.
     """
-    base_interval = 1.0 / max(15.0, min(60.0, stream_reader.video_fps))
-    delay = max(0.02, min(0.35, base_interval / max(0.25, speed)))
+    fps = max(15.0, min(60.0, stream_reader.video_fps))
+    base_interval = 1.0 / fps
+    target_interval = max(0.015, min(0.35, base_interval / max(0.25, speed)))
+
     while True:
         clip = stream_reader.replay_buffer.get_locked_clip()
         if not clip:
+            t0 = time.perf_counter()
             jpg = await stream_reader.read_and_process_live_frame()
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
             )
-            await asyncio.sleep(0.08)
+            rem = max(0.001, base_interval - (time.perf_counter() - t0))
+            await asyncio.sleep(rem)
             continue
 
         for jpg in clip:
+            t0 = time.perf_counter()
             # 리플레이 재생 중에도 실시간 카메라 프레임을 감시하여 수구 출발 시 즉시 SHOT_IN_PROGRESS로 전환
             if stream_reader.match_manager.fsm_state == MatchState.WAIT_SHOT:
                 await stream_reader.read_and_process_live_frame()
@@ -898,8 +1010,9 @@ async def _mjpeg_replay_generator(speed: float = 1.0) -> AsyncGenerator[bytes, N
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
             )
-            await asyncio.sleep(delay)
-        await asyncio.sleep(0.35)
+            rem = max(0.001, target_interval - (time.perf_counter() - t0))
+            await asyncio.sleep(rem)
+        await asyncio.sleep(0.25)
 
 
 @app.get("/api/video/replay")
