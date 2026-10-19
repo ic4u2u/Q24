@@ -137,11 +137,11 @@
       box-shadow: 0 0 8px currentColor;
     }
 
-    /* 메인 스코어보드 3단 그리드 (좌: P1, 중: 타이머/쿠션, 우: P2) */
+    /* 메인 스코어보드 3단 그리드 (좌: P1, 중: 라이브캠/타이머/쿠션, 우: P2) */
     .scoreboard-grid {
       display: grid;
-      grid-template-columns: 1fr 410px 1fr;
-      gap: 20px;
+      grid-template-columns: 1fr 450px 1fr;
+      gap: 18px;
       align-items: stretch;
       flex: 1;
     }
@@ -152,7 +152,7 @@
       background: var(--bg-panel);
       border: 2px solid var(--border-dim);
       border-radius: 22px;
-      padding: 22px 28px;
+      padding: 20px 26px;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
@@ -398,12 +398,12 @@
       font-variant-numeric: tabular-nums;
     }
 
-    /* 중앙 허브 (타이머, 쿠션 카운트, 타임아웃, 경기 상태) */
+    /* 중앙 허브 (상단: 라이브캠/자동리플레이 모니터, 중단: 타이머+이닝, 하단: 쿠션/상태) */
     .center-hub {
       background: var(--bg-panel);
       border: 1px solid var(--border-dim);
       border-radius: 22px;
-      padding: 18px 18px;
+      padding: 14px 16px;
       display: flex;
       flex-direction: column;
       align-items: center;
@@ -412,14 +412,155 @@
       box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
     }
 
+    /* Step 9: 보드판 중앙 상단 실시간 카메라 & 직전 샷 자동 리플레이 모니터 */
+    .cam-monitor-box {
+      width: 100%;
+      background: #030712;
+      border: 2px solid #334155;
+      border-radius: 16px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      transition: border-color 0.3s ease, box-shadow 0.3s ease;
+    }
+
+    .cam-monitor-box.replay-active {
+      border-color: #f59e0b;
+      box-shadow: 0 0 24px rgba(245, 158, 11, 0.38);
+    }
+
+    .cam-viewport {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 8.5;
+      background: #020617;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .cam-stream-img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .cam-overlay-top {
+      position: absolute;
+      top: 8px;
+      left: 10px;
+      right: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      pointer-events: none;
+      z-index: 5;
+    }
+
+    .cam-mode-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 11px;
+      border-radius: 999px;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.76rem;
+      font-weight: 800;
+      letter-spacing: 0.8px;
+      background: rgba(239, 68, 68, 0.88);
+      color: #ffffff;
+      box-shadow: 0 2px 10px rgba(239, 68, 68, 0.5);
+    }
+
+    .cam-mode-badge.replay-mode {
+      background: rgba(245, 158, 11, 0.94);
+      color: #020617;
+      box-shadow: 0 2px 12px rgba(245, 158, 11, 0.65);
+    }
+
+    .cam-shot-tag {
+      padding: 3px 9px;
+      border-radius: 6px;
+      background: rgba(15, 23, 42, 0.82);
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      color: #7dd3fc;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.72rem;
+      font-weight: 800;
+    }
+
+    .cam-controls-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 6px 8px;
+      background: rgba(15, 23, 42, 0.95);
+      border-top: 1px solid #1e293b;
+    }
+
+    .cam-btn-group {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .cam-ctrl-btn {
+      min-height: 34px;
+      padding: 0 10px;
+      border-radius: 8px;
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: #cbd5e1;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.75rem;
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .cam-ctrl-btn:hover {
+      background: #334155;
+      color: #ffffff;
+    }
+
+    .cam-ctrl-btn.active {
+      background: rgba(56, 189, 248, 0.22);
+      border-color: #38bdf8;
+      color: #7dd3fc;
+    }
+
+    .cam-ctrl-btn.live-btn.active {
+      background: rgba(239, 68, 68, 0.22);
+      border-color: #ef4444;
+      color: #fca5a5;
+    }
+
+    /* 타이머 + 현재 이닝 가로 통합 로우 */
+    .timer-inning-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-around;
+      width: 100%;
+      gap: 10px;
+      padding: 4px 6px;
+    }
+
     .inning-header {
       text-align: center;
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 14px;
+      padding: 10px 16px;
+      min-width: 118px;
     }
 
     .inning-label {
-      font-size: 0.78rem;
+      font-size: 0.72rem;
       color: var(--text-muted);
-      letter-spacing: 2px;
+      letter-spacing: 1.5px;
       font-weight: 800;
     }
 
@@ -429,21 +570,22 @@
       font-weight: 800;
       color: #38bdf8;
       line-height: 1.05;
+      margin-top: 2px;
     }
 
     /* 40초 원형 프로그레스 타이머 */
     .timer-wrapper {
       position: relative;
-      width: 196px;
-      height: 196px;
+      width: 138px;
+      height: 138px;
       display: flex;
       align-items: center;
       justify-content: center;
     }
 
     .timer-svg {
-      width: 196px;
-      height: 196px;
+      width: 138px;
+      height: 138px;
       transform: rotate(-90deg);
     }
 
@@ -473,16 +615,16 @@
 
     .timer-seconds {
       font-family: 'Oswald', sans-serif;
-      font-size: 4.1rem;
+      font-size: 3.1rem;
       font-weight: 700;
       line-height: 1;
       font-variant-numeric: tabular-nums;
     }
 
     .timer-unit {
-      font-size: 0.78rem;
+      font-size: 0.68rem;
       color: var(--text-muted);
-      margin-top: 5px;
+      margin-top: 3px;
       font-weight: 800;
     }
 
@@ -900,21 +1042,54 @@
       </div>
     </section>
 
-    <!-- 중앙: 40초 원형 프로그레스 타이머 & 타임아웃/수구스왑 & 쿠션 카운터 -->
+    <!-- 중앙: 상단 실시간 라이브캠/자동 리플레이 모니터 & 40초 원형 타이머 & 쿠션 카운터 -->
     <section class="center-hub">
-      <div class="inning-header">
-        <div class="inning-label">CURRENT INNING</div>
-        <div id="centerInning" class="inning-number">1</div>
+      <!-- Step 9: 보드판 중앙 상단 실시간 카메라 & 3공 정지 시 자동 리플레이 모니터 -->
+      <div id="camMonitorBox" class="cam-monitor-box">
+        <div id="camViewport" class="cam-viewport">
+          <img
+            id="camStreamImg"
+            class="cam-stream-img"
+            src="/api/video/live"
+            alt="CUE24 Table Live Cam & Auto Replay"
+          />
+          <div class="cam-overlay-top">
+            <span id="camModeBadge" class="cam-mode-badge">🔴 LIVE CAM</span>
+            <span id="camShotBadge" class="cam-shot-tag">REAL-TIME TABLE VIEW</span>
+          </div>
+        </div>
+        <div class="cam-controls-bar">
+          <div class="cam-btn-group">
+            <button id="btnLiveCam" class="cam-ctrl-btn live-btn active" onclick="switchToLiveCam()">
+              🔴 LIVE 복귀
+            </button>
+            <button id="btnReplayCam" class="cam-ctrl-btn" onclick="switchToReplayCam()">
+              ⏪ 직전 리플레이
+            </button>
+          </div>
+          <div class="cam-btn-group" aria-label="Replay Speed Controls">
+            <button id="speedBtn10" class="cam-ctrl-btn active" onclick="changeReplaySpeed(1.0)">1.0x</button>
+            <button id="speedBtn05" class="cam-ctrl-btn" onclick="changeReplaySpeed(0.5)">0.5x</button>
+            <button id="speedBtn025" class="cam-ctrl-btn" onclick="changeReplaySpeed(0.25)">0.25x</button>
+          </div>
+        </div>
       </div>
 
-      <div class="timer-wrapper">
-        <svg class="timer-svg" viewBox="0 0 220 220">
-          <circle class="timer-bg-circle" cx="110" cy="110" r="94"></circle>
-          <circle id="timerCircle" class="timer-fg-circle" cx="110" cy="110" r="94"></circle>
-        </svg>
-        <div class="timer-center-text">
-          <div id="timerSec" class="timer-seconds">40</div>
-          <div id="timerStateText" class="timer-unit">SHOT CLOCK</div>
+      <div class="timer-inning-row">
+        <div class="inning-header">
+          <div class="inning-label">INNING</div>
+          <div id="centerInning" class="inning-number">1</div>
+        </div>
+
+        <div class="timer-wrapper">
+          <svg class="timer-svg" viewBox="0 0 220 220">
+            <circle class="timer-bg-circle" cx="110" cy="110" r="94"></circle>
+            <circle id="timerCircle" class="timer-fg-circle" cx="110" cy="110" r="94"></circle>
+          </svg>
+          <div class="timer-center-text">
+            <div id="timerSec" class="timer-seconds">40</div>
+            <div id="timerStateText" class="timer-unit">SHOT CLOCK</div>
+          </div>
         </div>
       </div>
 
@@ -1034,6 +1209,63 @@
     let varTimeoutId = null;
     let prevScores = { P1: 0, P2: 0 };
     let currentRuleMode = 'STANDARD';
+    let currentCamMode = 'LIVE'; // 'LIVE' | 'REPLAY'
+    let currentReplaySpeed = 1.0;
+    let prevFsmState = 'WAIT_SHOT';
+
+    function switchToLiveCam() {
+      currentCamMode = 'LIVE';
+      const streamImg = document.getElementById('camStreamImg');
+      const monitorBox = document.getElementById('camMonitorBox');
+      const modeBadge = document.getElementById('camModeBadge');
+      const shotBadge = document.getElementById('camShotBadge');
+      const btnLive = document.getElementById('btnLiveCam');
+      const btnReplay = document.getElementById('btnReplayCam');
+
+      streamImg.src = `/api/video/live?t=${Date.now()}`;
+      monitorBox.classList.remove('replay-active');
+      modeBadge.classList.remove('replay-mode');
+      modeBadge.textContent = '🔴 LIVE CAM';
+      shotBadge.textContent = 'REAL-TIME TABLE VIEW';
+      btnLive.classList.add('active');
+      btnReplay.classList.remove('active');
+    }
+
+    function switchToReplayCam(replayMeta) {
+      currentCamMode = 'REPLAY';
+      const streamImg = document.getElementById('camStreamImg');
+      const monitorBox = document.getElementById('camMonitorBox');
+      const modeBadge = document.getElementById('camModeBadge');
+      const shotBadge = document.getElementById('camShotBadge');
+      const btnLive = document.getElementById('btnLiveCam');
+      const btnReplay = document.getElementById('btnReplayCam');
+
+      streamImg.src = `/api/video/replay?speed=${currentReplaySpeed}&t=${Date.now()}`;
+      monitorBox.classList.add('replay-active');
+      modeBadge.classList.add('replay-mode');
+      modeBadge.textContent = `⏪ AUTO REPLAY (${currentReplaySpeed}x)`;
+
+      if (replayMeta && replayMeta.shot_type) {
+        const statusLabel = replayMeta.is_scored ? 'SCORED' : 'NO SCORE';
+        shotBadge.textContent = `${replayMeta.shot_type} · ${statusLabel}`;
+      } else {
+        shotBadge.textContent = 'PREVIOUS SHOT REPLAY';
+      }
+
+      btnLive.classList.remove('active');
+      btnReplay.classList.add('active');
+    }
+
+    function changeReplaySpeed(speed) {
+      currentReplaySpeed = Number(speed);
+      document.getElementById('speedBtn10').classList.toggle('active', currentReplaySpeed === 1.0);
+      document.getElementById('speedBtn05').classList.toggle('active', currentReplaySpeed === 0.5);
+      document.getElementById('speedBtn025').classList.toggle('active', currentReplaySpeed === 0.25);
+
+      if (currentCamMode === 'REPLAY') {
+        switchToReplayCam();
+      }
+    }
 
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -1056,6 +1288,9 @@
             renderScoreboard(packet.data);
           } else if (packet.type === 'VAR_ALERT') {
             showVarPopup(packet.data);
+          } else if (packet.type === 'AUTO_REPLAY_READY') {
+            // 3공이 모두 멈추는 순간 직전 샷 리플레이 영상으로 자동 전환
+            switchToReplayCam(packet.data);
           }
         } catch (err) {
           console.error('WebSocket message parse error:', err);
@@ -1119,6 +1354,12 @@
 
       const p1 = data.players.P1;
       const p2 = data.players.P2;
+
+      // 새로운 샷이 출발(SHOT_IN_PROGRESS)하면 자동으로 실시간 라이브캠으로 복귀
+      if (data.fsm_state === 'SHOT_IN_PROGRESS' && prevFsmState !== 'SHOT_IN_PROGRESS') {
+        switchToLiveCam();
+      }
+      prevFsmState = data.fsm_state;
 
       // 룰 모드 토글 버튼 업데이트
       currentRuleMode = data.rule_mode || 'STANDARD';
@@ -1255,11 +1496,15 @@
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ action: 'SIMULATE_SHOT', scenario }));
       } else {
-        await fetch('/api/match/simulate-shot', {
+        const res = await fetch('/api/match/simulate-shot', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ scenario }),
         });
+        const data = await res.json();
+        if (data && data.replay_meta) {
+          switchToReplayCam(data.replay_meta);
+        }
       }
     }
 
@@ -1306,6 +1551,7 @@
 
     async function resetMatch() {
       hideVarPopup();
+      switchToLiveCam();
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ action: 'RESET_MATCH' }));
       } else {
