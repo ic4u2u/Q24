@@ -218,6 +218,76 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
         self.assertIn("replayOneShotTimerId", html)
         self.assertIn("이닝별 득점 기록표", html)
         self.assertIn("작전타임 (+40초)", html)
+        self.assertIn("applyCueTheme('p1', 'WHITE')", html)
+        self.assertIn("applyCueTheme('p2', 'YELLOW')", html)
+
+    def test_immutable_cue_ball_colors_and_local_physics_ai_mcp(self) -> None:
+        """
+        1. 선공(P1)은 무조건 흰색(WHITE), 후공(P2)은 무조건 노란색(YELLOW)으로 고정되며
+           경기 및 득점 카운트 도중 절대 수구 색상이 바뀌지 않는지 검증
+        2. 2쿠션 공타 시 억지 3쿠션 부풀리기 없이 정확히 MISS(INSUFFICIENT_CUSHIONS)로 판정하는지 검증
+        3. 로컬 물리/AI MCP 서버(billiard_physics_mcp) 도구 조회 및 3쿠션 물리 검증 호출 테스트
+        """
+        from fastapi.testclient import TestClient
+        from cue24.api.server import app
+        from cue24.mcp.billiard_physics_mcp import billiard_mcp_server
+
+        client = TestClient(app)
+
+        # 1) MCP 도구 목록 조회 검증
+        tools_resp = client.get("/api/mcp/tools")
+        self.assertEqual(tools_resp.status_code, 200)
+        tools_json = tools_resp.json()
+        self.assertEqual(tools_json["mcp_server"], "cue24-local-billiard-physics-mcp")
+        tool_names = [t["name"] for t in tools_json["tools"]]
+        self.assertIn("verify_3cushion_shot_physics", tool_names)
+        self.assertIn("audit_cue_ball_identity", tool_names)
+
+        # 2) 2쿠션 후 제2적구 충돌 시 물리 AI MCP가 정확히 공타(is_scored=False)로 판정하는지 검증
+        miss_check = billiard_mcp_server.call_tool(
+            "verify_3cushion_shot_physics",
+            {
+                "events": [
+                    (20, "CUSHION", "BOTTOM"),
+                    (71, "CUSHION", "LEFT"),
+                    (72, "FIRST_HIT", "1"),
+                    (87, "SECOND_HIT", "2"),
+                ],
+                "first_object_ball_id": 1,
+                "second_object_ball_id": 2,
+                "cushions_before_first_hit": 2,
+                "cushions_before_second_hit": 2,
+                "total_cushions": 2,
+                "distinct_rails_before_second_hit": ["BOTTOM", "LEFT"],
+                "cue_travel_distance_mm": 2100.0,
+            },
+        )
+        self.assertFalse(miss_check["result"]["is_scored"])
+        self.assertEqual(miss_check["result"]["shot_type"], "MISS")
+        self.assertEqual(miss_check["result"]["reason_code"], "INSUFFICIENT_CUSHIONS")
+
+        # 3) 정식 3쿠션 후 제2적구 충돌 시 물리 AI MCP가 정확히 득점(is_scored=True)으로 판정하는지 검증
+        score_check = billiard_mcp_server.call_tool(
+            "verify_3cushion_shot_physics",
+            {
+                "events": [
+                    (10, "FIRST_HIT", "1"),
+                    (40, "CUSHION", "TOP"),
+                    (85, "CUSHION", "LEFT"),
+                    (120, "CUSHION", "BOTTOM"),
+                    (165, "SECOND_HIT", "3"),
+                ],
+                "first_object_ball_id": 1,
+                "second_object_ball_id": 3,
+                "cushions_before_first_hit": 0,
+                "cushions_before_second_hit": 3,
+                "total_cushions": 3,
+                "distinct_rails_before_second_hit": ["TOP", "LEFT", "BOTTOM"],
+                "cue_travel_distance_mm": 2850.0,
+            },
+        )
+        self.assertTrue(score_check["result"]["is_scored"])
+        self.assertEqual(score_check["result"]["shot_type"], "REGULAR_3C")
 
 
 if __name__ == "__main__":

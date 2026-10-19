@@ -204,19 +204,24 @@ class ScoringEngine:
         vx, vy = cue_vel
         prev_vx = self._prev_cue_vel[0] if self._prev_cue_vel is not None else 0.0
         prev_vy = self._prev_cue_vel[1] if self._prev_cue_vel is not None else 0.0
+        prev_vel_tuple = (prev_vx, prev_vy)
+
+        from cue24.mcp.billiard_physics_mcp import physics_ai_engine
 
         # 1. LEFT 레일 검사
         if x <= self.left_bound:
             if vx < -1e-4 or prev_vx < -1e-4:
                 self._approaching_rail["LEFT"] = True
             if self._approaching_rail["LEFT"] and vx > 1e-4:
-                self.record_cushion_touch("LEFT", frame_idx, cue_pos)
+                if physics_ai_engine.verify_cushion_impulse("LEFT", cue_pos, prev_vel_tuple, cue_vel):
+                    self.record_cushion_touch("LEFT", frame_idx, cue_pos)
+                    triggered_rails.append("LEFT")
                 self._approaching_rail["LEFT"] = False
-                triggered_rails.append("LEFT")
         else:
             if self._approaching_rail["LEFT"] and vx > 1e-4:
-                self.record_cushion_touch("LEFT", frame_idx, cue_pos)
-                triggered_rails.append("LEFT")
+                if physics_ai_engine.verify_cushion_impulse("LEFT", cue_pos, prev_vel_tuple, cue_vel):
+                    self.record_cushion_touch("LEFT", frame_idx, cue_pos)
+                    triggered_rails.append("LEFT")
             self._approaching_rail["LEFT"] = False
 
         # 2. RIGHT 레일 검사
@@ -224,13 +229,15 @@ class ScoringEngine:
             if vx > 1e-4 or prev_vx > 1e-4:
                 self._approaching_rail["RIGHT"] = True
             if self._approaching_rail["RIGHT"] and vx < -1e-4:
-                self.record_cushion_touch("RIGHT", frame_idx, cue_pos)
+                if physics_ai_engine.verify_cushion_impulse("RIGHT", cue_pos, prev_vel_tuple, cue_vel):
+                    self.record_cushion_touch("RIGHT", frame_idx, cue_pos)
+                    triggered_rails.append("RIGHT")
                 self._approaching_rail["RIGHT"] = False
-                triggered_rails.append("RIGHT")
         else:
             if self._approaching_rail["RIGHT"] and vx < -1e-4:
-                self.record_cushion_touch("RIGHT", frame_idx, cue_pos)
-                triggered_rails.append("RIGHT")
+                if physics_ai_engine.verify_cushion_impulse("RIGHT", cue_pos, prev_vel_tuple, cue_vel):
+                    self.record_cushion_touch("RIGHT", frame_idx, cue_pos)
+                    triggered_rails.append("RIGHT")
             self._approaching_rail["RIGHT"] = False
 
         # 3. TOP 레일 검사
@@ -238,13 +245,15 @@ class ScoringEngine:
             if vy < -1e-4 or prev_vy < -1e-4:
                 self._approaching_rail["TOP"] = True
             if self._approaching_rail["TOP"] and vy > 1e-4:
-                self.record_cushion_touch("TOP", frame_idx, cue_pos)
+                if physics_ai_engine.verify_cushion_impulse("TOP", cue_pos, prev_vel_tuple, cue_vel):
+                    self.record_cushion_touch("TOP", frame_idx, cue_pos)
+                    triggered_rails.append("TOP")
                 self._approaching_rail["TOP"] = False
-                triggered_rails.append("TOP")
         else:
             if self._approaching_rail["TOP"] and vy > 1e-4:
-                self.record_cushion_touch("TOP", frame_idx, cue_pos)
-                triggered_rails.append("TOP")
+                if physics_ai_engine.verify_cushion_impulse("TOP", cue_pos, prev_vel_tuple, cue_vel):
+                    self.record_cushion_touch("TOP", frame_idx, cue_pos)
+                    triggered_rails.append("TOP")
             self._approaching_rail["TOP"] = False
 
         # 4. BOTTOM 레일 검사
@@ -252,13 +261,15 @@ class ScoringEngine:
             if vy > 1e-4 or prev_vy > 1e-4:
                 self._approaching_rail["BOTTOM"] = True
             if self._approaching_rail["BOTTOM"] and vy < -1e-4:
-                self.record_cushion_touch("BOTTOM", frame_idx, cue_pos)
+                if physics_ai_engine.verify_cushion_impulse("BOTTOM", cue_pos, prev_vel_tuple, cue_vel):
+                    self.record_cushion_touch("BOTTOM", frame_idx, cue_pos)
+                    triggered_rails.append("BOTTOM")
                 self._approaching_rail["BOTTOM"] = False
-                triggered_rails.append("BOTTOM")
         else:
             if self._approaching_rail["BOTTOM"] and vy < -1e-4:
-                self.record_cushion_touch("BOTTOM", frame_idx, cue_pos)
-                triggered_rails.append("BOTTOM")
+                if physics_ai_engine.verify_cushion_impulse("BOTTOM", cue_pos, prev_vel_tuple, cue_vel):
+                    self.record_cushion_touch("BOTTOM", frame_idx, cue_pos)
+                    triggered_rails.append("BOTTOM")
             self._approaching_rail["BOTTOM"] = False
 
         return triggered_rails
@@ -304,10 +315,10 @@ class ScoringEngine:
                 cue_pos[1] - self._prev_cue_pos[1],
             )
 
-        # 1. 4면 쿠션 법선 속도 부호 반전(Velocity Reversal) 판정
+        # 1. 4면 쿠션 법선 속도 부호 반전(Velocity Reversal) + 물리 충격량(Impulse) 판정
         self._check_cushion_velocity_reversal(frame_idx, cue_pos, cue_vel)
 
-        # 2. 목적구(제1적구, 제2적구) 충돌 판정 (중심 거리 + 선분 접촉 + 3차 스플라인 곡선 복원 + 정지 목적구 피격 감지)
+        # 2. 목적구(제1적구, 제2적구) 충돌 판정 (수구 직접 접촉 + 스플라인 복원 + 적구 간 키스 분리 검증)
         spline_pts: List[Point2D] = []
         if self._prev_cue_pos is not None and self._prev_cue_vel is not None:
             from cue24.core.physics_tracker import PhysicsTracker
@@ -315,6 +326,8 @@ class ScoringEngine:
             spline_pts = PhysicsTracker.interpolate_cubic_spline(
                 self._prev_cue_pos, self._prev_cue_vel, cue_pos, cue_vel, num_steps=8
             )
+
+        from cue24.mcp.billiard_physics_mcp import physics_ai_engine
 
         for bid, pos in ball_positions.items():
             if bid == self.cue_ball_id:
@@ -333,26 +346,40 @@ class ScoringEngine:
             )
             min_approach_dist = min(dist, seg_dist, spline_dist)
 
-            # 목적구가 직전 프레임 대비 충격을 받아 갑자기 움직였는지 확인 (30fps 샘플링 보완)
-            target_impact_moved = False
+            # 다른 목적구(제1적구 등)와 현재 목적구 사이의 거리 계산 -> 적구끼리 부딪힌 키스(Kiss) 오판 차단용
+            other_obj_dist = 9999.0
+            for other_id, other_pos in ball_positions.items():
+                if other_id != self.cue_ball_id and other_id != bid:
+                    d_obj = math.hypot(pos[0] - other_pos[0], pos[1] - other_pos[1])
+                    if d_obj < other_obj_dist:
+                        other_obj_dist = d_obj
+
+            step_move = 0.0
+            prev_init_disp = 0.0
+            curr_init_disp = 0.0
             if bid in self._initial_ball_positions:
                 init_t = self._initial_ball_positions[bid]
                 curr_init_disp = math.hypot(pos[0] - init_t[0], pos[1] - init_t[1])
                 if curr_init_disp >= 20.0 and bid not in self._target_first_move_frame:
                     self._target_first_move_frame[bid] = frame_idx
 
-                if bid in self._prev_ball_positions:
-                    prev_t = self._prev_ball_positions[bid]
-                    step_move = math.hypot(pos[0] - prev_t[0], pos[1] - prev_t[1])
-                    prev_init_disp = math.hypot(prev_t[0] - init_t[0], prev_t[1] - init_t[1])
-                    # 정지해 있던 목적구가 충격으로 튕겨 나가기 시작한 순간 감지
-                    if prev_init_disp <= 18.0 and (
-                        (step_move >= 6.0 and min_approach_dist <= 260.0)
-                        or curr_init_disp >= 22.0
-                    ):
-                        target_impact_moved = True
+                prev_t = self._prev_ball_positions.get(bid, init_t)
+                step_move = math.hypot(pos[0] - prev_t[0], pos[1] - prev_t[1])
+                prev_init_disp = math.hypot(
+                    prev_t[0] - init_t[0], prev_t[1] - init_t[1]
+                )
 
-            if min_approach_dist <= self.ball_contact_th or target_impact_moved:
+            is_direct_hit = physics_ai_engine.verify_direct_cue_hit(
+                min_cue_to_target_dist_mm=min_approach_dist,
+                target_step_move_mm=step_move,
+                target_init_disp_mm=prev_init_disp,
+                curr_init_disp_mm=curr_init_disp,
+                other_object_to_target_dist_mm=other_obj_dist,
+                contact_threshold_mm=self.ball_contact_th,
+                is_first_object_hit_Done=(self.first_object_ball_id is not None),
+            )
+
+            if is_direct_hit:
                 if not self._in_contact_with_ball.get(bid, False):
                     self.record_ball_hit(bid, frame_idx, cue_pos)
                     self._in_contact_with_ball[bid] = True
@@ -367,134 +394,30 @@ class ScoringEngine:
 
     def evaluate_shot(self, has_double_touch_foul: bool = False) -> Dict[str, object]:
         """
-        샷이 완전히 정지한 후 기록된 이벤트 시퀀스를 기반으로 최종 3쿠션 룰을 평가합니다.
+        샷이 완전히 정지한 후 기록된 물리 이벤트 시퀀스를 기반으로
+        로컬 물리/AI 3쿠션 검증 엔진(LocalPhysics3CushionAI)을 통해 최종 3쿠션 룰을 평가합니다.
 
-        - 일반 3C: 1적구 충돌 -> (2적구 충돌 전 총 쿠션 접촉 >= 3회) -> 2적구 충돌 성립 시 득점 인정
-        - 뱅크 샷: 공 접촉 전 쿠션 접촉 >= 3회 선행 -> 1적구 충돌 -> 2적구 충돌 성립 시 득점 인정
-        - 그 외: 공타(Miss) 사유(쿠션 부족, 2적구 불발, 1적구 불발, 더블터치 파울) 분류
-
-        Returns:
-            result: {
-                "is_scored": bool,
-                "shot_type": "REGULAR_3C" | "BANK_SHOT" | "MISS" | "FOUL",
-                "reason_code": str,
-                "message": str,
-                "cushions_before_first_hit": int,
-                "cushions_before_second_hit": int,
-                "total_cushions": int,
-                "events": List[ShotEvent],
-            }
+        - 일반 3C: 1적구 충돌 -> (2적구 충돌 전 총 쿠션 접촉 >= 3회) -> 2적구 충돌 성립 시에만 득점 인정
+        - 뱅크 샷: 공 접촉 전 쿠션 접촉 >= 3회 선행 -> 1적구 충돌 -> 2적구 충돌 성립 시에만 득점 인정
+        - 그 외: 2쿠션 이하에서 제2적구를 맞혔거나 제2적구를 맞히지 못한 경우 엄격히 공타(MISS) 처리
         """
-        if has_double_touch_foul:
-            return {
-                "is_scored": False,
-                "shot_type": "FOUL",
-                "reason_code": "DOUBLE_TOUCH_FOUL",
-                "message": "쿠션 이중 터치(Double Touch) 파울로 공타 처리되었습니다.",
-                "cushions_before_first_hit": self.cushion_count_before_first_hit,
-                "cushions_before_second_hit": self.cushion_count_before_second_hit,
-                "total_cushions": self.total_cushion_count,
-                "events": list(self.events),
-            }
+        from cue24.mcp.billiard_physics_mcp import physics_ai_engine
 
-        # [30fps 고속 모션 블러/터널링 물리 교차 검증 보정]
-        # 샷 시작 대비 정지 시점에 두 목적구가 모두 초기 정지 위치에서 20mm 이상 실제로 이동했다면
-        # 물리적으로 제1적구와 제2적구 충돌이 모두 성립한 것이므로 누락된 충돌/코너 반사를 복원합니다.
-        moved_targets: List[Tuple[int, int]] = []
-        if self._initial_ball_positions and self._prev_ball_positions:
-            for bid, init_pt in self._initial_ball_positions.items():
-                if bid == self.cue_ball_id:
-                    continue
-                end_pt = self._prev_ball_positions.get(bid, init_pt)
-                disp = math.hypot(end_pt[0] - init_pt[0], end_pt[1] - init_pt[1])
-                if disp >= 20.0:
-                    first_f = self._target_first_move_frame.get(bid, 999999)
-                    moved_targets.append((first_f, bid))
-
-        moved_targets.sort()
-        if len(moved_targets) >= 2:
-            t1_id = moved_targets[0][1]
-            t2_id = moved_targets[1][1]
-            cue_last = self._prev_cue_pos or (0.0, 0.0)
-            if self.first_object_ball_id is None:
-                self.record_ball_hit(t1_id, moved_targets[0][0], cue_last)
-            if self.second_object_ball_id is None:
-                other_id = t2_id if self.first_object_ball_id != t2_id else t1_id
-                self.record_ball_hit(other_id, moved_targets[1][0], cue_last)
-            # 두 목적구가 모두 실제 충돌로 이동했고 수구 주행거리가 충분(>=1400mm)하며 2쿠션 이상 감지된 경우 고속 코너 반사 3쿠션 복원
-            if (
-                self.cushion_count_before_second_hit < 3
-                and self.total_cushion_count >= 2
-                and self.cue_travel_distance_mm >= 1400.0
-            ):
-                self.total_cushion_count = max(3, self.total_cushion_count)
-                self.cushion_count_before_second_hit = max(
-                    3, self.cushion_count_before_second_hit, self.total_cushion_count
-                )
-
-        # 케이스 1: 제1적구조차 맞히지 못한 경우
-        if self.first_object_ball_id is None:
-            return {
-                "is_scored": False,
-                "shot_type": "MISS",
-                "reason_code": "NO_BALL_HIT",
-                "message": "공타: 제1목적구 충돌이 발생하지 않았습니다.",
-                "cushions_before_first_hit": self.cushion_count_before_first_hit,
-                "cushions_before_second_hit": self.cushion_count_before_second_hit,
-                "total_cushions": self.total_cushion_count,
-                "events": list(self.events),
-            }
-
-        # 케이스 2: 제1적구는 맞혔으나 제2적구를 맞히지 못한 경우
-        if self.second_object_ball_id is None:
-            return {
-                "is_scored": False,
-                "shot_type": "MISS",
-                "reason_code": "NO_SECOND_BALL_HIT",
-                "message": f"공타: 제2목적구 불발 (현재 누적 {self.total_cushion_count}쿠션).",
-                "cushions_before_first_hit": self.cushion_count_before_first_hit,
-                "cushions_before_second_hit": self.cushion_count_before_second_hit,
-                "total_cushions": self.total_cushion_count,
-                "events": list(self.events),
-            }
-
-        # 케이스 3: 제1적구와 제2적구를 모두 맞혔으나, 제2적구 충돌 시점까지 누적 쿠션이 3회 미만인 경우
-        if self.cushion_count_before_second_hit < 3:
-            return {
-                "is_scored": False,
-                "shot_type": "MISS",
-                "reason_code": "INSUFFICIENT_CUSHIONS",
-                "message": (
-                    f"공타: 쿠션 부족 (제2적구 접촉 시점 {self.cushion_count_before_second_hit}쿠션 < 3쿠션)."
-                ),
-                "cushions_before_first_hit": self.cushion_count_before_first_hit,
-                "cushions_before_second_hit": self.cushion_count_before_second_hit,
-                "total_cushions": self.total_cushion_count,
-                "events": list(self.events),
-            }
-
-        # 케이스 4: 득점 성공! (공 접촉 전 3쿠션 이상 선행 여부에 따라 뱅크 샷 / 일반 3C 분류)
-        if self.cushion_count_before_first_hit >= 3:
-            return {
-                "is_scored": True,
-                "shot_type": "BANK_SHOT",
-                "reason_code": "VALID_BANK_SHOT",
-                "message": (
-                    f"득점 인정 (뱅크 샷): 선행 {self.cushion_count_before_first_hit}쿠션 후 제1·2적구 충돌 성공!"
-                ),
-                "cushions_before_first_hit": self.cushion_count_before_first_hit,
-                "cushions_before_second_hit": self.cushion_count_before_second_hit,
-                "total_cushions": self.total_cushion_count,
-                "events": list(self.events),
-            }
+        verified = physics_ai_engine.verify_3cushion_shot(
+            first_object_ball_id=self.first_object_ball_id,
+            second_object_ball_id=self.second_object_ball_id,
+            cushions_before_first_hit=self.cushion_count_before_first_hit,
+            cushions_before_second_hit=self.cushion_count_before_second_hit,
+            total_cushions=self.total_cushion_count,
+            has_double_touch_foul=has_double_touch_foul,
+        )
 
         return {
-            "is_scored": True,
-            "shot_type": "REGULAR_3C",
-            "reason_code": "VALID_REGULAR_3C",
-            "message": (
-                f"득점 인정 (일반 3쿠션): 총 {self.cushion_count_before_second_hit}쿠션 후 제2적구 충돌 성공!"
-            ),
+            "is_scored": bool(verified["is_scored"]),
+            "shot_type": str(verified["shot_type"]),
+            "reason_code": str(verified["reason_code"]),
+            "message": str(verified["message"]),
+            "confidence": float(verified.get("confidence", 1.0)),
             "cushions_before_first_hit": self.cushion_count_before_first_hit,
             "cushions_before_second_hit": self.cushion_count_before_second_hit,
             "total_cushions": self.total_cushion_count,

@@ -143,8 +143,10 @@ class LocalPhysics3CushionAI:
         min_cue_to_target_dist_mm: float,
         target_step_move_mm: float,
         target_init_disp_mm: float,
+        curr_init_disp_mm: float = 0.0,
         other_object_to_target_dist_mm: float = 9999.0,
         contact_threshold_mm: float = 64.0,
+        is_first_object_hit_Done: bool = False,
     ) -> bool:
         """
         [물리 법칙 3: 수구 직접 타격 vs 적구 간 키스(Kiss) 분리 검증]
@@ -153,21 +155,35 @@ class LocalPhysics3CushionAI:
 
         판정 기준:
         1) 수구-목적구 최단 접근 거리가 물리적 접촉 반경(contact_threshold_mm, 약 64mm) 이내이면 직접 접촉 인정!
-        2) 30fps 고속 주행 중 프레임 사이 터널링으로 목적구가 갑자기 튕겨 나간 경우(target_step_move_mm >= 5.5mm):
-           - 반드시 수구와의 최단 접근 거리가 FAST_TUNNELING_MAX_DIST_MM(165mm) 이내여야 하며,
-           - 동시에 다른 목적구와의 거리(other_object_to_target_dist_mm)보다 수구가 더 가까워야만(또는 다른 목적구가 90mm 밖)
-             수구에 의한 직접 타격으로 인정합니다! (수구가 멀리 있는데 목적구 혼자 22mm 움직였다고 타격으로 인정하던 오류 원천 제거)
+        2) 아직 제1적구 접촉이 발생하기 전(is_first_object_hit_Done == False):
+           - 당구대 위에서 에너지를 가진 공은 오직 수구(Cue Ball) 하나뿐이므로 적구 간 키스가 물리적으로 불가능합니다.
+           - 따라서 정지해 있던 목적구가 초기 위치에서 22mm 이상 확실히 이탈(curr_init_disp_mm >= 22.0)했거나
+             충격 스텝(target_step_move_mm >= 5.5mm, 거리 <= 260mm)이 발생하면 제1적구 타격으로 인정합니다.
+        3) 이미 제1적구가 맞은 후 제2적구 접촉을 판정할 때(is_first_object_hit_Done == True):
+           - 제1적구가 굴러가서 제2적구를 치는 '키스'를 차단하기 위해, 반드시 수구와의 최단 거리가 210mm 이내여야 하며
+             다른 목적구가 밀착(< 85mm)하여 수구보다 더 가까운 경우(적구 간 키스)를 철저히 배제합니다.
         """
         if min_cue_to_target_dist_mm <= contact_threshold_mm:
             return True
 
-        # 고속 프레임 터널링 보완: 수구가 근접(<= 165mm)한 상태에서 목적구가 충격으로 급격히 출발한 경우
+        # 제1적구 타격 전: 당구대 위에 움직이는 공은 수구뿐이므로 목적구가 정지 위치에서 22mm 이상 튕겨나가면 수구 타격 확정
+        if not is_first_object_hit_Done:
+            if curr_init_disp_mm >= 22.0 and min_cue_to_target_dist_mm <= 420.0:
+                return True
+            if (
+                target_init_disp_mm <= 18.0
+                and target_step_move_mm >= self.MIN_TARGET_IMPACT_STEP_MM
+                and min_cue_to_target_dist_mm <= 260.0
+            ):
+                return True
+            return False
+
+        # 제2적구 타격 판정: 고속 터널링 보완 + 제1적구에 의한 키스(Kiss) 엄격 차단
         if (
             target_init_disp_mm <= 18.0
-            and target_step_move_mm >= self.MIN_TARGET_IMPACT_STEP_MM
-            and min_cue_to_target_dist_mm <= self.FAST_TUNNELING_MAX_DIST_MM
+            and (target_step_move_mm >= self.MIN_TARGET_IMPACT_STEP_MM or curr_init_disp_mm >= 22.0)
+            and min_cue_to_target_dist_mm <= 210.0
         ):
-            # 만약 다른 목적구가 해당 목적구에 85mm 이내로 밀착해 있고 수구보다 더 가깝다면 '적구 간 키스'이므로 배제!
             if (
                 other_object_to_target_dist_mm < 85.0
                 and other_object_to_target_dist_mm < min_cue_to_target_dist_mm

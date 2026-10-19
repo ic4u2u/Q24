@@ -1209,7 +1209,7 @@
 
       <div class="quick-hub-actions">
         <button class="hub-btn" onclick="useTimeout()" data-legacy-action="TIME-OUT (+40s)">⏱️ 작전타임 (+40초)</button>
-        <button class="hub-btn" onclick="swapCueBalls()">🔄 수구 색상 교대</button>
+        <button class="hub-btn" onclick="swapCueBalls()">🔄 공격권(턴) 교대</button>
       </div>
 
       <div class="state-banner">
@@ -1714,9 +1714,9 @@
         p2Card.classList.add('active-p2');
       }
 
-      // 수구 색상 테마 동기화
-      applyCueTheme('p1', p1.cue_ball_color);
-      applyCueTheme('p2', p2.cue_ball_color);
+      // [불변 규칙 강제] 선공(1번 선수)은 무조건 흰공(WHITE), 후공(2번 선수)은 무조건 노란공(YELLOW) 영구 고정
+      applyCueTheme('p1', 'WHITE');
+      applyCueTheme('p2', 'YELLOW');
 
       // P1 데이터 렌더링
       document.getElementById('p1Name').textContent = p1NameKo;
@@ -1867,9 +1867,9 @@
 
     async function swapCueBalls() {
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ action: 'SWAP_CUES' }));
+        ws.send(JSON.stringify({ action: 'SWITCH_TURN' }));
       } else {
-        await fetch('/api/match/swap-cues', { method: 'POST' });
+        await fetch('/api/match/switch-turn', { method: 'POST' });
       }
     }
 

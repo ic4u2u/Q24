@@ -34,6 +34,7 @@ from cue24.core.replay_buffer import ReplayRingBuffer, SyntheticCamGenerator
 from cue24.core.scoring_engine import ScoringEngine
 from cue24.core.table_calibrator import TableCalibrator
 from cue24.core.var_referee import VARReferee
+from cue24.mcp.billiard_physics_mcp import billiard_mcp_server, physics_ai_engine
 from cue24.services.match_manager import MatchManager, MatchState
 
 Point2D = Tuple[float, float]
@@ -831,11 +832,16 @@ class LiveStreamReader:
 
         # 2. WAIT_SHOT 상태에서 처음 움직이는 공을 수구(Cue Ball)로 인식 및 2단계(색상 감지기 OFF + 타이머 정지) 진입
         if self.match_manager.fsm_state == MatchState.WAIT_SHOT:
+            # [불변 규칙 강제] 선공(P1)은 무조건 흰색(WHITE), 후공(P2)은 무조건 노란색(YELLOW)으로 영구 고정
+            self.match_manager.players["P1"].cue_ball_color = "WHITE"
+            self.match_manager.players["P2"].cue_ball_color = "YELLOW"
+
             vel_th = (
                 start_velocity_th
                 if start_velocity_th is not None
                 else settings.STOP_VELOCITY_TH
             )
+            active_expected_color = self.match_manager.active_cue_ball_color
             moving_candidates: List[Tuple[float, int]] = []
 
             for bid, st in ball_states.items():
@@ -848,7 +854,13 @@ class LiveStreamReader:
                     )
                     if disp < self.VISION_START_DISP_MM:
                         continue
-                color_bonus = 1000.0 if st.color in ("WHITE", "YELLOW") else 0.0
+                # 현재 턴 플레이어의 고유 수구 색상이 움직였을 때 최우선 선택 (맞은 공을 수구로 오인하는 현상 방지)
+                if st.color == active_expected_color:
+                    color_bonus = 3000.0
+                elif st.color in ("WHITE", "YELLOW"):
+                    color_bonus = 1000.0
+                else:
+                    color_bonus = 0.0
                 moving_candidates.append((color_bonus + st.speed, bid))
 
             if moving_candidates:
@@ -885,10 +897,19 @@ class LiveStreamReader:
                 self.color_locker.set_shot_lock(True)
                 self.bulletproof_tracker.is_shot_in_progress = True
 
-                # 현재 공격 플레이어의 수구 색상 표시를 실제 출발한 수구 색상(WHITE/YELLOW)과 동기화
-                if cue_state.color in ("WHITE", "YELLOW"):
-                    if self.match_manager.active_cue_ball_color != cue_state.color:
-                        self.match_manager.swap_cue_balls()
+                # [절대 원칙] 선공(P1=WHITE)과 후공(P2=YELLOW)의 수구 색상은 절대로 바꾸지 않음!
+                # 실제 카메라/영상 스트림(require_rest_displacement=True)에서 만약 흰공이 출발하면 P1 턴,
+                # 노란공이 단독 출발하면 P2 턴으로 공격권만 일치시키고 공 색깔은 절대 스왑하지 않습니다.
+                self.match_manager.players["P1"].cue_ball_color = "WHITE"
+                self.match_manager.players["P2"].cue_ball_color = "YELLOW"
+                if require_rest_displacement and cue_state.color in ("WHITE", "YELLOW"):
+                    owner_pid = "P1" if cue_state.color == "WHITE" else "P2"
+                    if self.match_manager.active_player_id != owner_pid:
+                        self.match_manager.active_player_id = owner_pid
+                        owner_player = self.match_manager.players[owner_pid]
+                        if owner_player.innings <= 0:
+                            owner_player.innings = 1
+                            owner_player.inning_scores[1] = 0
 
                 # 수구가 움직였으므로 샷 클락(카운트) 작동을 즉시 멈추고 득점 알고리즘 가동
                 self.match_manager.on_shot_started()
@@ -900,7 +921,7 @@ class LiveStreamReader:
                 )
                 # 샷 출발 전 정지 기준점(_rest_positions)이 존재하면 득점 엔진 초기 위치로 보존
                 if self._rest_positions and len(self._rest_positions) == 3:
-                    self.scoring_engine._initial_positions = {
+                    self.scoring_engine._initial_ball_positions = {
                         bid: self._rest_positions[bid]
                         for bid in ball_states.keys()
                         if bid in self._rest_positions
@@ -1000,10 +1021,17 @@ class LiveStreamReader:
                 self._missing_streak_by_id.clear()
                 self._last_missing_wait_id = None
 
+                # [불변 규칙 강제] 득점/공타 정산 전후 선공(P1)=WHITE, 후공(P2)=YELLOW 영구 고정
+                self.match_manager.players["P1"].cue_ball_color = "WHITE"
+                self.match_manager.players["P2"].cue_ball_color = "YELLOW"
+
                 shot_eval = self.scoring_engine.evaluate_shot(
                     has_double_touch_foul=has_double_touch_foul
                 )
                 transition = self.match_manager.on_ball_stopped(shot_eval)
+
+                self.match_manager.players["P1"].cue_ball_color = "WHITE"
+                self.match_manager.players["P2"].cue_ball_color = "YELLOW"
 
                 # 정지 직후 공 3개의 좌표를 다음 샷 감지를 위한 새로운 정지 기준점(_rest_positions)으로 저장
                 self._rest_positions = {
@@ -1435,6 +1463,45 @@ async def simulate_shot(req: SimulateShotRequest) -> Dict[str, Any]:
     }
 
 
+class MCPToolCallRequest(BaseModel):
+    """로컬 물리/AI 3쿠션 MCP 도구 호출 요청 스키마"""
+
+    name: str = Field(
+        default="verify_3cushion_shot_physics",
+        description="실행할 MCP 도구명: verify_3cushion_shot_physics | audit_cue_ball_identity",
+    )
+    arguments: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="MCP 도구 입력 인자 딕셔너리",
+    )
+
+
+@app.get("/api/mcp/tools")
+async def list_mcp_tools() -> Dict[str, Any]:
+    """로컬 3쿠션 물리/AI 판독 MCP 서버가 제공하는 도구 스키마 목록을 반환합니다."""
+    return {
+        "mcp_server": "cue24-local-billiard-physics-mcp",
+        "hf_model_loaded": physics_ai_engine.hf_model_loaded,
+        "tools": billiard_mcp_server.list_tools(),
+    }
+
+
+@app.post("/api/mcp/call")
+async def call_mcp_tool_endpoint(req: MCPToolCallRequest) -> Dict[str, Any]:
+    """로컬 3쿠션 물리/AI 판독 MCP 도구를 실행하고 검증 결과를 반환합니다."""
+    return billiard_mcp_server.call_tool(req.name, req.arguments)
+
+
+@app.post("/api/match/switch-turn")
+async def switch_player_turn() -> Dict[str, Any]:
+    """선공(P1=흰공)/후공(P2=노란공)의 수구 색상은 절대 바꾸지 않고 공격권(턴)만 교대합니다."""
+    match_manager.players["P1"].cue_ball_color = "WHITE"
+    match_manager.players["P2"].cue_ball_color = "YELLOW"
+    payload = match_manager.force_switch_turn()
+    await ws_manager.broadcast_event("TURN_CHANGED", payload)
+    return payload
+
+
 @app.websocket("/ws/scoreboard")
 async def websocket_scoreboard_endpoint(websocket: WebSocket) -> None:
     """
@@ -1476,6 +1543,11 @@ async def websocket_scoreboard_endpoint(websocket: WebSocket) -> None:
                 delta = int(msg.get("delta", 1))
                 payload = match_manager.adjust_score(pid, delta)
                 await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "SWITCH_TURN":
+                match_manager.players["P1"].cue_ball_color = "WHITE"
+                match_manager.players["P2"].cue_ball_color = "YELLOW"
+                payload = match_manager.force_switch_turn()
+                await ws_manager.broadcast_event("TURN_CHANGED", payload)
             elif action == "SWAP_CUES":
                 payload = match_manager.swap_cue_balls()
                 await ws_manager.broadcast_event("SCORE_UPDATED", payload)
