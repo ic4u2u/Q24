@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CUE24 - Smart 3-Cushion Digital Scoreboard & Hawk-Eye VAR</title>
+  <style>
+    :root {
+      --bg-dark: #070b14;
+      --bg-panel: #0f172a;
+      --bg-panel-active: #13203c;
+      --border-dim: #1e293b;
+      --border-active-p1: #38bdf8;
+      --border-active-p2: #facc15;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent-cyan: #00f2fe;
+      --accent-green: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-red: #ef4444;
+      --ball-white: #f8fafc;
+      --ball-yellow: #facc15;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    body {
+      background: radial-gradient(circle at 50% 0%, #111c35 0%, var(--bg-dark) 75%);
+      color: var(--text-main);
+      font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      overflow-x: hidden;
+      padding: 18px 24px;
+    }
+
+    /* 상단 헤더 바 */
+    .top-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 20px;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid var(--border-dim);
+      border-radius: 14px;
+      backdrop-filter: blur(10px);
+    }
+
+    .brand-box {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .brand-logo {
+      font-size: 1.5rem;
+      font-weight: 900;
+      letter-spacing: 2px;
+      background: linear-gradient(90deg, #38bdf8, #818cf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand-sub {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      border-left: 2px solid var(--border-dim);
+      padding-left: 12px;
+    }
+
+    .status-indicators {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      font-size: 0.9rem;
+    }
+
+    .ws-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 999px;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      color: #34d399;
+      font-weight: 600;
+    }
+
+    .ws-pill.disconnected {
+      background: rgba(239, 68, 68, 0.15);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: #f87171;
+    }
+
+    .ws-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 8px currentColor;
+    }
+
+    /* 메인 스코어보드 3단 그리드 (좌: P1, 중: 타이머/쿠션, 우: P2) */
+    .scoreboard-grid {
+      display: grid;
+      grid-template-columns: 1fr 380px 1fr;
+      gap: 24px;
+      align-items: stretch;
+      margin: 18px 0;
+      flex: 1;
+    }
+
+    /* 플레이어 카드 */
+    .player-card {
+      position: relative;
+      background: var(--bg-panel);
+      border: 2px solid var(--border-dim);
+      border-radius: 24px;
+      padding: 28px 32px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: 0 12px 35px rgba(0, 0, 0, 0.45);
+    }
+
+    .player-card.active-p1 {
+      background: linear-gradient(160deg, #132342 0%, #0d172a 100%);
+      border-color: var(--border-active-p1);
+      box-shadow: 0 0 35px rgba(56, 189, 248, 0.22);
+    }
+
+    .player-card.active-p2 {
+      background: linear-gradient(160deg, #272212 0%, #0d172a 100%);
+      border-color: var(--border-active-p2);
+      box-shadow: 0 0 35px rgba(250, 204, 21, 0.22);
+    }
+
+    .player-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .player-title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    /* 수구 표시등 (WHITE / YELLOW 구체) */
+    .cue-ball-lamp {
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      position: relative;
+      box-shadow: inset -5px -5px 10px rgba(0, 0, 0, 0.45), 0 0 14px rgba(255, 255, 255, 0.25);
+    }
+
+    .cue-ball-lamp::after {
+      content: '';
+      position: absolute;
+      top: 6px;
+      left: 8px;
+      width: 10px;
+      height: 6px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.85);
+      transform: rotate(-25deg);
+    }
+
+    .cue-ball-lamp.white {
+      background: radial-gradient(circle at 35% 35%, #ffffff, #cbd5e1);
+    }
+
+    .cue-ball-lamp.yellow {
+      background: radial-gradient(circle at 35% 35%, #fef08a, #eab308);
+      box-shadow: inset -5px -5px 10px rgba(0, 0, 0, 0.45), 0 0 14px rgba(250, 204, 21, 0.4);
+    }
+
+    .player-name {
+      font-size: 2rem;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+    }
+
+    .attack-badge {
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: 800;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      opacity: 0;
+      transform: scale(0.9);
+      transition: all 0.25s ease;
+    }
+
+    .active-p1 .attack-badge {
+      opacity: 1;
+      transform: scale(1);
+      background: rgba(56, 189, 248, 0.2);
+      border: 1px solid #38bdf8;
+      color: #7dd3fc;
+    }
+
+    .active-p2 .attack-badge {
+      opacity: 1;
+      transform: scale(1);
+      background: rgba(250, 204, 21, 0.2);
+      border: 1px solid #facc15;
+      color: #fde047;
+    }
+
+    /* 초대형 점수 폰트 */
+    .score-display {
+      font-size: 9.5rem;
+      font-weight: 900;
+      line-height: 1;
+      text-align: center;
+      margin: 20px 0;
+      font-variant-numeric: tabular-nums;
+      text-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+      transition: transform 0.25s ease, color 0.25s ease;
+    }
+
+    .score-display.bump {
+      transform: scale(1.12);
+      color: #34d399;
+    }
+
+    /* 플레이어 하단 스탯 그리드 (이닝, 에버리지, 하이런) */
+    .player-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      border-top: 1px solid rgba(148, 163, 184, 0.15);
+      padding-top: 18px;
+    }
+
+    .stat-box {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      border-radius: 14px;
+      padding: 12px 14px;
+      text-align: center;
+    }
+
+    .stat-label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .stat-value {
+      font-size: 1.55rem;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* 중앙 허브 (타이머, 쿠션 카운트, 경기 상태) */
+    .center-hub {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-dim);
+      border-radius: 24px;
+      padding: 24px 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 12px 35px rgba(0, 0, 0, 0.45);
+    }
+
+    .inning-header {
+      text-align: center;
+    }
+
+    .inning-label {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      letter-spacing: 2px;
+      font-weight: 700;
+    }
+
+    .inning-number {
+      font-size: 2.4rem;
+      font-weight: 900;
+      color: #38bdf8;
+    }
+
+    /* 40초 원형 프로그레스 타이머 */
+    .timer-wrapper {
+      position: relative;
+      width: 220px;
+      height: 220px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .timer-svg {
+      width: 220px;
+      height: 220px;
+      transform: rotate(-90deg);
+    }
+
+    .timer-bg-circle {
+      fill: none;
+      stroke: #1e293b;
+      stroke-width: 14;
+    }
+
+    .timer-fg-circle {
+      fill: none;
+      stroke: var(--accent-green);
+      stroke-width: 14;
+      stroke-linecap: round;
+      stroke-dasharray: 590.6; /* 2 * pi * 94 */
+      stroke-dashoffset: 0;
+      transition: stroke-dashoffset 0.35s linear, stroke 0.3s ease;
+    }
+
+    .timer-center-text {
+      position: absolute;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .timer-seconds {
+      font-size: 4.2rem;
+      font-weight: 900;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .timer-unit {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-top: 6px;
+      font-weight: 700;
+    }
+
+    /* 쿠션 카운트 배지 */
+    .cushion-counter-box {
+      width: 100%;
+      background: rgba(2, 6, 23, 0.7);
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 14px 18px;
+      text-align: center;
+    }
+
+    .cushion-title {
+      font-size: 1.35rem;
+      font-weight: 900;
+      letter-spacing: 1.5px;
+      color: #e2e8f0;
+    }
+
+    .cushion-title span {
+      color: #38bdf8;
+      font-size: 1.8rem;
+      margin-left: 6px;
+    }
+
+    .cushion-pips {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .pip {
+      width: 44px;
+      height: 10px;
+      border-radius: 999px;
+      background: #1e293b;
+      transition: all 0.25s ease;
+    }
+
+    .pip.lit {
+      background: #10b981;
+      box-shadow: 0 0 12px #10b981;
+    }
+
+    /* 경기 상태 배너 */
+    .state-banner {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      text-align: center;
+    }
+
+    .state-code {
+      font-size: 0.8rem;
+      font-weight: 800;
+      color: #38bdf8;
+      letter-spacing: 1px;
+      margin-bottom: 4px;
+    }
+
+    .state-message {
+      font-size: 0.92rem;
+      color: #f1f5f9;
+      font-weight: 600;
+      line-height: 1.35;
+    }
+
+    /* 우측 상단 오버레이: [CUE24 HAWK-EYE VAR] 현미경 판독 팝업창 */
+    .var-popup {
+      position: fixed;
+      top: 84px;
+      right: 28px;
+      width: 410px;
+      background: rgba(9, 14, 28, 0.96);
+      border: 2px solid #38bdf8;
+      border-radius: 18px;
+      padding: 20px 22px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.85), 0 0 30px rgba(56, 189, 248, 0.35);
+      z-index: 999;
+      transform: translateX(460px);
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .var-popup.show {
+      transform: translateX(0);
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .var-popup.foul {
+      border-color: var(--accent-red);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.85), 0 0 35px rgba(239, 68, 68, 0.45);
+    }
+
+    .var-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+      padding-bottom: 10px;
+      margin-bottom: 12px;
+    }
+
+    .var-title {
+      font-size: 1rem;
+      font-weight: 900;
+      letter-spacing: 1px;
+      color: #38bdf8;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .var-popup.foul .var-title {
+      color: #f87171;
+    }
+
+    .var-close-btn {
+      background: transparent;
+      border: 1px solid #475569;
+      color: #cbd5e1;
+      border-radius: 8px;
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      min-height: 36px;
+    }
+
+    .var-metrics {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .var-metric-card {
+      background: rgba(30, 41, 59, 0.65);
+      border-radius: 10px;
+      padding: 10px 12px;
+      text-align: center;
+    }
+
+    .var-metric-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+
+    .var-metric-val {
+      font-size: 1.35rem;
+      font-weight: 900;
+      color: #f8fafc;
+    }
+
+    .var-desc {
+      font-size: 0.9rem;
+      line-height: 1.45;
+      color: #e2e8f0;
+      font-weight: 600;
+    }
+
+    /* 하단 시뮬레이션 & 관제 컨트롤 바 (터치 영역 최소 44px 이상) */
+    .control-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 20px;
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid var(--border-dim);
+      border-radius: 16px;
+    }
+
+    .control-label {
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: var(--text-muted);
+    }
+
+    .btn-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .ctrl-btn {
+      min-height: 46px;
+      padding: 0 18px;
+      border-radius: 10px;
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: #f8fafc;
+      font-size: 0.9rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .ctrl-btn:hover {
+      background: #334155;
+      transform: translateY(-1px);
+    }
+
+    .ctrl-btn.primary {
+      background: rgba(16, 185, 129, 0.2);
+      border-color: #10b981;
+      color: #6ee7b7;
+    }
+
+    .ctrl-btn.var-btn {
+      background: rgba(56, 189, 248, 0.18);
+      border-color: #38bdf8;
+      color: #7dd3fc;
+    }
+
+    .ctrl-btn.danger {
+      background: rgba(239, 68, 68, 0.18);
+      border-color: #ef4444;
+      color: #fca5a5;
+    }
+
+    /* 반응형 레이아웃 대응 (태블릿/작은 화면) */
+    @media (max-width: 1180px) {
+      .scoreboard-grid {
+        grid-template-columns: 1fr;
+      }
+      .score-display {
+        font-size: 6.5rem;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 상단 상태 헤더 -->
+  <header class="top-bar">
+    <div class="brand-box">
+      <div class="brand-logo">CUE24</div>
+      <div class="brand-sub">AI 3-CUSHION UNMANNED SCOREBOARD &amp; MICRO-HAWK VAR</div>
+    </div>
+    <div class="status-indicators">
+      <div id="fsmBadge" style="font-weight:700; color:#94a3b8;">STATE: WAIT_SHOT</div>
+      <div id="wsStatusPill" class="ws-pill">
+        <span class="ws-dot"></span>
+        <span id="wsStatusText">LIVE CONNECTED</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- 우측 상단 오버레이: [CUE24 HAWK-EYE VAR] 팝업창 -->
+  <aside id="varPopup" class="var-popup" role="alert">
+    <div class="var-header">
+      <div class="var-title">
+        <span>🔬 [CUE24 HAWK-EYE VAR]</span>
+      </div>
+      <button class="var-close-btn" onclick="hideVarPopup()">닫기 ✕</button>
+    </div>
+    <div class="var-metrics">
+      <div class="var-metric-card">
+        <div class="var-metric-label">서브픽셀 최소 간극 (GAP)</div>
+        <div id="varGapVal" class="var-metric-val">-0.15 mm</div>
+      </div>
+      <div class="var-metric-card">
+        <div id="varSecondLabel" class="var-metric-label">수구 진행 굴절각</div>
+        <div id="varSecondVal" class="var-metric-val">0.68°</div>
+      </div>
+    </div>
+    <div id="varMessage" class="var-desc">
+      미세 접촉 판독 결과가 이곳에 표시됩니다.
+    </div>
+  </aside>
+
+  <!-- 메인 3단 스코어보드 -->
+  <main class="scoreboard-grid">
+    <!-- 좌측: Player 1 카드 -->
+    <section id="p1Card" class="player-card active-p1">
+      <div class="player-header">
+        <div class="player-title-wrap">
+          <div id="p1CueLamp" class="cue-ball-lamp white" title="수구: WHITE"></div>
+          <h2 id="p1Name" class="player-name">PLAYER 1</h2>
+        </div>
+        <span class="attack-badge">ATTACKING</span>
+      </div>
+
+      <div id="p1Score" class="score-display">0</div>
+
+      <div class="player-stats">
+        <div class="stat-box">
+          <div class="stat-label">INNING</div>
+          <div id="p1Inning" class="stat-value">1</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">AVERAGE</div>
+          <div id="p1Avg" class="stat-value">0.000</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">HIGH RUN (RUN)</div>
+          <div id="p1HighRun" class="stat-value">0 (0)</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 중앙: 40초 원형 프로그레스 타이머 & 쿠션 카운터 & 배너 -->
+    <section class="center-hub">
+      <div class="inning-header">
+        <div class="inning-label">CURRENT INNING</div>
+        <div id="centerInning" class="inning-number">1</div>
+      </div>
+
+      <div class="timer-wrapper">
+        <svg class="timer-svg" viewBox="0 0 220 220">
+          <circle class="timer-bg-circle" cx="110" cy="110" r="94"></circle>
+          <circle id="timerCircle" class="timer-fg-circle" cx="110" cy="110" r="94"></circle>
+        </svg>
+        <div class="timer-center-text">
+          <div id="timerSec" class="timer-seconds">40</div>
+          <div id="timerStateText" class="timer-unit">SHOT CLOCK</div>
+        </div>
+      </div>
+
+      <div class="cushion-counter-box">
+        <div class="cushion-title">CUSHIONS: <span id="cushionCountNum">0</span></div>
+        <div class="cushion-pips">
+          <div id="pip1" class="pip"></div>
+          <div id="pip2" class="pip"></div>
+          <div id="pip3" class="pip"></div>
+        </div>
+      </div>
+
+      <div class="state-banner">
+        <div id="bannerCode" class="state-code">READY</div>
+        <div id="bannerMsg" class="state-message">경기 시작 대기 중 (P1 선공 - WHITE 수구)</div>
+      </div>
+    </section>
+
+    <!-- 우측: Player 2 카드 -->
+    <section id="p2Card" class="player-card">
+      <div class="player-header">
+        <div class="player-title-wrap">
+          <div id="p2CueLamp" class="cue-ball-lamp yellow" title="수구: YELLOW"></div>
+          <h2 id="p2Name" class="player-name">PLAYER 2</h2>
+        </div>
+        <span class="attack-badge">ATTACKING</span>
+      </div>
+
+      <div id="p2Score" class="score-display">0</div>
+
+      <div class="player-stats">
+        <div class="stat-box">
+          <div class="stat-label">INNING</div>
+          <div id="p2Inning" class="stat-value">0</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">AVERAGE</div>
+          <div id="p2Avg" class="stat-value">0.000</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">HIGH RUN (RUN)</div>
+          <div id="p2HighRun" class="stat-value">0 (0)</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 하단 실시간 시뮬레이션 및 경기 제어 바 -->
+  <footer class="control-bar">
+    <div class="control-label">⚡ 실시간 판독 시뮬레이터 &amp; 키오스크 제어</div>
+    <div class="btn-group">
+      <button class="ctrl-btn primary" onclick="triggerSimulation('REGULAR_3C')">+1 일반 3C 득점</button>
+      <button class="ctrl-btn primary" onclick="triggerSimulation('BANK_SHOT')">+1 뱅크샷(가락지) 득점</button>
+      <button class="ctrl-btn" onclick="triggerSimulation('MISS_2C')">2쿠션 공타 (턴 교체)</button>
+      <button class="ctrl-btn var-btn" onclick="triggerSimulation('VAR_MICRO_CONTACT')">🔬 VAR 미세접촉 득점</button>
+      <button class="ctrl-btn danger" onclick="triggerSimulation('VAR_DOUBLE_TOUCH')">🚨 VAR 쿠션 더블터치 파울</button>
+      <button class="ctrl-btn" onclick="resetMatch()">🔄 경기 초기화</button>
+    </div>
+  </footer>
+
+  <script>
+    const CIRCUMFERENCE = 2 * Math.PI * 94; // 590.62
+    let ws = null;
+    let varTimeoutId = null;
+    let prevScores = { P1: 0, P2: 0 };
+
+    function connectWebSocket() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.host || 'localhost:8000';
+      const wsUrl = `${protocol}//${host}/ws/scoreboard`;
+
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        const pill = document.getElementById('wsStatusPill');
+        const text = document.getElementById('wsStatusText');
+        pill.classList.remove('disconnected');
+        text.textContent = 'LIVE CONNECTED';
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const packet = JSON.parse(event.data);
+          if (packet.type === 'SCORE_UPDATED' || packet.type === 'TURN_CHANGED') {
+            renderScoreboard(packet.data);
+          } else if (packet.type === 'VAR_ALERT') {
+            showVarPopup(packet.data);
+          }
+        } catch (err) {
+          console.error('WebSocket message parse error:', err);
+        }
+      };
+
+      ws.onclose = () => {
+        const pill = document.getElementById('wsStatusPill');
+        const text = document.getElementById('wsStatusText');
+        pill.classList.add('disconnected');
+        text.textContent = 'RECONNECTING...';
+        setTimeout(connectWebSocket, 2000);
+      };
+    }
+
+    function renderScoreboard(data) {
+      if (!data || !data.players) return;
+
+      const p1 = data.players.P1;
+      const p2 = data.players.P2;
+
+      // FSM 상태 및 중앙 이닝 업데이트
+      document.getElementById('fsmBadge').textContent = `STATE: ${data.fsm_state}`;
+      document.getElementById('centerInning').textContent = data.current_inning;
+
+      // 공격 턴 하이라이트
+      const p1Card = document.getElementById('p1Card');
+      const p2Card = document.getElementById('p2Card');
+      if (data.active_player_id === 'P1') {
+        p1Card.classList.add('active-p1');
+        p2Card.classList.remove('active-p2');
+      } else {
+        p1Card.classList.remove('active-p1');
+        p2Card.classList.add('active-p2');
+      }
+
+      // P1 데이터 렌더링
+      document.getElementById('p1Name').textContent = p1.name;
+      const p1ScoreEl = document.getElementById('p1Score');
+      if (p1.score !== prevScores.P1) {
+        p1ScoreEl.classList.add('bump');
+        setTimeout(() => p1ScoreEl.classList.remove('bump'), 350);
+        prevScores.P1 = p1.score;
+      }
+      p1ScoreEl.textContent = p1.score;
+      document.getElementById('p1Inning').textContent = p1.innings;
+      document.getElementById('p1Avg').textContent = Number(p1.average).toFixed(3);
+      document.getElementById('p1HighRun').textContent = `${p1.high_run} (${p1.current_run})`;
+
+      // P2 데이터 렌더링
+      document.getElementById('p2Name').textContent = p2.name;
+      const p2ScoreEl = document.getElementById('p2Score');
+      if (p2.score !== prevScores.P2) {
+        p2ScoreEl.classList.add('bump');
+        setTimeout(() => p2ScoreEl.classList.remove('bump'), 350);
+        prevScores.P2 = p2.score;
+      }
+      p2ScoreEl.textContent = p2.score;
+      document.getElementById('p2Inning').textContent = p2.innings;
+      document.getElementById('p2Avg').textContent = Number(p2.average).toFixed(3);
+      document.getElementById('p2HighRun').textContent = `${p2.high_run} (${p2.current_run})`;
+
+      // 40초 원형 프로그레스 타이머 렌더링
+      const timer = data.shot_timer || { remaining_sec: 40, default_sec: 40, is_paused: false };
+      const rem = Math.max(0, timer.remaining_sec);
+      const def = Math.max(1, timer.default_sec);
+      document.getElementById('timerSec').textContent = rem;
+      document.getElementById('timerStateText').textContent = timer.is_paused ? 'PAUSED (IN SHOT)' : 'SHOT CLOCK';
+
+      const ratio = rem / def;
+      const offset = CIRCUMFERENCE * (1 - ratio);
+      const circle = document.getElementById('timerCircle');
+      circle.style.strokeDashoffset = `${offset}`;
+
+      if (rem <= 10) {
+        circle.style.stroke = '#ef4444';
+      } else if (rem <= 20) {
+        circle.style.stroke = '#f59e0b';
+      } else {
+        circle.style.stroke = '#10b981';
+      }
+
+      // 직전 샷 쿠션 카운트 및 배너 업데이트
+      const last = data.last_shot_result || {};
+      const cushions = Number(last.total_cushions ?? last.cushions_before_second_hit ?? 0);
+      document.getElementById('cushionCountNum').textContent = cushions;
+
+      document.getElementById('pip1').classList.toggle('lit', cushions >= 1);
+      document.getElementById('pip2').classList.toggle('lit', cushions >= 2);
+      document.getElementById('pip3').classList.toggle('lit', cushions >= 3);
+
+      document.getElementById('bannerCode').textContent = last.shot_type || 'READY';
+      document.getElementById('bannerMsg').textContent = last.message || '';
+    }
+
+    function showVarPopup(varData) {
+      if (!varData) return;
+      const popup = document.getElementById('varPopup');
+      const isFoul = varData.status === 'DOUBLE_TOUCH_FOUL' || varData.is_double_touch === true;
+
+      popup.classList.toggle('foul', isFoul);
+      document.getElementById('varGapVal').textContent = `${Number(varData.gap_mm || 0).toFixed(2)} mm`;
+
+      const secondLabel = document.getElementById('varSecondLabel');
+      const secondVal = document.getElementById('varSecondVal');
+      if (isFoul) {
+        secondLabel.textContent = '극솟점 시간 간격';
+        secondVal.textContent = `${Number(varData.minima_interval_ms || 0).toFixed(1)} ms`;
+      } else {
+        secondLabel.textContent = '수구 진행 굴절각';
+        secondVal.textContent = `${Number(varData.deflection_deg || 0).toFixed(2)}°`;
+      }
+
+      document.getElementById('varMessage').textContent = varData.message || 'VAR 판독 완료';
+      popup.classList.add('show');
+
+      if (varTimeoutId) clearTimeout(varTimeoutId);
+      varTimeoutId = setTimeout(hideVarPopup, 7000);
+    }
+
+    function hideVarPopup() {
+      document.getElementById('varPopup').classList.remove('show');
+    }
+
+    async function triggerSimulation(scenario) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'SIMULATE_SHOT', scenario }));
+      } else {
+        await fetch('/api/match/simulate-shot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scenario }),
+        });
+      }
+    }
+
+    async function resetMatch() {
+      hideVarPopup();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'RESET_MATCH' }));
+      } else {
+        await fetch('/api/match/reset', { method: 'POST' });
+      }
+    }
+
+    window.addEventListener('DOMContentLoaded', connectWebSocket);
+  </script>
+</body>
+</html>
