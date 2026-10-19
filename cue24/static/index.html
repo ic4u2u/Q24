@@ -412,7 +412,7 @@
       box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
     }
 
-    /* Step 9: 보드판 중앙 상단 실시간 카메라 & 직전 샷 자동 리플레이 모니터 */
+    /* Step 9 & Step 10: 보드판 중앙 상단 실시간 카메라 & 자동 리플레이 & 터치 전체화면/줌 모니터 */
     .cam-monitor-box {
       width: 100%;
       background: #030712;
@@ -429,6 +429,18 @@
       box-shadow: 0 0 24px rgba(245, 158, 11, 0.38);
     }
 
+    /* Step 10: 라이브캠 화면 터치 시 전체화면(Fullscreen) 전환 모드 */
+    .cam-monitor-box.fullscreen-mode {
+      position: fixed;
+      inset: 16px;
+      width: auto;
+      height: auto;
+      z-index: 960;
+      border-radius: 22px;
+      border: 2px solid #38bdf8;
+      box-shadow: 0 0 0 9999px rgba(2, 6, 23, 0.88), 0 25px 60px rgba(0, 0, 0, 0.95);
+    }
+
     .cam-viewport {
       position: relative;
       width: 100%;
@@ -438,6 +450,22 @@
       display: flex;
       align-items: center;
       justify-content: center;
+      cursor: pointer;
+      touch-action: none;
+    }
+
+    .cam-monitor-box.fullscreen-mode .cam-viewport {
+      flex: 1;
+      aspect-ratio: auto;
+      height: 100%;
+    }
+
+    .cam-viewport.is-zoomed {
+      cursor: grab;
+    }
+
+    .cam-viewport.is-dragging {
+      cursor: grabbing;
     }
 
     .cam-stream-img {
@@ -445,6 +473,14 @@
       height: 100%;
       object-fit: cover;
       display: block;
+      transform-origin: center center;
+      transition: transform 0.14s ease-out;
+      will-change: transform;
+      pointer-events: none;
+    }
+
+    .cam-stream-img.no-transition {
+      transition: none;
     }
 
     .cam-overlay-top {
@@ -457,6 +493,58 @@
       justify-content: space-between;
       pointer-events: none;
       z-index: 5;
+    }
+
+    .cam-overlay-bottom {
+      position: absolute;
+      bottom: 8px;
+      left: 10px;
+      right: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      pointer-events: none;
+      z-index: 5;
+    }
+
+    .cam-touch-hint {
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: rgba(2, 6, 23, 0.78);
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      color: #e2e8f0;
+      font-size: 0.7rem;
+      font-weight: 700;
+    }
+
+    .cam-zoom-pill {
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.88);
+      border: 1px solid #38bdf8;
+      color: #38bdf8;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.72rem;
+      font-weight: 800;
+    }
+
+    .cam-fullscreen-hud {
+      display: none;
+      align-items: center;
+      gap: 14px;
+      padding: 5px 16px;
+      border-radius: 999px;
+      background: rgba(9, 14, 28, 0.92);
+      border: 1px solid #38bdf8;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.95rem;
+      font-weight: 800;
+      color: #f8fafc;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.65);
+    }
+
+    .cam-monitor-box.fullscreen-mode .cam-fullscreen-hud {
+      display: inline-flex;
     }
 
     .cam-mode-badge {
@@ -493,9 +581,10 @@
 
     .cam-controls-bar {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
-      gap: 6px;
+      gap: 5px;
       padding: 6px 8px;
       background: rgba(15, 23, 42, 0.95);
       border-top: 1px solid #1e293b;
@@ -504,21 +593,27 @@
     .cam-btn-group {
       display: flex;
       align-items: center;
-      gap: 5px;
+      gap: 4px;
     }
 
     .cam-ctrl-btn {
       min-height: 34px;
-      padding: 0 10px;
+      padding: 0 8px;
       border-radius: 8px;
       border: 1px solid #334155;
       background: #1e293b;
       color: #cbd5e1;
       font-family: 'Chakra Petch', sans-serif;
-      font-size: 0.75rem;
+      font-size: 0.73rem;
       font-weight: 800;
       cursor: pointer;
       transition: all 0.2s ease;
+    }
+
+    .cam-monitor-box.fullscreen-mode .cam-ctrl-btn {
+      min-height: 44px;
+      padding: 0 14px;
+      font-size: 0.88rem;
     }
 
     .cam-ctrl-btn:hover {
@@ -1044,9 +1139,9 @@
 
     <!-- 중앙: 상단 실시간 라이브캠/자동 리플레이 모니터 & 40초 원형 타이머 & 쿠션 카운터 -->
     <section class="center-hub">
-      <!-- Step 9: 보드판 중앙 상단 실시간 카메라 & 3공 정지 시 자동 리플레이 모니터 -->
+      <!-- Step 9 & Step 10: 보드판 중앙 상단 실시간 카메라 & 자동 리플레이 & 터치 전체화면/줌 모니터 -->
       <div id="camMonitorBox" class="cam-monitor-box">
-        <div id="camViewport" class="cam-viewport">
+        <div id="camViewport" class="cam-viewport" title="화면을 터치(클릭)하면 전체화면으로 전환/복귀됩니다">
           <img
             id="camStreamImg"
             class="cam-stream-img"
@@ -1055,22 +1150,41 @@
           />
           <div class="cam-overlay-top">
             <span id="camModeBadge" class="cam-mode-badge">🔴 LIVE CAM</span>
+            <div id="camFullscreenHud" class="cam-fullscreen-hud">
+              <span id="hudP1Text">P1: 0</span>
+              <span style="color:#94a3b8;">|</span>
+              <span id="hudInningText">1 INN</span>
+              <span style="color:#94a3b8;">|</span>
+              <span id="hudP2Text" style="color:#fde047;">P2: 0</span>
+            </div>
             <span id="camShotBadge" class="cam-shot-tag">REAL-TIME TABLE VIEW</span>
+          </div>
+          <div class="cam-overlay-bottom">
+            <span id="camTouchHint" class="cam-touch-hint">👆 화면 터치: 전체화면 전환</span>
+            <span id="camZoomBadge" class="cam-zoom-pill">ZOOM 1.0x</span>
           </div>
         </div>
         <div class="cam-controls-bar">
           <div class="cam-btn-group">
             <button id="btnLiveCam" class="cam-ctrl-btn live-btn active" onclick="switchToLiveCam()">
-              🔴 LIVE 복귀
+              🔴 LIVE
             </button>
             <button id="btnReplayCam" class="cam-ctrl-btn" onclick="switchToReplayCam()">
-              ⏪ 직전 리플레이
+              ⏪ REPLAY
             </button>
           </div>
           <div class="cam-btn-group" aria-label="Replay Speed Controls">
             <button id="speedBtn10" class="cam-ctrl-btn active" onclick="changeReplaySpeed(1.0)">1.0x</button>
             <button id="speedBtn05" class="cam-ctrl-btn" onclick="changeReplaySpeed(0.5)">0.5x</button>
             <button id="speedBtn025" class="cam-ctrl-btn" onclick="changeReplaySpeed(0.25)">0.25x</button>
+          </div>
+          <div class="cam-btn-group" aria-label="Zoom and Fullscreen Controls">
+            <button id="btnZoomOut" class="cam-ctrl-btn" onclick="zoomCam(-0.5)" title="줌 아웃 (-0.5x)">🔍－</button>
+            <button id="btnZoomReset" class="cam-ctrl-btn" onclick="resetCamZoom()" title="배율 1.0x 초기화">1:1</button>
+            <button id="btnZoomIn" class="cam-ctrl-btn" onclick="zoomCam(0.5)" title="줌 인 (+0.5x)">🔍＋</button>
+            <button id="btnFullscreenToggle" class="cam-ctrl-btn" onclick="toggleCamFullscreen()" title="전체화면 전환/복귀">
+              ⛶ 전체화면
+            </button>
           </div>
         </div>
       </div>
@@ -1212,6 +1326,152 @@
     let currentCamMode = 'LIVE'; // 'LIVE' | 'REPLAY'
     let currentReplaySpeed = 1.0;
     let prevFsmState = 'WAIT_SHOT';
+
+    // Step 10: 전체화면(Fullscreen) 토글 및 1.0x~4.0x 줌인/줌아웃 & 드래그 패닝 상태
+    let isCamFullscreen = false;
+    let currentZoom = 1.0;
+    let panX = 0;
+    let panY = 0;
+    let isDraggingCam = false;
+    let pointerStartX = 0;
+    let pointerStartY = 0;
+    let startPanX = 0;
+    let startPanY = 0;
+    let maxDragDistance = 0;
+    const TAP_MOVE_THRESHOLD_PX = 6; // 6px 미만 이동은 단순 터치(전체화면 토글), 6px 이상은 드래그 패닝
+
+    function clampPanOffsets() {
+      const viewport = document.getElementById('camViewport');
+      if (!viewport || currentZoom <= 1.0) {
+        panX = 0;
+        panY = 0;
+        return;
+      }
+      const maxX = ((viewport.clientWidth || 400) * (currentZoom - 1)) / 2;
+      const maxY = ((viewport.clientHeight || 225) * (currentZoom - 1)) / 2;
+      panX = Math.max(-maxX, Math.min(maxX, panX));
+      panY = Math.max(-maxY, Math.min(maxY, panY));
+    }
+
+    function applyCamTransform(withTransition = true) {
+      const streamImg = document.getElementById('camStreamImg');
+      const viewport = document.getElementById('camViewport');
+      const zoomBadge = document.getElementById('camZoomBadge');
+      const resetBtn = document.getElementById('btnZoomReset');
+
+      clampPanOffsets();
+      streamImg.classList.toggle('no-transition', !withTransition);
+      streamImg.style.transform = `translate3d(${panX.toFixed(1)}px, ${panY.toFixed(1)}px, 0) scale(${currentZoom.toFixed(2)})`;
+      viewport.classList.toggle('is-zoomed', currentZoom > 1.0);
+      zoomBadge.textContent = `ZOOM ${currentZoom.toFixed(1)}x`;
+      resetBtn.textContent = currentZoom > 1.0 ? `${currentZoom.toFixed(1)}x` : '1:1';
+      resetBtn.classList.toggle('active', currentZoom > 1.0);
+    }
+
+    function zoomCam(delta) {
+      const nextZoom = Math.max(1.0, Math.min(4.0, Number((currentZoom + delta).toFixed(2))));
+      currentZoom = nextZoom;
+      if (currentZoom <= 1.0) {
+        panX = 0;
+        panY = 0;
+      }
+      applyCamTransform(true);
+    }
+
+    function resetCamZoom() {
+      currentZoom = 1.0;
+      panX = 0;
+      panY = 0;
+      applyCamTransform(true);
+    }
+
+    function toggleCamFullscreen() {
+      isCamFullscreen = !isCamFullscreen;
+      const monitorBox = document.getElementById('camMonitorBox');
+      const fsBtn = document.getElementById('btnFullscreenToggle');
+      const touchHint = document.getElementById('camTouchHint');
+
+      monitorBox.classList.toggle('fullscreen-mode', isCamFullscreen);
+      if (isCamFullscreen) {
+        fsBtn.textContent = '✕ 원래화면';
+        fsBtn.classList.add('active');
+        touchHint.textContent = '👆 화면 재터치: 원래 점수판 화면으로 복귀 (드래그: 이동)';
+      } else {
+        fsBtn.textContent = '⛶ 전체화면';
+        fsBtn.classList.remove('active');
+        touchHint.textContent = '👆 화면 터치: 전체화면 전환';
+      }
+      setTimeout(() => applyCamTransform(true), 40);
+    }
+
+    function initCamInteractiveEvents() {
+      const viewport = document.getElementById('camViewport');
+      if (!viewport) return;
+
+      viewport.addEventListener('pointerdown', (e) => {
+        isDraggingCam = true;
+        pointerStartX = e.clientX;
+        pointerStartY = e.clientY;
+        startPanX = panX;
+        startPanY = panY;
+        maxDragDistance = 0;
+        viewport.classList.add('is-dragging');
+        if (viewport.setPointerCapture) {
+          try {
+            viewport.setPointerCapture(e.pointerId);
+          } catch (_) {}
+        }
+      });
+
+      viewport.addEventListener('pointermove', (e) => {
+        if (!isDraggingCam) return;
+        const dx = e.clientX - pointerStartX;
+        const dy = e.clientY - pointerStartY;
+        const dist = Math.hypot(dx, dy);
+        if (dist > maxDragDistance) {
+          maxDragDistance = dist;
+        }
+        if (currentZoom > 1.0 && maxDragDistance >= TAP_MOVE_THRESHOLD_PX) {
+          panX = startPanX + dx;
+          panY = startPanY + dy;
+          applyCamTransform(false);
+        }
+      });
+
+      const finishPointer = (e) => {
+        if (!isDraggingCam) return;
+        isDraggingCam = false;
+        viewport.classList.remove('is-dragging');
+        if (viewport.releasePointerCapture) {
+          try {
+            viewport.releasePointerCapture(e.pointerId);
+          } catch (_) {}
+        }
+        // 드래그 이동량이 6px 미만이면 단순 터치로 판정 -> 전체화면 토글(켜기/원래대로 복귀)
+        if (maxDragDistance < TAP_MOVE_THRESHOLD_PX) {
+          toggleCamFullscreen();
+        } else {
+          applyCamTransform(true);
+        }
+      };
+
+      viewport.addEventListener('pointerup', finishPointer);
+      viewport.addEventListener('pointercancel', () => {
+        isDraggingCam = false;
+        viewport.classList.remove('is-dragging');
+      });
+
+      // 마우스 휠 줌인/줌아웃 지원
+      viewport.addEventListener(
+        'wheel',
+        (e) => {
+          e.preventDefault();
+          const step = e.deltaY < 0 ? 0.5 : -0.5;
+          zoomCam(step);
+        },
+        { passive: false }
+      );
+    }
 
     function switchToLiveCam() {
       currentCamMode = 'LIVE';
@@ -1360,6 +1620,11 @@
         switchToLiveCam();
       }
       prevFsmState = data.fsm_state;
+
+      // 전체화면 상단 미니 스코어 HUD 동기화
+      document.getElementById('hudP1Text').textContent = `${p1.name}: ${p1.score}`;
+      document.getElementById('hudInningText').textContent = `${data.current_inning} INN`;
+      document.getElementById('hudP2Text').textContent = `${p2.name}: ${p2.score}`;
 
       // 룰 모드 토글 버튼 업데이트
       currentRuleMode = data.rule_mode || 'STANDARD';
@@ -1551,6 +1816,7 @@
 
     async function resetMatch() {
       hideVarPopup();
+      resetCamZoom();
       switchToLiveCam();
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ action: 'RESET_MATCH' }));
@@ -1559,7 +1825,10 @@
       }
     }
 
-    window.addEventListener('DOMContentLoaded', connectWebSocket);
+    window.addEventListener('DOMContentLoaded', () => {
+      initCamInteractiveEvents();
+      connectWebSocket();
+    });
   </script>
 </body>
 </html>

@@ -47,7 +47,7 @@ h:\WorkSpace\Q24\
     ├── api/                # FastAPI 웹소켓 및 REST 라우터 폴더
     │   └── server.py           # /ws/scoreboard 웹소켓 및 /api/video/live, /api/video/replay 스트리밍 서버
     ├── static/             # 20인치 태블릿 점수판 프론트엔드 HTML/JS/CSS 폴더
-    │   └── index.html          # CUESCO 초대형 폰트, 빌리보드 이닝 기록지, PBA 룰 토글, Hawk-Eye VAR 팝업 UI
+    │   └── index.html          # CUESCO 초대형 폰트, 중앙 상단 라이브캠/자동 리플레이, 터치 전체화면 & 1.0x~4.0x 줌인/줌아웃 UI
     └── tests/              # 모듈별 단위 테스트 폴더
         ├── test_step2.py   # 평면 보정기 및 반사광 제거 색상 확정기 단위 테스트
         ├── test_step3.py   # 진원도 필터, 물리 충돌 가드 ID 스왑 원복, 스핀 정지 감지 단위 테스트
@@ -55,7 +55,9 @@ h:\WorkSpace\Q24\
         ├── test_step5.py   # FSM 경기 관리자 및 WebSocket 실시간 브로드캐스트 단위 테스트
         ├── test_step6.py   # 20인치 태블릿 점수판 HTML UI 및 통합 엔트리포인트 단위 테스트
         ├── test_step7.py   # 리플레이 링버퍼, PBA 뱅크샷 2점 룰, 이닝 기록지, 타임아웃 단위 테스트
-        └── test_step8.py   # 큐스코 초대형 스코어 폰트 및 빌리보드 이닝 스코어시트 UI 단위 테스트
+        ├── test_step8.py   # 큐스코 초대형 스코어 폰트 및 빌리보드 이닝 스코어시트 UI 단위 테스트
+        ├── test_step9.py   # 보드판 중앙 상단 라이브캠 모니터 및 3공 정지 시 자동 리플레이 전환 단위 테스트
+        └── test_step10.py  # 라이브캠 터치 전체화면 토글 및 1.0x~4.0x 줌인/줌아웃·드래그 패닝 단위 테스트
 ```
 
 ---
