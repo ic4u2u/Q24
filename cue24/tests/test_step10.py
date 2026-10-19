@@ -262,9 +262,9 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
                 "cue_travel_distance_mm": 2100.0,
             },
         )
-        self.assertFalse(miss_check["result"]["is_scored"])
-        self.assertEqual(miss_check["result"]["shot_type"], "MISS")
-        self.assertEqual(miss_check["result"]["reason_code"], "INSUFFICIENT_CUSHIONS")
+        self.assertFalse(miss_check["is_scored"])
+        self.assertEqual(miss_check["shot_type"], "MISS")
+        self.assertEqual(miss_check["reason_code"], "INSUFFICIENT_CUSHIONS")
 
         # 3) 정식 3쿠션 후 제2적구 충돌 시 물리 AI MCP가 정확히 득점(is_scored=True)으로 판정하는지 검증
         score_check = billiard_mcp_server.call_tool(
@@ -286,8 +286,8 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
                 "cue_travel_distance_mm": 2850.0,
             },
         )
-        self.assertTrue(score_check["result"]["is_scored"])
-        self.assertEqual(score_check["result"]["shot_type"], "REGULAR_3C")
+        self.assertTrue(score_check["is_scored"])
+        self.assertEqual(score_check["shot_type"], "REGULAR_3C")
 
 
 if __name__ == "__main__":

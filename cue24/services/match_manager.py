@@ -116,9 +116,10 @@ class MatchManager:
         self.active_player_id: str = "P1"
         self.current_inning: int = 1
 
-        # 샷 타이머 관리 (초 단위)
+        # 샷 타이머 관리 (초 단위) 및 경기 시작부터 누적 경과 타이머 (초 단위)
         self.remaining_timer_sec: float = float(self.default_shot_timer)
         self.is_timer_paused: bool = False
+        self.match_elapsed_sec: float = 0.0
 
         # 직전 샷 판정 요약 메시지 및 코드
         self.last_shot_result: Dict[str, object] = {
@@ -128,6 +129,15 @@ class MatchManager:
             "reason_code": "MATCH_START",
             "message": "경기 시작 대기 중 (P1 선공 - WHITE 수구)",
         }
+
+    @property
+    def formatted_match_time(self) -> str:
+        """경기 시작부터 누적된 경과 시간을 HH:MM:SS 포맷 문자열로 반환합니다."""
+        total_sec = max(0, int(round(self.match_elapsed_sec)))
+        hours = total_sec // 3600
+        minutes = (total_sec % 3600) // 60
+        seconds = total_sec % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     @property
     def active_player(self) -> PlayerState:
@@ -194,6 +204,85 @@ class MatchManager:
         player.inning_scores[inning_idx] = max(0, prev_inning_pts + actual_delta)
         return self.get_match_payload()
 
+    def set_player_name(self, player_id: str, new_name: str) -> Dict[str, object]:
+        """
+        1번 선수(P1) 또는 2번 선수(P2)의 이름을 변경합니다.
+        선공(P1)=WHITE, 후공(P2)=YELLOW 수구 색상 불변 규칙은 그대로 유지합니다.
+        """
+        pid = player_id.upper()
+        if pid not in self.players:
+            raise ValueError(f"존재하지 않는 플레이어 ID입니다: {player_id}")
+        cleaned = new_name.strip()
+        if not cleaned:
+            cleaned = "1번 선수" if pid == "P1" else "2번 선수"
+        self.players[pid].name = cleaned
+        self.players["P1"].cue_ball_color = "WHITE"
+        self.players["P2"].cue_ball_color = "YELLOW"
+        self.last_shot_result = {
+            "is_scored": False,
+            "points_awarded": 0,
+            "shot_type": "READY",
+            "reason_code": "PLAYER_NAME_CHANGED",
+            "message": f"선수 이름이 '{cleaned}'(으)로 변경되었습니다.",
+        }
+        return self.get_match_payload()
+
+    def swap_player_seats(self) -> Dict[str, object]:
+        """
+        1번 선수(좌측 선공 자리)와 2번 선수(우측 후공 자리)의 자리를 맞바꿉니다.
+        - 두 선수의 이름 및 경기 스탯(점수, 하이런, 뱅크샷, 이닝 기록 등)을 서로 교체하되,
+        - 좌측 1번 자리(P1)는 무조건 흰공(WHITE), 우측 2번 자리(P2)는 무조건 노란공(YELLOW)으로 고정합니다!
+        """
+        p1, p2 = self.players["P1"], self.players["P2"]
+
+        # 기본 영문 플레이스홀더일 경우 자연스러운 한글 기본명으로 변환 후 스왑
+        n1 = "1번 선수" if p1.name.strip().upper() in ("PLAYER 1", "P1") else p1.name
+        n2 = "2번 선수" if p2.name.strip().upper() in ("PLAYER 2", "P2") else p2.name
+        p1.name, p2.name = n2, n1
+
+        # 만약 경기가 이미 진행 중(득점이 있거나 2이닝 이상)이면 점수/스탯도 함께 자리 이동
+        is_initial_state = (
+            p1.score == 0
+            and p2.score == 0
+            and self.current_inning == 1
+            and p2.innings == 0
+        )
+        if not is_initial_state:
+            p1.score, p2.score = p2.score, p1.score
+            p1.innings, p2.innings = p2.innings, p1.innings
+            p1.current_run, p2.current_run = p2.current_run, p1.current_run
+            p1.high_run, p2.high_run = p2.high_run, p1.high_run
+            p1.timeouts_remaining, p2.timeouts_remaining = (
+                p2.timeouts_remaining,
+                p1.timeouts_remaining,
+            )
+            p1.bank_shots, p2.bank_shots = p2.bank_shots, p1.bank_shots
+            p1.inning_scores, p2.inning_scores = (
+                dict(p2.inning_scores),
+                dict(p1.inning_scores),
+            )
+            self.active_player_id = "P2" if self.active_player_id == "P1" else "P1"
+        else:
+            # 경기 시작 직전(초기 상태)에 자리바꿈을 한 경우: 새로 1번 자리에 온 선수가 1이닝 선공(흰공)으로 시작
+            p1.innings = 1
+            p1.inning_scores = {1: 0}
+            p2.innings = 0
+            p2.inning_scores = {}
+            self.active_player_id = "P1"
+
+        # [불변 규칙 강제] 1번 자리(선공) = 무조건 흰공(WHITE), 2번 자리(후공) = 무조건 노란공(YELLOW)
+        p1.cue_ball_color = "WHITE"
+        p2.cue_ball_color = "YELLOW"
+
+        self.last_shot_result = {
+            "is_scored": False,
+            "points_awarded": 0,
+            "shot_type": "READY",
+            "reason_code": "PLAYERS_SWAPPED",
+            "message": f"선수 자리바꿈 완료: 선공({p1.name}·흰공) vs 후공({p2.name}·노란공)",
+        }
+        return self.get_match_payload()
+
     def swap_cue_balls(self) -> Dict[str, object]:
         """P1과 P2의 수구 색상(WHITE <-> YELLOW)을 맞바꿉니다."""
         p1, p2 = self.players["P1"], self.players["P2"]
@@ -231,10 +320,18 @@ class MatchManager:
         self.is_timer_paused = True
         return self.get_match_payload()
 
+    def tick_match_elapsed(self, elapsed_sec: float = 1.0) -> None:
+        """경기 시작부터 누적된 총 경기 시간을 증가시킵니다."""
+        self.match_elapsed_sec = round(
+            self.match_elapsed_sec + max(0.0, elapsed_sec), 2
+        )
+
     def tick_timer(self, elapsed_sec: float = 1.0) -> Dict[str, object]:
         """
-        WAIT_SHOT 상태에서 타이머가 일시 정지되지 않았을 때 남은 시간을 차감합니다.
+        WAIT_SHOT 상태에서 타이머가 일시 정지되지 않았을 때 남은 시간을 차감하고,
+        경기 누적 경과 시간도 함께 갱신합니다.
         """
+        self.tick_match_elapsed(elapsed_sec)
         if self.fsm_state == MatchState.WAIT_SHOT and not self.is_timer_paused:
             self.remaining_timer_sec = max(
                 0.0, round(self.remaining_timer_sec - elapsed_sec, 2)
@@ -360,6 +457,10 @@ class MatchManager:
             "active_player_id": self.active_player_id,
             "active_cue_ball_color": self.active_cue_ball_color,
             "current_inning": self.current_inning,
+            "match_timer": {
+                "elapsed_sec": int(round(self.match_elapsed_sec)),
+                "formatted": self.formatted_match_time,
+            },
             "shot_timer": {
                 "remaining_sec": int(round(self.remaining_timer_sec)),
                 "default_sec": self.default_shot_timer,

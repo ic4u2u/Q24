@@ -1064,6 +1064,7 @@ class LiveStreamReader:
     async def run_timer_loop(self) -> None:
         """
         백그라운드에서 1초마다:
+        - 경기 시작부터 누적 경과 타이머(match_elapsed_sec)를 상시 1초씩 증가시키고,
         - 모든 공이 멈춰 있는 대기 상태(WAIT_SHOT)이면 40초 샷 클락(카운트)을 1초씩 작동시키고,
         - 만약 샷 클락(40초)이 모두 소진(0초)되면 시간 초과(TIME FOUL)로 자동 턴 교체를 수행합니다.
         """
@@ -1093,6 +1094,9 @@ class LiveStreamReader:
                     await self.ws_manager.broadcast_event(
                         "SCORE_UPDATED", self.match_manager.get_match_payload()
                     )
+            else:
+                # 샷 주행 중(SHOT_IN_PROGRESS)이거나 일시정지 중일 때도 누적 경기 시간은 1초씩 증가
+                self.match_manager.tick_match_elapsed(1.0)
 
 
 class SimulateShotRequest(BaseModel):
@@ -1109,6 +1113,13 @@ class AdjustScoreRequest(BaseModel):
 
     player_id: str = Field(default="P1", description="P1 또는 P2")
     delta: int = Field(default=1, description="점수 변경량 (+1 또는 -1)")
+
+
+class PlayerNameRequest(BaseModel):
+    """선수 이름 변경 요청 스키마"""
+
+    player_id: str = Field(default="P1", description="P1 또는 P2")
+    name: str = Field(default="1번 선수", description="변경할 선수 이름")
 
 
 class RuleModeRequest(BaseModel):
@@ -1214,6 +1225,22 @@ async def change_rule_mode(req: RuleModeRequest) -> Dict[str, Any]:
 async def adjust_player_score(req: AdjustScoreRequest) -> Dict[str, Any]:
     """현장 수동 점수 가감(+1 / -1)을 반영하고 브로드캐스트합니다."""
     payload = match_manager.adjust_score(req.player_id, req.delta)
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return payload
+
+
+@app.post("/api/match/player-name")
+async def update_player_name(req: PlayerNameRequest) -> Dict[str, Any]:
+    """1번 선수(P1) 또는 2번 선수(P2)의 이름을 변경하고 모든 태블릿에 브로드캐스트합니다."""
+    payload = match_manager.set_player_name(req.player_id, req.name)
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return payload
+
+
+@app.post("/api/match/swap-players")
+async def swap_players_seat_endpoint() -> Dict[str, Any]:
+    """선공(P1=흰공)/후공(P2=노란공) 수구 색상은 고정한 채 1번 선수와 2번 선수의 자리를 맞바꿉니다."""
+    payload = match_manager.swap_player_seats()
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
     return payload
 
@@ -1481,7 +1508,7 @@ async def list_mcp_tools() -> Dict[str, Any]:
     """로컬 3쿠션 물리/AI 판독 MCP 서버가 제공하는 도구 스키마 목록을 반환합니다."""
     return {
         "mcp_server": "cue24-local-billiard-physics-mcp",
-        "hf_model_loaded": physics_ai_engine.hf_model_loaded,
+        "hf_model_loaded": physics_ai_engine.hf_backend_loaded,
         "tools": billiard_mcp_server.list_tools(),
     }
 
@@ -1542,6 +1569,14 @@ async def websocket_scoreboard_endpoint(websocket: WebSocket) -> None:
                 pid = str(msg.get("player_id", "P1"))
                 delta = int(msg.get("delta", 1))
                 payload = match_manager.adjust_score(pid, delta)
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "SET_PLAYER_NAME":
+                pid = str(msg.get("player_id", "P1"))
+                new_name = str(msg.get("name", ""))
+                payload = match_manager.set_player_name(pid, new_name)
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "SWAP_PLAYERS":
+                payload = match_manager.swap_player_seats()
                 await ws_manager.broadcast_event("SCORE_UPDATED", payload)
             elif action == "SWITCH_TURN":
                 match_manager.players["P1"].cue_ball_color = "WHITE"
