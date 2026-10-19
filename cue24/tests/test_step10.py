@@ -155,6 +155,67 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
 
         asyncio.run(_run_scenario())
 
+    def test_bulletproof_5stage_tracker_and_korean_ui(self) -> None:
+        """
+        1. BulletproofBallTracker 5단계 알고리즘(1단계 도넛 마스크 색상 확정, 2단계 색상 무시 추적,
+           3단계 충돌 법선 벡터 내적 > 0.8 ID 스왑 강제 원복, 4단계 3차 스플라인 궤적 복원) 검증
+        2. 점수판 화면 용어의 자연스러운 한글화 적용 여부 검증
+        """
+        import numpy as np
+        from cue24.core.physics_tracker import BulletproofBallTracker, PhysicsTracker
+
+        bp = BulletproofBallTracker()
+        white_crop = np.full((32, 32, 3), (245, 245, 245), dtype=np.uint8)
+        yellow_crop = np.full((32, 32, 3), (20, 225, 245), dtype=np.uint8)
+        red_crop = np.full((32, 32, 3), (25, 25, 235), dtype=np.uint8)
+
+        # [1단계] 정지 상태 신분증 발급
+        locked = bp.phase1_lock_balls_before_shot(
+            [
+                {"center": (900.0, 700.0), "crop_img": white_crop},
+                {"center": (500.0, 300.0), "crop_img": yellow_crop},
+                {"center": (1000.0, 700.0), "crop_img": red_crop},
+            ]
+        )
+        self.assertEqual(locked[0]["color"], "WHITE")
+        self.assertEqual(locked[1]["color"], "YELLOW")
+        self.assertEqual(locked[2]["color"], "RED")
+
+        # [2단계] 주행 중 색상 무시 위치 추적 (수구 ID 0이 적구 ID 2에 충돌 거리 50mm <= 61.5mm로 접근)
+        bp.phase2_track_motion_only(
+            [
+                {"center": (950.0, 700.0)},
+                {"center": (500.0, 300.0)},
+                {"center": (1000.0, 700.0)},
+            ]
+        )
+
+        # [3단계] 충돌 법선 방향으로 날아간 공이 수구(ID 0)로 잘못 매칭된 경우 물리 가드가 즉시 원복하는지 확인
+        swapped = bp.phase3_anti_id_switch_guard(cue_id=0, obj_id=2)
+        self.assertTrue(swapped)
+        self.assertEqual(bp.swap_restore_count, 1)
+        self.assertEqual(bp.locked_balls[0]["pos"], (1000.0, 700.0))
+        self.assertEqual(bp.locked_balls[2]["pos"], (950.0, 700.0))
+
+        # [4단계] 3차 스플라인 궤적 복원 검증
+        spline_pts = PhysicsTracker.interpolate_cubic_spline(
+            (100.0, 100.0), (20.0, 0.0), (200.0, 120.0), (20.0, 10.0), num_steps=8
+        )
+        self.assertEqual(len(spline_pts), 8)
+        self.assertAlmostEqual(spline_pts[-1][0], 200.0, places=3)
+        self.assertAlmostEqual(spline_pts[-1][1], 120.0, places=3)
+
+        # 화면 UI 한글화 요소 검증
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        self.assertIn("스마트 3쿠션 디지털 점수판", html)
+        self.assertIn("1번 선수", html)
+        self.assertIn("2번 선수", html)
+        self.assertIn("애버리지", html)
+        self.assertIn("하이런 (연속득점)", html)
+        self.assertIn("실시간 쿠션 수:", html)
+        self.assertIn("이닝별 득점 기록표", html)
+        self.assertIn("작전타임 (+40초)", html)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
