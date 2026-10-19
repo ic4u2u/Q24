@@ -21,26 +21,61 @@ Point2D = Tuple[float, float]
 
 @dataclass
 class BallState:
-    """단일 당구공의 물리 상태(위치, 속도, 이전 위치, 접촉 이력)를 관리하는 데이터 클래스"""
+    """단일 당구공의 물리 상태(위치, 속도, EMA 스무딩 속도, 관측 중심 모멘텀 이력)를 관리하는 데이터 클래스"""
 
     ball_id: int
     position: np.ndarray  # 현재 (x, y) 밀리미터 좌표, shape=(2,)
     prev_position: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
     velocity: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
+    velocity_ema: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
     speed: float = 0.0
+    speed_ema: float = 0.0
     color: str = "UNKNOWN"
+    last_observed_pos: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
+    missing_frames: int = 0
+    steps_since_turn: int = 0
 
-    def update_kinematics(self, new_pos: Point2D) -> None:
-        """새로운 좌표로 위치를 갱신하고 프레임 간 선속도 벡터 및 속력을 계산합니다."""
+    def update_kinematics(self, new_pos: Point2D, is_observed: bool = True) -> None:
+        """
+        새로운 좌표로 위치를 갱신하고 프레임 간 선속도 벡터 및 EMA(지수이동평균, 0.6*raw + 0.4*prev) 속도를 계산합니다.
+        충돌이나 쿠션 반사로 진행 방향이 급격히 꺾인 직후(delta_t <= 2)에는 EMA 지연을 즉시 리셋하여
+        OC-SORT의 비선형 궤적 반응성을 100% 보존합니다.
+        """
         new_vec = np.array([float(new_pos[0]), float(new_pos[1])], dtype=np.float64)
+        raw_vel = new_vec - self.position
+        raw_speed = float(np.linalg.norm(raw_vel))
+
+        # 급격한 방향 전환(충돌/쿠션 반사) 여부 감지 -> 직후 1~2프레임은 EMA 지연 없이 즉각 반영
+        prev_norm = float(np.linalg.norm(self.velocity))
+        if prev_norm > 2.0 and raw_speed > 2.0:
+            cos_sim = float(np.dot(self.velocity, raw_vel) / (prev_norm * raw_speed))
+            if cos_sim < 0.5:
+                self.steps_since_turn = 0
+            else:
+                self.steps_since_turn += 1
+        else:
+            self.steps_since_turn += 1
+
+        if self.steps_since_turn <= 2 or float(np.linalg.norm(self.velocity_ema)) < 1e-3:
+            self.velocity_ema = raw_vel.copy()
+        else:
+            self.velocity_ema = 0.6 * raw_vel + 0.4 * self.velocity_ema
+
         self.prev_position = self.position.copy()
-        self.velocity = new_vec - self.prev_position
-        self.speed = float(np.linalg.norm(self.velocity))
+        self.velocity = raw_vel
+        self.speed = raw_speed
+        self.speed_ema = float(np.linalg.norm(self.velocity_ema))
         self.position = new_vec
+
+        if is_observed:
+            self.last_observed_pos = new_vec.copy()
+            self.missing_frames = 0
+        else:
+            self.missing_frames += 1
 
     def predict_kalman_position(self, damping: float = 0.92) -> Point2D:
         """
-        [4단계: 칼만 필터 위치 예측]
+        [4단계: 칼만/OC-SORT 위치 예측]
         공이 너무 빨라 카메라 블러로 순간 소실되었을 때 직전 위치와 감쇠 속도 모델로 다음 프레임 위치를 예측합니다.
         """
         pred = self.position + self.velocity * damping
@@ -231,16 +266,23 @@ class PhysicsTracker:
                 position=vec.copy(),
                 prev_position=vec.copy(),
                 velocity=np.zeros(2, dtype=np.float64),
+                velocity_ema=np.zeros(2, dtype=np.float64),
                 speed=0.0,
+                speed_ema=0.0,
                 color=color,
+                last_observed_pos=vec.copy(),
+                missing_frames=0,
+                steps_since_turn=0,
             )
 
     def _match_nearest_positions(
-        self, detected_points: List[Point2D]
+        self, detected_points: List[Point2D], use_ocm: bool = True
     ) -> Dict[int, Point2D]:
         """
-        현재 추적 중인 공 ID들과 새로 검출된 2D 좌표 리스트 간의 전체 거리 합이 최소가 되는
-        1:1 최단 거리 매칭(Exact Permutations Assignment for 3 balls)을 수행합니다.
+        [OC-SORT 관측 중심 모멘텀(OCM) 결합 1:1 최적 매칭]
+        현재 추적 중인 공 ID들과 새로 검출된 2D 좌표 리스트 간의 유클리드 거리 합과
+        실제 관측된 진행 방향 모멘텀 일관성(OCM: Observation-Centric Momentum) 비용이
+        최소가 되는 1:1 순열 매칭을 수행합니다.
         """
         ball_ids = list(self.balls.keys())
         if len(detected_points) != len(ball_ids):
@@ -249,16 +291,27 @@ class PhysicsTracker:
             )
 
         best_perm: Optional[Tuple[Point2D, ...]] = None
-        min_total_dist: float = float("inf")
+        min_total_cost: float = float("inf")
 
         for perm in itertools.permutations(detected_points):
-            total_dist = 0.0
+            total_cost = 0.0
             for bid, pt in zip(ball_ids, perm):
-                cur_pos = self.balls[bid].position
-                dist = math.hypot(pt[0] - cur_pos[0], pt[1] - cur_pos[1])
-                total_dist += dist
-            if total_dist < min_total_dist:
-                min_total_dist = total_dist
+                state = self.balls[bid]
+                cur_pos = state.position
+                dx = pt[0] - float(cur_pos[0])
+                dy = pt[1] - float(cur_pos[1])
+                dist = math.hypot(dx, dy)
+                cost = dist
+
+                # OC-SORT OCM(Observation-Centric Momentum): 주행 중인 공의 관측 방향 연속성 보너스 반영
+                if use_ocm and state.speed > (self.stop_velocity_th * 2.0) and dist > 4.0:
+                    disp_vec = np.array([dx, dy], dtype=np.float64)
+                    cos_dir = self._cosine_similarity(state.velocity, disp_vec)
+                    cost -= 3.5 * cos_dir
+
+                total_cost += cost
+            if total_cost < min_total_cost:
+                min_total_cost = total_cost
                 best_perm = perm
 
         assert best_perm is not None
@@ -422,6 +475,112 @@ class PhysicsTracker:
             iy = h00 * p0[1] + h10 * m0y + h01 * p1[1] + h11 * m1y
             pts.append((float(ix), float(iy)))
         return pts
+
+    @staticmethod
+    def recover_occluded_trajectory_oru(
+        last_obs_pos: Point2D,
+        reappeared_pos: Point2D,
+        missing_steps: int,
+        last_obs_vel: Optional[Point2D] = None,
+        table_width_mm: float = settings.TABLE_WIDTH_MM,
+        table_height_mm: float = settings.TABLE_HEIGHT_MM,
+        rail_margin_mm: float = settings.CUSHION_MARGIN_MM,
+    ) -> List[Point2D]:
+        """
+        [OC-SORT ORU (Observation-Centric Re-Update): 가림/블러 복구 가상 궤적 재갱신]
+        선수의 신체나 큐대 가림(Occlusion) 또는 초고속 블러로 인해 missing_steps 프레임 동안
+        관측이 끊겼다가 reappeared_pos에서 공이 다시 관측되었을 때,
+        끊긴 구간의 가상 관측 궤적을 역산(Back-interpolation)하여 복원합니다.
+        만약 가려진 동안 직전 속도(last_obs_vel) 방향으로 쿠션 벽면에 부딪혀 튕겨 나왔다면
+        거울 반사(Fold-back) 물리 궤적으로 경유 쿠션 접점까지 정확히 복원합니다.
+        """
+        if missing_steps <= 1:
+            return [reappeared_pos]
+
+        x0, y0 = float(last_obs_pos[0]), float(last_obs_pos[1])
+        x1, y1 = float(reappeared_pos[0]), float(reappeared_pos[1])
+
+        # 직전 속도가 쿠션을 향하고 있었고 재등장 위치가 반대 방향인 경우 거울 반사 경유점 계산
+        bounce_pt: Optional[Point2D] = None
+        if last_obs_vel is not None:
+            vx0, vy0 = float(last_obs_vel[0]), float(last_obs_vel[1])
+            pred_x = x0 + vx0 * missing_steps
+            pred_y = y0 + vy0 * missing_steps
+            if pred_x <= rail_margin_mm and x1 > rail_margin_mm:
+                bounce_pt = (rail_margin_mm, (y0 + y1) * 0.5)
+            elif pred_x >= (table_width_mm - rail_margin_mm) and x1 < (table_width_mm - rail_margin_mm):
+                bounce_pt = (table_width_mm - rail_margin_mm, (y0 + y1) * 0.5)
+            elif pred_y <= rail_margin_mm and y1 > rail_margin_mm:
+                bounce_pt = ((x0 + x1) * 0.5, rail_margin_mm)
+            elif pred_y >= (table_height_mm - rail_margin_mm) and y1 < (table_height_mm - rail_margin_mm):
+                bounce_pt = ((x0 + x1) * 0.5, table_height_mm - rail_margin_mm)
+
+        recovered: List[Point2D] = []
+        if bounce_pt is not None and missing_steps >= 2:
+            mid_step = max(1, missing_steps // 2)
+            for s in range(1, mid_step + 1):
+                alpha = s / float(mid_step)
+                recovered.append(
+                    (
+                        x0 + (bounce_pt[0] - x0) * alpha,
+                        y0 + (bounce_pt[1] - y0) * alpha,
+                    )
+                )
+            rem_steps = missing_steps - mid_step
+            for s in range(1, rem_steps + 1):
+                alpha = s / float(rem_steps)
+                recovered.append(
+                    (
+                        bounce_pt[0] + (x1 - bounce_pt[0]) * alpha,
+                        bounce_pt[1] + (y1 - bounce_pt[1]) * alpha,
+                    )
+                )
+            return recovered
+
+        for s in range(1, missing_steps + 1):
+            alpha = s / float(missing_steps)
+            recovered.append((x0 + (x1 - x0) * alpha, y0 + (y1 - y0) * alpha))
+        return recovered
+
+    def verify_and_correct_colors_at_low_speed(
+        self,
+        observed_colors: Dict[int, str],
+        min_separation_mm: float = 75.0,
+        max_allowable_speed: float = 18.0,
+    ) -> bool:
+        """
+        [저속 분리 구간 ROI 색상 교차 검증 (Zero-Swap Safety)]
+        공들이 서로 충분히 떨어져 있고(>= 75mm) 모션 블러가 없는 저속 구간(<= 18mm/frame)에서
+        관측된 색상(WHITE, YELLOW, RED)이 트랙에 잠긴 색상과 뒤바뀌어 있다면 즉시 원복합니다.
+        """
+        if len(self.balls) != 3 or len(observed_colors) != 3:
+            return False
+        if set(observed_colors.values()) != {"WHITE", "YELLOW", "RED"}:
+            return False
+
+        positions = [st.position for st in self.balls.values()]
+        for i in range(len(positions)):
+            for j in range(i + 1, len(positions)):
+                if float(np.linalg.norm(positions[i] - positions[j])) < min_separation_mm:
+                    return False
+
+        if any(st.speed > max_allowable_speed for st in self.balls.values()):
+            return False
+
+        mismatched_ids = [
+            bid
+            for bid, st in self.balls.items()
+            if observed_colors.get(bid) != st.color
+        ]
+        if len(mismatched_ids) == 2:
+            id_a, id_b = mismatched_ids[0], mismatched_ids[1]
+            if (
+                observed_colors[id_a] == self.balls[id_b].color
+                and observed_colors[id_b] == self.balls[id_a].color
+            ):
+                self._swap_ball_states(id_a, id_b)
+                return True
+        return False
 
 
 class SpinDetector:

@@ -6,7 +6,7 @@
 국제식 대대 표준 내경 규격(2840mm x 1420mm, 1px = 1mm)의 평면으로 정규화합니다.
 """
 
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
@@ -26,6 +26,7 @@ class TableCalibrator:
         src_corners: Union[List[Point2D], np.ndarray],
         width_mm: float = settings.TABLE_WIDTH_MM,
         height_mm: float = settings.TABLE_HEIGHT_MM,
+        camera_tilt_ratio: float = 0.0,
     ) -> None:
         """
         TableCalibrator 초기화
@@ -35,9 +36,11 @@ class TableCalibrator:
                          순서: [좌상(Top-Left), 우상(Top-Right), 우하(Bottom-Right), 좌하(Bottom-Left)]
             width_mm: 보정될 목표 평면의 가로 길이 (기본값: 2840.0 mm)
             height_mm: 보정될 목표 평면의 세로 길이 (기본값: 1420.0 mm)
+            camera_tilt_ratio: 대각선 카메라 시차(Parallax) 보정 비율 (수직 탑뷰=0.0, 대각선 뷰=0.10~0.15)
         """
         self.width_mm: int = int(round(width_mm))
         self.height_mm: int = int(round(height_mm))
+        self.camera_tilt_ratio: float = float(camera_tilt_ratio)
 
         # 입력 좌표 유효성 검증 및 float32 배열 변환
         self.src_points: np.ndarray = self._validate_and_format_corners(src_corners)
@@ -180,6 +183,43 @@ class TableCalibrator:
         transformed = cv2.perspectiveTransform(pt, self.homography_matrix)
         x_mm, y_mm = float(transformed[0, 0, 0]), float(transformed[0, 0, 1])
         return (x_mm, y_mm)
+
+    def ball_to_table_mm(
+        self,
+        point_px: Point2D,
+        radius_px: float = 0.0,
+        camera_tilt_ratio: Optional[float] = None,
+    ) -> Point2D:
+        """
+        [대각선 카메라 3D 당구공 시차(Parallax) 보정 투영]
+        당구공은 3D 구(반지름 30.75mm)이므로 대각선 카메라에서 볼 때 구의 중심(cx, cy)이
+        실제 당구대 바닥(라사지) 접점보다 위쪽(멀리)으로 투영됩니다.
+        공의 픽셀 반지름(radius_px)과 카메라 기울기 비율(camera_tilt_ratio)을 반영하여
+        실제 바닥 접점(cy_contact = cy + radius_px * tilt)을 2840 x 1420 mm 물리 평면 좌표로 변환합니다.
+        """
+        tilt = (
+            self.camera_tilt_ratio
+            if camera_tilt_ratio is None
+            else float(camera_tilt_ratio)
+        )
+        cx_px = float(point_px[0])
+        cy_contact_px = float(point_px[1]) + float(radius_px) * tilt
+        return self.pixel_to_mm((cx_px, cy_contact_px))
+
+    def bbox_to_table_mm(
+        self,
+        bbox_xyxy: Tuple[float, float, float, float],
+        camera_tilt_ratio: Optional[float] = None,
+    ) -> Point2D:
+        """
+        객체 검출기(YOLO/RF-DETR 등)의 바운딩 박스(x1, y1, x2, y2)를 입력받아
+        대각선 시차(Parallax)를 보정한 실제 당구대 바닥 접점(mm) 좌표로 변환합니다.
+        """
+        x1, y1, x2, y2 = bbox_xyxy
+        cx = (float(x1) + float(x2)) / 2.0
+        cy = (float(y1) + float(y2)) / 2.0
+        r_px = (float(y2) - float(y1)) / 2.0
+        return self.ball_to_table_mm((cx, cy), radius_px=r_px, camera_tilt_ratio=camera_tilt_ratio)
 
     def mm_to_pixel(self, point_mm: Point2D) -> Point2D:
         """
