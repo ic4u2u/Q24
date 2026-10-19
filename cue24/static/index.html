@@ -1610,6 +1610,8 @@
         const text = document.getElementById('wsStatusText');
         pill.classList.remove('disconnected');
         text.textContent = '실시간 연결됨';
+        // 화면 리플레시(새로고침) 또는 최초 접속 시 즉시 3구 색상 잠금 및 득점 시스템 가동
+        ws.send(JSON.stringify({ action: 'ACTIVATE_VISION' }));
       };
 
       ws.onmessage = (event) => {

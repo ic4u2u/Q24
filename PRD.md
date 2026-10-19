@@ -10,14 +10,14 @@
 - **절대 깨지면 안 되는 핵심 기능**:
   - 국제식 대대(2840x1420mm) 및 당구공(61.5mm) 전역 물리/비전 규격 상수 설정 (`cue24/config/settings.py`)
   - 호모그래피 기반 2840x1420mm 표준 당구대 평면 정규화 및 카메라 당구대 내경 4모서리 자동 보정 (`cue24/core/table_calibrator.py`)
-  - 도넛(환형) 마스크 기반 반사광/그림자 제거 당구공 3색(`WHITE`, `YELLOW`, `RED`) 실시간 분류 및 처음 움직이는 공 수구(Cue Ball) 자동 인식 (`cue24/core/color_locker.py`, `cue24/api/server.py`)
-  - 진원도(>0.72) 필터 당구공 검출, 충돌 법선 벡터(N) 기반 ID 스왑 원복 물리 가드, 15프레임 스핀 정지 감지 (`cue24/core/physics_tracker.py`)
-  - 법선 속도 부호 반전 기반 쿠션 판정(동일 레일 연속 중복 방지 포함) 및 일반 3C/뱅크샷/공타 룰 평가 엔진 (`cue24/core/scoring_engine.py`)
+  - 도넛(환형) 마스크 다중 프레임 누적 투표 기반 당구공 3색(`WHITE`, `YELLOW`, `RED`) 확정, 주행 중 색상 감지기 완전 OFF 잠금 및 처음 움직이는 공 수구(Cue Ball) 자동 인식 (`cue24/core/color_locker.py`, `cue24/api/server.py`)
+  - 5단계 철통 3구 추적(`BulletproofBallTracker` + `PhysicsTracker`): 진원도/모션블러 후보 검출, 칼만 필터 예측 매칭, 충돌 법선 벡터($\vec{N}$) 기반 ID 스왑 강제 원복 물리 가드, 3차 에르미트 스플라인 궤적 복원, 15프레임 스핀 정지 감지 (`cue24/core/physics_tracker.py`)
+  - 법선 속도 부호 반전 기반 쿠션 판정(동일 레일 연속 중복 방지 포함), 3차 스플라인 서브프레임 충돌 검사 및 일반 3C/뱅크샷/공타 룰 평가 엔진 (`cue24/core/scoring_engine.py`)
   - Micro-Hawk 서브픽셀 미세 접촉(간극 <= 0mm, 굴절각 > 0.35도) 및 쿠션 이중 터치(90ms 내 극솟점 2회) VAR 심판 모듈 (`cue24/core/var_referee.py`)
   - 3쿠션 경기 FSM(WAIT_SHOT / SHOT_IN_PROGRESS / BALL_STOPPED), 수구 출발 시 샷 클락 자동 정지 및 3공 정지 시 득점 카운트/실패 시 자동 턴 전환·샷 클락 재작동 (`cue24/services/match_manager.py`)
   - 실시간 라이브캠 & 3공 정지 시 직전 샷 자동 리플레이(Auto-Replay) 링버퍼 엔진 (`cue24/core/replay_buffer.py`)
-  - FastAPI 실시간 WebSocket(`/ws/scoreboard`) 브로드캐스트, MJPEG 라이브/리플레이 스트리밍 및 실시간 비전 판독 파이프라인 서버 (`cue24/api/server.py`)
-  - 20인치 태블릿 CUESCO 스타일 점수판에 꽉 찬 초대형 득점 숫자(`clamp(11rem, min(48vh, 25vw), 32rem)`) 및 Hawk-Eye VAR 팝업 UI (`cue24/static/index.html`)
+  - FastAPI 실시간 WebSocket(`/ws/scoreboard`) 브로드캐스트, 절대 시계(Wall-Clock) 동기화 기반 실시간 1.0배속 MJPEG 라이브/리플레이 스트리밍 및 비전 판독 파이프라인 서버 (`cue24/api/server.py`)
+  - 20인치 태블릿 CUESCO 스타일 점수판에 꽉 찬 초대형 득점 숫자(`clamp(11rem, min(48vh, 25vw), 32rem)`), 당구장 표준 자연스러운 전면 한글화 UI 및 AI 초정밀 비디오 판독(VAR) 팝업 (`cue24/static/index.html`)
 
 ---
 
