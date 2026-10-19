@@ -14,8 +14,9 @@
   - 진원도(>0.72) 필터 당구공 검출, 충돌 법선 벡터(N) 기반 ID 스왑 원복 물리 가드, 15프레임 스핀 정지 감지 (`cue24/core/physics_tracker.py`)
   - 법선 속도 부호 반전 기반 쿠션 판정 및 일반 3C/뱅크샷/공타 룰 평가 엔진 (`cue24/core/scoring_engine.py`)
   - Micro-Hawk 서브픽셀 미세 접촉(간극 <= 0mm, 굴절각 > 0.35도) 및 쿠션 이중 터치(90ms 내 극솟점 2회) VAR 심판 모듈 (`cue24/core/var_referee.py`)
-  - 3쿠션 경기 FSM(WAIT_SHOT / SHOT_IN_PROGRESS / BALL_STOPPED), 점수/이닝/에버리지/40초 타이머 관리 (`cue24/services/match_manager.py`)
-  - FastAPI 실시간 WebSocket(`/ws/scoreboard`) 브로드캐스트 및 비전 파이프라인 연동 서버 (`cue24/api/server.py`)
+  - 3쿠션 경기 FSM(WAIT_SHOT / SHOT_IN_PROGRESS / BALL_STOPPED), 점수/이닝/에버리지/40초 타이머, PBA 뱅크샷 2점제/이닝 기록지/타임아웃 관리 (`cue24/services/match_manager.py`)
+  - 실시간 라이브캠 & 3공 정지 시 직전 샷 자동 리플레이(Auto-Replay) 링버퍼 엔진 (`cue24/core/replay_buffer.py`)
+  - FastAPI 실시간 WebSocket(`/ws/scoreboard`) 브로드캐스트, MJPEG 라이브/리플레이 스트리밍 및 비전 파이프라인 서버 (`cue24/api/server.py`)
   - 20인치 태블릿 CUESCO 스타일 다크 모드 디지털 점수판 및 Hawk-Eye VAR 팝업 UI (`cue24/static/index.html`)
 
 ---
@@ -39,19 +40,22 @@ h:\WorkSpace\Q24\
     │   ├── color_locker.py     # 조명 반사광(35%)과 그림자(15%)를 제거해 공 색상을 확정하고 수구를 고정하는 모듈
     │   ├── physics_tracker.py  # 진원도 공 검출기, 충돌 법선 벡터 ID 스왑 방지 추적기, 스핀 정지 감지 엔진
     │   ├── scoring_engine.py   # 쿠션 법선 속도 반전 판정 및 일반 3C/뱅크샷/공타 룰 판정 엔진
-    │   └── var_referee.py      # Micro-Hawk 서브픽셀 미세 접촉 및 쿠션 이중 터치(Double Touch) VAR 판독 모듈
+    │   ├── var_referee.py      # Micro-Hawk 서브픽셀 미세 접촉 및 쿠션 이중 터치(Double Touch) VAR 판독 모듈
+    │   └── replay_buffer.py    # 샷 주행 녹화 링버퍼 및 3공 정지 시 직전 샷 자동 리플레이/가상 카메라 생성기
     ├── services/           # 경기 규칙 FSM(상태 머신) 및 스코어 관리자 폴더
-    │   └── match_manager.py    # 턴, 점수, 이닝, 에버리지, 하이런, 40초 샷 타이머 FSM 관리자
+    │   └── match_manager.py    # 턴, 점수, 이닝 기록지, PBA 뱅크샷 2점제, 타임아웃(+40초), 수동 보정 FSM 관리자
     ├── api/                # FastAPI 웹소켓 및 REST 라우터 폴더
-    │   └── server.py           # /ws/scoreboard 실시간 웹소켓 브로드캐스트 및 비전 스트림 연동 서버
+    │   └── server.py           # /ws/scoreboard 웹소켓 및 /api/video/live, /api/video/replay 스트리밍 서버
     ├── static/             # 20인치 태블릿 점수판 프론트엔드 HTML/JS/CSS 폴더
-    │   └── index.html          # CUESCO 스타일 다크 모드 디지털 점수판 및 [CUE24 HAWK-EYE VAR] 팝업 UI
+    │   └── index.html          # CUESCO 초대형 폰트, 빌리보드 이닝 기록지, PBA 룰 토글, Hawk-Eye VAR 팝업 UI
     └── tests/              # 모듈별 단위 테스트 폴더
         ├── test_step2.py   # 평면 보정기 및 반사광 제거 색상 확정기 단위 테스트
         ├── test_step3.py   # 진원도 필터, 물리 충돌 가드 ID 스왑 원복, 스핀 정지 감지 단위 테스트
         ├── test_step4.py   # 3쿠션 득점/공타 판정 엔진 및 Micro-Hawk VAR 판독 모듈 단위 테스트
         ├── test_step5.py   # FSM 경기 관리자 및 WebSocket 실시간 브로드캐스트 단위 테스트
-        └── test_step6.py   # 20인치 태블릿 점수판 HTML UI 및 통합 엔트리포인트 단위 테스트
+        ├── test_step6.py   # 20인치 태블릿 점수판 HTML UI 및 통합 엔트리포인트 단위 테스트
+        ├── test_step7.py   # 리플레이 링버퍼, PBA 뱅크샷 2점 룰, 이닝 기록지, 타임아웃 단위 테스트
+        └── test_step8.py   # 큐스코 초대형 스코어 폰트 및 빌리보드 이닝 스코어시트 UI 단위 테스트
 ```
 
 ---

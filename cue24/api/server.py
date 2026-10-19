@@ -1,23 +1,25 @@
 """
-CUE24 FastAPI 실시간 WebSocket 및 REST API 관제 서버
+CUE24 FastAPI 실시간 WebSocket, 라이브캠/자동 리플레이 스트리밍 및 REST API 관제 서버
 파일 경로: cue24/api/server.py
 
 1. WebSocket 엔드포인트 (/ws/scoreboard) 및 ConnectionManager를 통한 실시간 태블릿 브로드캐스트
-2. LiveStreamReader 카메라/시뮬레이션 영상 루프와 Step 2~4 비전·물리·VAR 엔진 통합 파이프라인
+2. LiveStreamReader 카메라/시뮬레이션 영상 루프와 Step 2~4 비전·물리·VAR 엔진 및 Step 7 ReplayRingBuffer 통합
 3. 실시간 이벤트 송출:
    - SCORE_UPDATED (득점 및 점수판 갱신)
    - TURN_CHANGED (공타 시 턴 및 수구 색상 전환)
    - VAR_ALERT (미세 접촉 또는 쿠션 더블터치 현미경 판독 팝업 트리거)
+   - AUTO_REPLAY_READY (3공 완전 정지 시 직전 샷 자동 리플레이 전환 신호)
+4. 라이브캠 & 직전 샷 리플레이 MJPEG/프레임 스트리밍 엔드포인트 (/api/video/live, /api/video/replay)
 """
 
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,6 +30,7 @@ from cue24.core.physics_tracker import (
     PhysicsTracker,
     SpinDetector,
 )
+from cue24.core.replay_buffer import ReplayRingBuffer, SyntheticCamGenerator
 from cue24.core.scoring_engine import ScoringEngine
 from cue24.core.table_calibrator import TableCalibrator
 from cue24.core.var_referee import VARReferee
@@ -39,7 +42,7 @@ Point2D = Tuple[float, float]
 class ConnectionManager:
     """
     연결된 20인치 태블릿 점수판 브라우저 클라이언트들을 관리하고,
-    경기 상태 및 VAR 판독 이벤트를 실시간 브로드캐스트하는 웹소켓 매니저입니다.
+    경기 상태 및 VAR 판독/자동 리플레이 이벤트를 실시간 브로드캐스트하는 웹소켓 매니저입니다.
     """
 
     def __init__(self) -> None:
@@ -79,7 +82,8 @@ class ConnectionManager:
 class LiveStreamReader:
     """
     카메라 영상 스트림(또는 카메라 미연결 시 가상 대대 프레임)을 비동기적으로 공급하고,
-    Step 2~4 컴퓨터 비전·물리·VAR 모듈과 Step 5 MatchManager를 실시간 연동하는 파이프라인 리더입니다.
+    Step 2~4 컴퓨터 비전·물리·VAR 모듈, Step 5 MatchManager, Step 7 ReplayRingBuffer를
+    실시간 연동하는 파이프라인 리더입니다.
     """
 
     def __init__(
@@ -94,7 +98,7 @@ class LiveStreamReader:
         self.is_running: bool = False
         self.frame_counter: int = 0
 
-        # Step 2 ~ Step 4 핵심 코어 모듈 인스턴스 초기화
+        # Step 2 ~ Step 4 핵심 코어 모듈 및 Step 7 리플레이 버퍼 초기화
         default_corners = [
             (0.0, 0.0),
             (settings.TABLE_WIDTH_MM, 0.0),
@@ -108,8 +112,15 @@ class LiveStreamReader:
         self.spin_detector = SpinDetector()
         self.scoring_engine = ScoringEngine()
         self.var_referee = VARReferee()
+        self.replay_buffer = ReplayRingBuffer(max_frames=300)
+        self.cam_generator = SyntheticCamGenerator(width=960, height=480)
 
-        # 현재 샷 주행 중 궤적 버퍼 (VAR 미세 접촉 판독용)
+        # 초기 기본 리플레이 클립 준비 (첫 접속 시에도 리플레이 테스트 가능하도록)
+        init_clip = self.cam_generator.generate_shot_replay_clip("REGULAR_3C", "WHITE")
+        for f_bytes in init_clip:
+            self.replay_buffer.push_frame(f_bytes)
+        self.replay_buffer.lock_last_shot("REGULAR_3C", True, "초기 리플레이 준비 완료")
+
         self._cue_trajectory: List[Point2D] = []
         self._target_trajectories: Dict[int, List[Point2D]] = {}
 
@@ -134,7 +145,7 @@ class LiveStreamReader:
     ) -> Optional[Dict[str, Any]]:
         """
         단일 프레임에서 검출된 공 3개의 물리 좌표를 받아 PhysicsTracker, SpinDetector,
-        ScoringEngine, MatchManager를 순차 구동하고 이벤트 발생 시 WebSocket으로 즉시 브로드캐스트합니다.
+        ScoringEngine, MatchManager, ReplayRingBuffer를 순차 구동하고 이벤트 발생 시 브로드캐스트합니다.
         """
         self.frame_counter += 1
 
@@ -150,6 +161,7 @@ class LiveStreamReader:
         ):
             self.match_manager.on_shot_started()
             self.spin_detector.reset()
+            self.replay_buffer.clear_active()
             obj_ids = [bid for bid in ball_states.keys() if bid != cue_id]
             self.scoring_engine.reset_shot(cue_ball_id=cue_id, object_ball_ids=obj_ids)
             self._cue_trajectory = [
@@ -196,14 +208,20 @@ class LiveStreamReader:
                 ball_crops_gray=ball_crops_gray,
             )
 
-            # 15프레임 연속 정지 확정(BALL_STOPPED) 시 룰 평가 및 스코어/턴 갱신 브로드캐스트
+            # 15프레임 연속 정지 확정(BALL_STOPPED) 시 룰 평가 및 스코어/턴 갱신 + 자동 리플레이 브로드캐스트
             if bool(spin_status["is_fully_stopped"]):
                 shot_eval = self.scoring_engine.evaluate_shot(
                     has_double_touch_foul=has_double_touch_foul
                 )
                 transition = self.match_manager.on_ball_stopped(shot_eval)
 
-                # 만약 턴이 바뀌었다면 다음 턴 수구(WHITE <-> YELLOW)로 트래커의 cue_ball_id 갱신
+                # 직전 샷 리플레이 클립 확정 및 AUTO_REPLAY_READY 브로드캐스트
+                replay_meta = self.replay_buffer.lock_last_shot(
+                    shot_type=str(shot_eval.get("shot_type", "MISS")),
+                    is_scored=bool(shot_eval.get("is_scored", False)),
+                    message=str(shot_eval.get("message", "")),
+                )
+
                 new_cue_color = str(transition["active_cue_ball_color"])
                 for bid, st in self.tracker.balls.items():
                     if st.color == new_cue_color:
@@ -214,6 +232,7 @@ class LiveStreamReader:
                 await self.ws_manager.broadcast_event(
                     event_name, dict(transition["payload"])  # type: ignore[arg-type]
                 )
+                await self.ws_manager.broadcast_event("AUTO_REPLAY_READY", replay_meta)
                 return transition
 
         return None
@@ -244,6 +263,19 @@ class SimulateShotRequest(BaseModel):
     )
 
 
+class AdjustScoreRequest(BaseModel):
+    """수동 점수 가감(+1 / -1) 요청 스키마"""
+
+    player_id: str = Field(default="P1", description="P1 또는 P2")
+    delta: int = Field(default=1, description="점수 변경량 (+1 또는 -1)")
+
+
+class RuleModeRequest(BaseModel):
+    """룰 모드 변경(STANDARD / PBA) 요청 스키마"""
+
+    rule_mode: str = Field(default="STANDARD", description="STANDARD 또는 PBA")
+
+
 # 전역 싱글톤 서비스 및 웹소켓 매니저 인스턴스 생성
 ws_manager = ConnectionManager()
 match_manager = MatchManager()
@@ -266,7 +298,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="CUE24 Smart 3-Cushion SaaS Server",
     version=settings.VERSION,
-    description="대대 3쿠션 무인 관제 및 Micro-Hawk 자동 판독 실시간 WebSocket 서버",
+    description="대대 3쿠션 무인 관제, 라이브캠/자동 리플레이 및 Micro-Hawk 자동 판독 서버",
     lifespan=lifespan,
 )
 
@@ -313,19 +345,132 @@ async def reset_match_state() -> Dict[str, Any]:
     return payload
 
 
+@app.post("/api/match/timeout")
+async def use_match_timeout() -> Dict[str, Any]:
+    """현재 공격 선수의 타임아웃을 사용하여 타이머를 +40초 연장합니다."""
+    payload = match_manager.use_timeout()
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return payload
+
+
+@app.post("/api/match/rule-mode")
+async def change_rule_mode(req: RuleModeRequest) -> Dict[str, Any]:
+    """경기 룰 모드를 STANDARD(일반 1점) 또는 PBA(뱅크샷 2점)로 전환합니다."""
+    payload = match_manager.set_rule_mode(req.rule_mode)
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return payload
+
+
+@app.post("/api/match/adjust-score")
+async def adjust_player_score(req: AdjustScoreRequest) -> Dict[str, Any]:
+    """현장 수동 점수 가감(+1 / -1)을 반영하고 브로드캐스트합니다."""
+    payload = match_manager.adjust_score(req.player_id, req.delta)
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return payload
+
+
+@app.post("/api/match/swap-cues")
+async def swap_player_cue_balls() -> Dict[str, Any]:
+    """P1과 P2의 수구 색상(WHITE <-> YELLOW)을 맞바꿉니다."""
+    payload = match_manager.swap_cue_balls()
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return payload
+
+
+@app.get("/api/video/live-frame")
+async def get_single_live_frame() -> Response:
+    """실시간 라이브캠 단일 JPEG 프레임을 반환합니다."""
+    jpg_bytes = stream_reader.cam_generator.render_live_frame(
+        active_cue_color=match_manager.active_cue_ball_color,
+        fsm_state=match_manager.fsm_state.value,
+    )
+    return Response(content=jpg_bytes, media_type="image/jpeg")
+
+
+async def _mjpeg_live_generator() -> AsyncGenerator[bytes, None]:
+    """실시간 카메라(또는 가상 대대) MJPEG 멀티파트 스트림 제너레이터"""
+    while True:
+        jpg = stream_reader.cam_generator.render_live_frame(
+            active_cue_color=match_manager.active_cue_ball_color,
+            fsm_state=match_manager.fsm_state.value,
+        )
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+        )
+        await asyncio.sleep(0.08)
+
+
+@app.get("/api/video/live")
+async def stream_live_video() -> StreamingResponse:
+    """보드 중앙 상단 모니터용 실시간 MJPEG 라이브캠 스트림 엔드포인트"""
+    return StreamingResponse(
+        _mjpeg_live_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+async def _mjpeg_replay_generator(speed: float = 1.0) -> AsyncGenerator[bytes, None]:
+    """3공 정지 후 확정된 직전 샷 클립을 반복 재생하는 MJPEG 스트림 제너레이터"""
+    delay = max(0.03, min(0.4, 0.06 / max(0.25, speed)))
+    while True:
+        clip = stream_reader.replay_buffer.get_locked_clip()
+        if not clip:
+            jpg = stream_reader.cam_generator.render_live_frame()
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+            )
+            await asyncio.sleep(0.1)
+            continue
+
+        for jpg in clip:
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+            )
+            await asyncio.sleep(delay)
+        await asyncio.sleep(0.4)
+
+
+@app.get("/api/video/replay")
+async def stream_replay_video(speed: float = 1.0) -> StreamingResponse:
+    """3공 완전 정지 시 직전 샷을 자동으로 반복 보여주는 MJPEG 리플레이 엔드포인트"""
+    return StreamingResponse(
+        _mjpeg_replay_generator(speed=speed),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/api/video/replay-info")
+async def get_replay_info() -> Dict[str, Any]:
+    """현재 저장된 직전 샷 리플레이 클립의 메타데이터를 반환합니다."""
+    return stream_reader.replay_buffer.get_last_shot_meta()
+
+
 @app.post("/api/match/simulate-shot")
 async def simulate_shot(req: SimulateShotRequest) -> Dict[str, Any]:
     """
     실제 카메라 없이도 태블릿 화면에서 득점(일반 3C/뱅크샷), 공타(2쿠션),
-    VAR 현미경 판독(미세 접촉/더블터치)을 즉시 시연할 수 있는 시뮬레이션 엔드포인트입니다.
+    VAR 현미경 판독(미세 접촉/더블터치) 및 3공 정지 후 직전 샷 자동 리플레이를
+    즉시 시연할 수 있는 시뮬레이션 엔드포인트입니다.
     """
     scenario = req.scenario.upper()
+    cue_color_before = match_manager.active_cue_ball_color
 
-    # 1. 샷 출발 감지 -> 타이머 즉시 일시 정지
+    # 1. 샷 출발 감지 -> 타이머 즉시 일시 정지 및 리플레이 링버퍼 초기화
     match_manager.on_shot_started()
+    stream_reader.replay_buffer.clear_active()
     await ws_manager.broadcast_event(
         "SCORE_UPDATED", match_manager.get_match_payload()
     )
+
+    # 시나리오에 맞는 주행 프레임들을 링버퍼에 녹화
+    generated_clip = stream_reader.cam_generator.generate_shot_replay_clip(
+        scenario=scenario, active_cue_color=cue_color_before
+    )
+    for frame_jpg in generated_clip:
+        stream_reader.replay_buffer.push_frame(frame_jpg)
 
     var_alert: Optional[Dict[str, Any]] = None
 
@@ -340,11 +485,12 @@ async def simulate_shot(req: SimulateShotRequest) -> Dict[str, Any]:
             "total_cushions": 3,
         }
     elif scenario == "BANK_SHOT":
+        pts_label = "2점" if match_manager.rule_mode == "PBA" else "1점"
         shot_eval = {
             "is_scored": True,
             "shot_type": "BANK_SHOT",
             "reason_code": "VALID_BANK_SHOT",
-            "message": "득점 인정 (뱅크 샷): 선행 3쿠션 후 제1·2적구 충돌 성공!",
+            "message": f"득점 인정 (뱅크 샷 +{pts_label}): 선행 3쿠션 후 제1·2적구 충돌 성공!",
             "cushions_before_first_hit": 3,
             "cushions_before_second_hit": 3,
             "total_cushions": 3,
@@ -380,7 +526,6 @@ async def simulate_shot(req: SimulateShotRequest) -> Dict[str, Any]:
             "total_cushions": 2,
         }
     else:
-        # 기본 공타 시나리오 (2쿠션 부족)
         shot_eval = {
             "is_scored": False,
             "shot_type": "MISS",
@@ -391,15 +536,23 @@ async def simulate_shot(req: SimulateShotRequest) -> Dict[str, Any]:
             "total_cushions": 2,
         }
 
-    # 2. 공 정지(BALL_STOPPED) 판정 반영 및 SCORE_UPDATED / TURN_CHANGED 브로드캐스트
+    # 2. 공 3개 완전 정지(BALL_STOPPED) 판정 반영 및 직전 샷 리플레이 클립 Lock
     transition = match_manager.on_ball_stopped(shot_eval)
+    replay_meta = stream_reader.replay_buffer.lock_last_shot(
+        shot_type=str(shot_eval["shot_type"]),
+        is_scored=bool(shot_eval["is_scored"]),
+        message=str(shot_eval["message"]),
+    )
+
     await ws_manager.broadcast_event(
         str(transition["event_type"]), dict(transition["payload"])  # type: ignore[arg-type]
     )
+    await ws_manager.broadcast_event("AUTO_REPLAY_READY", replay_meta)
 
     return {
         "transition": transition,
         "var_alert": var_alert,
+        "replay_meta": replay_meta,
     }
 
 
@@ -407,8 +560,6 @@ async def simulate_shot(req: SimulateShotRequest) -> Dict[str, Any]:
 async def websocket_scoreboard_endpoint(websocket: WebSocket) -> None:
     """
     20인치 태블릿 점수판 전용 실시간 양방향 WebSocket 엔드포인트 (/ws/scoreboard)
-    - 연결 즉시 현재 스코어보드 상태(SCORE_UPDATED)를 전송합니다.
-    - 태블릿에서 제어 명령(RESET_MATCH, SIMULATE_SHOT 등)을 보낼 경우 즉시 처리하여 브로드캐스트합니다.
     """
     await ws_manager.connect(websocket)
     try:
@@ -429,6 +580,21 @@ async def websocket_scoreboard_endpoint(websocket: WebSocket) -> None:
             elif action == "SIMULATE_SHOT":
                 scenario_name = str(msg.get("scenario", "REGULAR_3C"))
                 await simulate_shot(SimulateShotRequest(scenario=scenario_name))
+            elif action == "USE_TIMEOUT":
+                payload = match_manager.use_timeout()
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "SET_RULE_MODE":
+                mode_name = str(msg.get("rule_mode", "STANDARD"))
+                payload = match_manager.set_rule_mode(mode_name)
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "ADJUST_SCORE":
+                pid = str(msg.get("player_id", "P1"))
+                delta = int(msg.get("delta", 1))
+                payload = match_manager.adjust_score(pid, delta)
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "SWAP_CUES":
+                payload = match_manager.swap_cue_balls()
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
             elif action == "PING":
                 await websocket.send_json(
                     {

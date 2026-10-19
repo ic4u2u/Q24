@@ -4,22 +4,26 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>CUE24 - Smart 3-Cushion Digital Scoreboard & Hawk-Eye VAR</title>
+  <!-- 큐스코(CUESCO) 및 빌리보드(PBA) 전광판 스타일 고밀도 스포츠 숫자 폰트 로드 -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@700;800&family=Oswald:wght@700&display=swap" rel="stylesheet" />
   <style>
     :root {
-      --bg-dark: #070b14;
-      --bg-panel: #0f172a;
-      --bg-panel-active: #13203c;
+      --bg-dark: #050811;
+      --bg-panel: #0c1324;
+      --bg-panel-active: #111d38;
       --border-dim: #1e293b;
-      --border-active-p1: #38bdf8;
-      --border-active-p2: #facc15;
+      --border-active-white: #38bdf8;
+      --border-active-yellow: #facc15;
       --text-main: #f8fafc;
       --text-muted: #94a3b8;
       --accent-cyan: #00f2fe;
       --accent-green: #10b981;
       --accent-amber: #f59e0b;
       --accent-red: #ef4444;
-      --ball-white: #f8fafc;
-      --ball-yellow: #facc15;
+      --score-white: #ffffff;
+      --score-yellow: #fde047;
     }
 
     * {
@@ -31,7 +35,7 @@
     }
 
     body {
-      background: radial-gradient(circle at 50% 0%, #111c35 0%, var(--bg-dark) 75%);
+      background: radial-gradient(circle at 50% 0%, #101c38 0%, var(--bg-dark) 78%);
       color: var(--text-main);
       font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       min-height: 100vh;
@@ -39,7 +43,8 @@
       flex-direction: column;
       justify-content: space-between;
       overflow-x: hidden;
-      padding: 18px 24px;
+      padding: 14px 22px;
+      gap: 12px;
     }
 
     /* 상단 헤더 바 */
@@ -48,7 +53,7 @@
       align-items: center;
       justify-content: space-between;
       padding: 10px 20px;
-      background: rgba(15, 23, 42, 0.85);
+      background: rgba(12, 19, 36, 0.92);
       border: 1px solid var(--border-dim);
       border-radius: 14px;
       backdrop-filter: blur(10px);
@@ -61,8 +66,9 @@
     }
 
     .brand-logo {
-      font-size: 1.5rem;
-      font-weight: 900;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 1.65rem;
+      font-weight: 800;
       letter-spacing: 2px;
       background: linear-gradient(90deg, #38bdf8, #818cf8);
       -webkit-background-clip: text;
@@ -74,13 +80,34 @@
       color: var(--text-muted);
       border-left: 2px solid var(--border-dim);
       padding-left: 12px;
+      font-weight: 600;
     }
 
-    .status-indicators {
+    .top-controls {
       display: flex;
       align-items: center;
-      gap: 18px;
-      font-size: 0.9rem;
+      gap: 12px;
+    }
+
+    /* 일반 3C (1점) <-> PBA 룰 (뱅크샷 2점) 토글 버튼 */
+    .rule-toggle-btn {
+      min-height: 44px;
+      padding: 0 16px;
+      border-radius: 10px;
+      border: 1px solid #38bdf8;
+      background: rgba(56, 189, 248, 0.14);
+      color: #7dd3fc;
+      font-weight: 800;
+      font-size: 0.88rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .rule-toggle-btn.pba-mode {
+      border-color: #f59e0b;
+      background: rgba(245, 158, 11, 0.22);
+      color: #fde047;
+      box-shadow: 0 0 15px rgba(245, 158, 11, 0.3);
     }
 
     .ws-pill {
@@ -92,7 +119,8 @@
       background: rgba(16, 185, 129, 0.12);
       border: 1px solid rgba(16, 185, 129, 0.35);
       color: #34d399;
-      font-weight: 600;
+      font-weight: 700;
+      font-size: 0.85rem;
     }
 
     .ws-pill.disconnected {
@@ -112,10 +140,9 @@
     /* 메인 스코어보드 3단 그리드 (좌: P1, 중: 타이머/쿠션, 우: P2) */
     .scoreboard-grid {
       display: grid;
-      grid-template-columns: 1fr 380px 1fr;
-      gap: 24px;
+      grid-template-columns: 1fr 410px 1fr;
+      gap: 20px;
       align-items: stretch;
-      margin: 18px 0;
       flex: 1;
     }
 
@@ -124,25 +151,25 @@
       position: relative;
       background: var(--bg-panel);
       border: 2px solid var(--border-dim);
-      border-radius: 24px;
-      padding: 28px 32px;
+      border-radius: 22px;
+      padding: 22px 28px;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
       transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-      box-shadow: 0 12px 35px rgba(0, 0, 0, 0.45);
+      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
     }
 
     .player-card.active-p1 {
-      background: linear-gradient(160deg, #132342 0%, #0d172a 100%);
-      border-color: var(--border-active-p1);
-      box-shadow: 0 0 35px rgba(56, 189, 248, 0.22);
+      background: linear-gradient(160deg, #112242 0%, #0a1224 100%);
+      border-color: var(--border-active-white);
+      box-shadow: 0 0 38px rgba(56, 189, 248, 0.26);
     }
 
     .player-card.active-p2 {
-      background: linear-gradient(160deg, #272212 0%, #0d172a 100%);
-      border-color: var(--border-active-p2);
-      box-shadow: 0 0 35px rgba(250, 204, 21, 0.22);
+      background: linear-gradient(160deg, #29220f 0%, #0a1224 100%);
+      border-color: var(--border-active-yellow);
+      box-shadow: 0 0 38px rgba(250, 204, 21, 0.26);
     }
 
     .player-header {
@@ -159,11 +186,11 @@
 
     /* 수구 표시등 (WHITE / YELLOW 구체) */
     .cue-ball-lamp {
-      width: 38px;
-      height: 38px;
+      width: 40px;
+      height: 40px;
       border-radius: 50%;
       position: relative;
-      box-shadow: inset -5px -5px 10px rgba(0, 0, 0, 0.45), 0 0 14px rgba(255, 255, 255, 0.25);
+      box-shadow: inset -5px -5px 10px rgba(0, 0, 0, 0.45), 0 0 16px rgba(255, 255, 255, 0.3);
     }
 
     .cue-ball-lamp::after {
@@ -171,10 +198,10 @@
       position: absolute;
       top: 6px;
       left: 8px;
-      width: 10px;
+      width: 11px;
       height: 6px;
       border-radius: 50%;
-      background: rgba(255, 255, 255, 0.85);
+      background: rgba(255, 255, 255, 0.9);
       transform: rotate(-25deg);
     }
 
@@ -184,19 +211,50 @@
 
     .cue-ball-lamp.yellow {
       background: radial-gradient(circle at 35% 35%, #fef08a, #eab308);
-      box-shadow: inset -5px -5px 10px rgba(0, 0, 0, 0.45), 0 0 14px rgba(250, 204, 21, 0.4);
+      box-shadow: inset -5px -5px 10px rgba(0, 0, 0, 0.45), 0 0 16px rgba(250, 204, 21, 0.45);
     }
 
     .player-name {
-      font-size: 2rem;
-      font-weight: 800;
+      font-size: 2.05rem;
+      font-weight: 900;
       letter-spacing: 0.5px;
+    }
+
+    .header-right-badges {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .timeout-dots {
+      display: flex;
+      gap: 5px;
+      align-items: center;
+      background: rgba(15, 23, 42, 0.8);
+      padding: 5px 10px;
+      border-radius: 999px;
+      border: 1px solid #334155;
+      font-size: 0.75rem;
+      font-weight: 800;
+      color: var(--text-muted);
+    }
+
+    .t-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #334155;
+    }
+
+    .t-dot.on {
+      background: #10b981;
+      box-shadow: 0 0 8px #10b981;
     }
 
     .attack-badge {
       padding: 6px 14px;
       border-radius: 999px;
-      font-size: 0.85rem;
+      font-size: 0.82rem;
       font-weight: 800;
       letter-spacing: 1px;
       text-transform: uppercase;
@@ -208,7 +266,7 @@
     .active-p1 .attack-badge {
       opacity: 1;
       transform: scale(1);
-      background: rgba(56, 189, 248, 0.2);
+      background: rgba(56, 189, 248, 0.22);
       border: 1px solid #38bdf8;
       color: #7dd3fc;
     }
@@ -216,69 +274,142 @@
     .active-p2 .attack-badge {
       opacity: 1;
       transform: scale(1);
-      background: rgba(250, 204, 21, 0.2);
+      background: rgba(250, 204, 21, 0.22);
       border: 1px solid #facc15;
       color: #fde047;
     }
 
-    /* 초대형 점수 폰트 */
-    .score-display {
-      font-size: 9.5rem;
+    /* 빌리보드(PBA) 스타일 목표 점수 진행률 바 */
+    .target-progress-row {
+      margin-top: 10px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .target-label {
+      font-size: 0.78rem;
+      font-weight: 800;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .progress-track {
+      flex: 1;
+      height: 8px;
+      background: #1e293b;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #38bdf8, #10b981);
+      border-radius: 999px;
+      transition: width 0.35s ease;
+    }
+
+    .progress-fill.yellow-bar {
+      background: linear-gradient(90deg, #facc15, #f97316);
+    }
+
+    /* 큐스코(CUESCO) 스타일 초대형 고대비 디지털 스코어 숫자 폰트 */
+    .score-zone {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 6px 0;
+    }
+
+    .score-adj-btn {
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      border: 1px solid #334155;
+      background: rgba(30, 41, 59, 0.55);
+      color: #cbd5e1;
+      font-size: 1.35rem;
       font-weight: 900;
-      line-height: 1;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .score-adj-btn:hover {
+      background: #334155;
+      color: #ffffff;
+      transform: scale(1.06);
+    }
+
+    .score-display {
+      font-family: 'Oswald', 'Chakra Petch', sans-serif;
+      font-size: 11.8rem;
+      font-weight: 700;
+      line-height: 0.92;
       text-align: center;
-      margin: 20px 0;
+      letter-spacing: -2px;
       font-variant-numeric: tabular-nums;
-      text-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
-      transition: transform 0.25s ease, color 0.25s ease;
+      transition: transform 0.25s ease, filter 0.25s ease;
+    }
+
+    .score-display.white-theme {
+      color: var(--score-white);
+      text-shadow: 0 0 28px rgba(56, 189, 248, 0.4), 0 10px 24px rgba(0, 0, 0, 0.85);
+    }
+
+    .score-display.yellow-theme {
+      color: var(--score-yellow);
+      text-shadow: 0 0 28px rgba(250, 204, 21, 0.45), 0 10px 24px rgba(0, 0, 0, 0.85);
     }
 
     .score-display.bump {
-      transform: scale(1.12);
-      color: #34d399;
+      transform: scale(1.14);
+      filter: brightness(1.35);
     }
 
-    /* 플레이어 하단 스탯 그리드 (이닝, 에버리지, 하이런) */
+    /* 플레이어 하단 스탯 그리드 (이닝, 에버리지, 하이런, 뱅크샷) */
     .player-stats {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 12px;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
       border-top: 1px solid rgba(148, 163, 184, 0.15);
-      padding-top: 18px;
+      padding-top: 14px;
     }
 
     .stat-box {
-      background: rgba(15, 23, 42, 0.6);
-      border: 1px solid rgba(148, 163, 184, 0.12);
-      border-radius: 14px;
-      padding: 12px 14px;
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      border-radius: 12px;
+      padding: 10px 10px;
       text-align: center;
     }
 
     .stat-label {
-      font-size: 0.8rem;
+      font-size: 0.74rem;
       color: var(--text-muted);
-      font-weight: 600;
-      margin-bottom: 4px;
+      font-weight: 700;
+      margin-bottom: 3px;
     }
 
     .stat-value {
-      font-size: 1.55rem;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 1.45rem;
       font-weight: 800;
       font-variant-numeric: tabular-nums;
     }
 
-    /* 중앙 허브 (타이머, 쿠션 카운트, 경기 상태) */
+    /* 중앙 허브 (타이머, 쿠션 카운트, 타임아웃, 경기 상태) */
     .center-hub {
       background: var(--bg-panel);
       border: 1px solid var(--border-dim);
-      border-radius: 24px;
-      padding: 24px 20px;
+      border-radius: 22px;
+      padding: 18px 18px;
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: space-between;
-      box-shadow: 0 12px 35px rgba(0, 0, 0, 0.45);
+      gap: 10px;
+      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
     }
 
     .inning-header {
@@ -286,31 +417,33 @@
     }
 
     .inning-label {
-      font-size: 0.85rem;
+      font-size: 0.78rem;
       color: var(--text-muted);
       letter-spacing: 2px;
-      font-weight: 700;
+      font-weight: 800;
     }
 
     .inning-number {
-      font-size: 2.4rem;
-      font-weight: 900;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 2.35rem;
+      font-weight: 800;
       color: #38bdf8;
+      line-height: 1.05;
     }
 
     /* 40초 원형 프로그레스 타이머 */
     .timer-wrapper {
       position: relative;
-      width: 220px;
-      height: 220px;
+      width: 196px;
+      height: 196px;
       display: flex;
       align-items: center;
       justify-content: center;
     }
 
     .timer-svg {
-      width: 220px;
-      height: 220px;
+      width: 196px;
+      height: 196px;
       transform: rotate(-90deg);
     }
 
@@ -325,7 +458,7 @@
       stroke: var(--accent-green);
       stroke-width: 14;
       stroke-linecap: round;
-      stroke-dasharray: 590.6; /* 2 * pi * 94 */
+      stroke-dasharray: 590.6;
       stroke-dashoffset: 0;
       transition: stroke-dashoffset 0.35s linear, stroke 0.3s ease;
     }
@@ -339,39 +472,64 @@
     }
 
     .timer-seconds {
-      font-size: 4.2rem;
-      font-weight: 900;
+      font-family: 'Oswald', sans-serif;
+      font-size: 4.1rem;
+      font-weight: 700;
       line-height: 1;
       font-variant-numeric: tabular-nums;
     }
 
     .timer-unit {
-      font-size: 0.85rem;
+      font-size: 0.78rem;
       color: var(--text-muted);
-      margin-top: 6px;
-      font-weight: 700;
+      margin-top: 5px;
+      font-weight: 800;
+    }
+
+    .quick-hub-actions {
+      display: flex;
+      width: 100%;
+      gap: 8px;
+    }
+
+    .hub-btn {
+      flex: 1;
+      min-height: 44px;
+      border-radius: 10px;
+      border: 1px solid #334155;
+      background: #162238;
+      color: #e2e8f0;
+      font-size: 0.82rem;
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .hub-btn:hover {
+      background: #233554;
     }
 
     /* 쿠션 카운트 배지 */
     .cushion-counter-box {
       width: 100%;
-      background: rgba(2, 6, 23, 0.7);
+      background: rgba(2, 6, 23, 0.75);
       border: 1px solid #334155;
-      border-radius: 16px;
-      padding: 14px 18px;
+      border-radius: 14px;
+      padding: 10px 14px;
       text-align: center;
     }
 
     .cushion-title {
-      font-size: 1.35rem;
-      font-weight: 900;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 1.25rem;
+      font-weight: 800;
       letter-spacing: 1.5px;
       color: #e2e8f0;
     }
 
     .cushion-title span {
       color: #38bdf8;
-      font-size: 1.8rem;
+      font-size: 1.65rem;
       margin-left: 6px;
     }
 
@@ -379,12 +537,12 @@
       display: flex;
       justify-content: center;
       gap: 10px;
-      margin-top: 10px;
+      margin-top: 8px;
     }
 
     .pip {
       width: 44px;
-      height: 10px;
+      height: 9px;
       border-radius: 999px;
       background: #1e293b;
       transition: all 0.25s ease;
@@ -398,32 +556,89 @@
     /* 경기 상태 배너 */
     .state-banner {
       width: 100%;
-      padding: 12px 14px;
-      border-radius: 14px;
+      padding: 10px 12px;
+      border-radius: 12px;
       background: rgba(56, 189, 248, 0.12);
       border: 1px solid rgba(56, 189, 248, 0.3);
       text-align: center;
     }
 
     .state-code {
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       font-weight: 800;
       color: #38bdf8;
       letter-spacing: 1px;
-      margin-bottom: 4px;
+      margin-bottom: 3px;
     }
 
     .state-message {
-      font-size: 0.92rem;
+      font-size: 0.88rem;
       color: #f1f5f9;
       font-weight: 600;
-      line-height: 1.35;
+      line-height: 1.3;
+    }
+
+    /* 빌리보드 & 큐스코 스타일 하단 가로형 이닝 기록지 (INNING SCORE SHEET) */
+    .inning-sheet-panel {
+      background: rgba(12, 19, 36, 0.92);
+      border: 1px solid var(--border-dim);
+      border-radius: 14px;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      overflow-x: auto;
+    }
+
+    .sheet-title {
+      font-size: 0.82rem;
+      font-weight: 800;
+      color: #38bdf8;
+      letter-spacing: 1px;
+      white-space: nowrap;
+      padding-right: 10px;
+      border-right: 1px solid var(--border-dim);
+    }
+
+    .sheet-table {
+      border-collapse: collapse;
+      flex: 1;
+      min-width: 680px;
+    }
+
+    .sheet-table th,
+    .sheet-table td {
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      text-align: center;
+      padding: 4px 8px;
+      min-width: 38px;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.9rem;
+      font-weight: 700;
+    }
+
+    .sheet-table th {
+      background: rgba(30, 41, 59, 0.6);
+      color: var(--text-muted);
+      font-size: 0.78rem;
+    }
+
+    .sheet-player-col {
+      text-align: left !important;
+      padding-left: 10px !important;
+      min-width: 110px !important;
+      color: #e2e8f0;
+    }
+
+    .pts-positive {
+      color: #34d399;
+      background: rgba(16, 185, 129, 0.12);
     }
 
     /* 우측 상단 오버레이: [CUE24 HAWK-EYE VAR] 현미경 판독 팝업창 */
     .var-popup {
       position: fixed;
-      top: 84px;
+      top: 76px;
       right: 28px;
       width: 410px;
       background: rgba(9, 14, 28, 0.96);
@@ -522,33 +737,33 @@
       flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
-      padding: 12px 20px;
-      background: rgba(15, 23, 42, 0.9);
+      gap: 10px;
+      padding: 10px 18px;
+      background: rgba(12, 19, 36, 0.92);
       border: 1px solid var(--border-dim);
-      border-radius: 16px;
+      border-radius: 14px;
     }
 
     .control-label {
-      font-size: 0.88rem;
-      font-weight: 700;
+      font-size: 0.85rem;
+      font-weight: 800;
       color: var(--text-muted);
     }
 
     .btn-group {
       display: flex;
       flex-wrap: wrap;
-      gap: 10px;
+      gap: 8px;
     }
 
     .ctrl-btn {
-      min-height: 46px;
-      padding: 0 18px;
+      min-height: 44px;
+      padding: 0 16px;
       border-radius: 10px;
       border: 1px solid #334155;
       background: #1e293b;
       color: #f8fafc;
-      font-size: 0.9rem;
+      font-size: 0.88rem;
       font-weight: 700;
       cursor: pointer;
       transition: all 0.2s ease;
@@ -577,13 +792,12 @@
       color: #fca5a5;
     }
 
-    /* 반응형 레이아웃 대응 (태블릿/작은 화면) */
     @media (max-width: 1180px) {
       .scoreboard-grid {
         grid-template-columns: 1fr;
       }
       .score-display {
-        font-size: 6.5rem;
+        font-size: 7.5rem;
       }
     }
   </style>
@@ -594,10 +808,13 @@
   <header class="top-bar">
     <div class="brand-box">
       <div class="brand-logo">CUE24</div>
-      <div class="brand-sub">AI 3-CUSHION UNMANNED SCOREBOARD &amp; MICRO-HAWK VAR</div>
+      <div class="brand-sub">CUESCO &amp; PBA HYBRID SMART SCOREBOARD</div>
     </div>
-    <div class="status-indicators">
-      <div id="fsmBadge" style="font-weight:700; color:#94a3b8;">STATE: WAIT_SHOT</div>
+    <div class="top-controls">
+      <button id="ruleToggleBtn" class="rule-toggle-btn" onclick="toggleRuleMode()">
+        🏆 RULE: STANDARD (일반 1점제)
+      </button>
+      <div id="fsmBadge" style="font-weight:800; color:#94a3b8; font-size:0.85rem;">STATE: WAIT_SHOT</div>
       <div id="wsStatusPill" class="ws-pill">
         <span class="ws-dot"></span>
         <span id="wsStatusText">LIVE CONNECTED</span>
@@ -632,15 +849,36 @@
   <main class="scoreboard-grid">
     <!-- 좌측: Player 1 카드 -->
     <section id="p1Card" class="player-card active-p1">
-      <div class="player-header">
-        <div class="player-title-wrap">
-          <div id="p1CueLamp" class="cue-ball-lamp white" title="수구: WHITE"></div>
-          <h2 id="p1Name" class="player-name">PLAYER 1</h2>
+      <div>
+        <div class="player-header">
+          <div class="player-title-wrap">
+            <div id="p1CueLamp" class="cue-ball-lamp white" title="수구: WHITE"></div>
+            <h2 id="p1Name" class="player-name">PLAYER 1</h2>
+          </div>
+          <div class="header-right-badges">
+            <div class="timeout-dots" title="잔여 타임아웃">
+              <span>T/O</span>
+              <span id="p1To1" class="t-dot on"></span>
+              <span id="p1To2" class="t-dot on"></span>
+            </div>
+            <span class="attack-badge">ATTACKING</span>
+          </div>
         </div>
-        <span class="attack-badge">ATTACKING</span>
+
+        <div class="target-progress-row">
+          <span id="p1TargetLabel" class="target-label">TARGET: 40 (0%)</span>
+          <div class="progress-track">
+            <div id="p1ProgressBar" class="progress-fill"></div>
+          </div>
+        </div>
       </div>
 
-      <div id="p1Score" class="score-display">0</div>
+      <!-- 큐스코 스타일 초대형 스코어 + 좌우 수동 보정 버튼 -->
+      <div class="score-zone">
+        <button class="score-adj-btn" onclick="adjustScore('P1', -1)" title="P1 점수 -1 보정">-1</button>
+        <div id="p1Score" class="score-display white-theme">0</div>
+        <button class="score-adj-btn" onclick="adjustScore('P1', 1)" title="P1 점수 +1 보정">+1</button>
+      </div>
 
       <div class="player-stats">
         <div class="stat-box">
@@ -655,10 +893,14 @@
           <div class="stat-label">HIGH RUN (RUN)</div>
           <div id="p1HighRun" class="stat-value">0 (0)</div>
         </div>
+        <div class="stat-box">
+          <div class="stat-label">BANK SHOT</div>
+          <div id="p1Bank" class="stat-value">0</div>
+        </div>
       </div>
     </section>
 
-    <!-- 중앙: 40초 원형 프로그레스 타이머 & 쿠션 카운터 & 배너 -->
+    <!-- 중앙: 40초 원형 프로그레스 타이머 & 타임아웃/수구스왑 & 쿠션 카운터 -->
     <section class="center-hub">
       <div class="inning-header">
         <div class="inning-label">CURRENT INNING</div>
@@ -674,6 +916,11 @@
           <div id="timerSec" class="timer-seconds">40</div>
           <div id="timerStateText" class="timer-unit">SHOT CLOCK</div>
         </div>
+      </div>
+
+      <div class="quick-hub-actions">
+        <button class="hub-btn" onclick="useTimeout()">⏱️ TIME-OUT (+40s)</button>
+        <button class="hub-btn" onclick="swapCueBalls()">🔄 수구 색상 스왑</button>
       </div>
 
       <div class="cushion-counter-box">
@@ -693,15 +940,36 @@
 
     <!-- 우측: Player 2 카드 -->
     <section id="p2Card" class="player-card">
-      <div class="player-header">
-        <div class="player-title-wrap">
-          <div id="p2CueLamp" class="cue-ball-lamp yellow" title="수구: YELLOW"></div>
-          <h2 id="p2Name" class="player-name">PLAYER 2</h2>
+      <div>
+        <div class="player-header">
+          <div class="player-title-wrap">
+            <div id="p2CueLamp" class="cue-ball-lamp yellow" title="수구: YELLOW"></div>
+            <h2 id="p2Name" class="player-name">PLAYER 2</h2>
+          </div>
+          <div class="header-right-badges">
+            <div class="timeout-dots" title="잔여 타임아웃">
+              <span>T/O</span>
+              <span id="p2To1" class="t-dot on"></span>
+              <span id="p2To2" class="t-dot on"></span>
+            </div>
+            <span class="attack-badge">ATTACKING</span>
+          </div>
         </div>
-        <span class="attack-badge">ATTACKING</span>
+
+        <div class="target-progress-row">
+          <span id="p2TargetLabel" class="target-label">TARGET: 40 (0%)</span>
+          <div class="progress-track">
+            <div id="p2ProgressBar" class="progress-fill yellow-bar"></div>
+          </div>
+        </div>
       </div>
 
-      <div id="p2Score" class="score-display">0</div>
+      <!-- 큐스코 스타일 초대형 스코어 + 좌우 수동 보정 버튼 -->
+      <div class="score-zone">
+        <button class="score-adj-btn" onclick="adjustScore('P2', -1)" title="P2 점수 -1 보정">-1</button>
+        <div id="p2Score" class="score-display yellow-theme">0</div>
+        <button class="score-adj-btn" onclick="adjustScore('P2', 1)" title="P2 점수 +1 보정">+1</button>
+      </div>
 
       <div class="player-stats">
         <div class="stat-box">
@@ -716,16 +984,43 @@
           <div class="stat-label">HIGH RUN (RUN)</div>
           <div id="p2HighRun" class="stat-value">0 (0)</div>
         </div>
+        <div class="stat-box">
+          <div class="stat-label">BANK SHOT</div>
+          <div id="p2Bank" class="stat-value">0</div>
+        </div>
       </div>
     </section>
   </main>
+
+  <!-- 빌리보드(PBA) & 큐스코 스타일 실시간 가로형 이닝 스코어시트 (INNING SCORE SHEET) -->
+  <section class="inning-sheet-panel" aria-label="Inning Score Sheet">
+    <div class="sheet-title">📊 INNING SCORE SHEET</div>
+    <table class="sheet-table">
+      <thead>
+        <tr id="sheetHeadRow">
+          <th class="sheet-player-col">PLAYER</th>
+          <th>1</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr id="sheetP1Row">
+          <td id="sheetP1Name" class="sheet-player-col">PLAYER 1</td>
+          <td>0</td>
+        </tr>
+        <tr id="sheetP2Row">
+          <td id="sheetP2Name" class="sheet-player-col">PLAYER 2</td>
+          <td>-</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
 
   <!-- 하단 실시간 시뮬레이션 및 경기 제어 바 -->
   <footer class="control-bar">
     <div class="control-label">⚡ 실시간 판독 시뮬레이터 &amp; 키오스크 제어</div>
     <div class="btn-group">
       <button class="ctrl-btn primary" onclick="triggerSimulation('REGULAR_3C')">+1 일반 3C 득점</button>
-      <button class="ctrl-btn primary" onclick="triggerSimulation('BANK_SHOT')">+1 뱅크샷(가락지) 득점</button>
+      <button class="ctrl-btn primary" onclick="triggerSimulation('BANK_SHOT')">+뱅크샷(가락지) 득점</button>
       <button class="ctrl-btn" onclick="triggerSimulation('MISS_2C')">2쿠션 공타 (턴 교체)</button>
       <button class="ctrl-btn var-btn" onclick="triggerSimulation('VAR_MICRO_CONTACT')">🔬 VAR 미세접촉 득점</button>
       <button class="ctrl-btn danger" onclick="triggerSimulation('VAR_DOUBLE_TOUCH')">🚨 VAR 쿠션 더블터치 파울</button>
@@ -738,6 +1033,7 @@
     let ws = null;
     let varTimeoutId = null;
     let prevScores = { P1: 0, P2: 0 };
+    let currentRuleMode = 'STANDARD';
 
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -775,11 +1071,65 @@
       };
     }
 
+    function applyCueTheme(playerPrefix, cueColor) {
+      const lamp = document.getElementById(`${playerPrefix}CueLamp`);
+      const scoreEl = document.getElementById(`${playerPrefix}Score`);
+      const barEl = document.getElementById(`${playerPrefix}ProgressBar`);
+
+      const isYellow = cueColor === 'YELLOW';
+      lamp.className = `cue-ball-lamp ${isYellow ? 'yellow' : 'white'}`;
+      lamp.title = `수구: ${cueColor}`;
+
+      scoreEl.classList.toggle('yellow-theme', isYellow);
+      scoreEl.classList.toggle('white-theme', !isYellow);
+      barEl.classList.toggle('yellow-bar', isYellow);
+    }
+
+    function renderInningSheet(historyList, p1Name, p2Name) {
+      const headRow = document.getElementById('sheetHeadRow');
+      const p1Row = document.getElementById('sheetP1Row');
+      const p2Row = document.getElementById('sheetP2Row');
+
+      const minCols = Math.max(12, (historyList || []).length);
+      const mapByInning = {};
+      (historyList || []).forEach((item) => {
+        mapByInning[item.inning] = item;
+      });
+
+      let headHtml = '<th class="sheet-player-col">PLAYER</th>';
+      let p1Html = `<td class="sheet-player-col">${p1Name}</td>`;
+      let p2Html = `<td class="sheet-player-col">${p2Name}</td>`;
+
+      for (let i = 1; i <= minCols; i++) {
+        headHtml += `<th>${i}</th>`;
+        const rec = mapByInning[i];
+        const v1 = rec && rec.P1 !== null && rec.P1 !== undefined ? rec.P1 : '-';
+        const v2 = rec && rec.P2 !== null && rec.P2 !== undefined ? rec.P2 : '-';
+        p1Html += `<td class="${Number(v1) > 0 ? 'pts-positive' : ''}">${v1}</td>`;
+        p2Html += `<td class="${Number(v2) > 0 ? 'pts-positive' : ''}">${v2}</td>`;
+      }
+
+      headRow.innerHTML = headHtml;
+      p1Row.innerHTML = p1Html;
+      p2Row.innerHTML = p2Html;
+    }
+
     function renderScoreboard(data) {
       if (!data || !data.players) return;
 
       const p1 = data.players.P1;
       const p2 = data.players.P2;
+
+      // 룰 모드 토글 버튼 업데이트
+      currentRuleMode = data.rule_mode || 'STANDARD';
+      const ruleBtn = document.getElementById('ruleToggleBtn');
+      if (currentRuleMode === 'PBA') {
+        ruleBtn.textContent = '🔥 RULE: PBA PRO (뱅크샷 2점제)';
+        ruleBtn.classList.add('pba-mode');
+      } else {
+        ruleBtn.textContent = '🏆 RULE: STANDARD (일반 1점제)';
+        ruleBtn.classList.remove('pba-mode');
+      }
 
       // FSM 상태 및 중앙 이닝 업데이트
       document.getElementById('fsmBadge').textContent = `STATE: ${data.fsm_state}`;
@@ -796,6 +1146,10 @@
         p2Card.classList.add('active-p2');
       }
 
+      // 수구 색상 테마 동기화
+      applyCueTheme('p1', p1.cue_ball_color);
+      applyCueTheme('p2', p2.cue_ball_color);
+
       // P1 데이터 렌더링
       document.getElementById('p1Name').textContent = p1.name;
       const p1ScoreEl = document.getElementById('p1Score');
@@ -808,6 +1162,11 @@
       document.getElementById('p1Inning').textContent = p1.innings;
       document.getElementById('p1Avg').textContent = Number(p1.average).toFixed(3);
       document.getElementById('p1HighRun').textContent = `${p1.high_run} (${p1.current_run})`;
+      document.getElementById('p1Bank').textContent = p1.bank_shots ?? 0;
+      document.getElementById('p1TargetLabel').textContent = `TARGET: ${p1.target_score} (${p1.progress_pct ?? 0}%)`;
+      document.getElementById('p1ProgressBar').style.width = `${p1.progress_pct ?? 0}%`;
+      document.getElementById('p1To1').classList.toggle('on', (p1.timeouts_remaining ?? 2) >= 1);
+      document.getElementById('p1To2').classList.toggle('on', (p1.timeouts_remaining ?? 2) >= 2);
 
       // P2 데이터 렌더링
       document.getElementById('p2Name').textContent = p2.name;
@@ -821,6 +1180,14 @@
       document.getElementById('p2Inning').textContent = p2.innings;
       document.getElementById('p2Avg').textContent = Number(p2.average).toFixed(3);
       document.getElementById('p2HighRun').textContent = `${p2.high_run} (${p2.current_run})`;
+      document.getElementById('p2Bank').textContent = p2.bank_shots ?? 0;
+      document.getElementById('p2TargetLabel').textContent = `TARGET: ${p2.target_score} (${p2.progress_pct ?? 0}%)`;
+      document.getElementById('p2ProgressBar').style.width = `${p2.progress_pct ?? 0}%`;
+      document.getElementById('p2To1').classList.toggle('on', (p2.timeouts_remaining ?? 2) >= 1);
+      document.getElementById('p2To2').classList.toggle('on', (p2.timeouts_remaining ?? 2) >= 2);
+
+      // 이닝 기록지 업데이트
+      renderInningSheet(data.inning_history || [], p1.name, p2.name);
 
       // 40초 원형 프로그레스 타이머 렌더링
       const timer = data.shot_timer || { remaining_sec: 40, default_sec: 40, is_paused: false };
@@ -829,7 +1196,7 @@
       document.getElementById('timerSec').textContent = rem;
       document.getElementById('timerStateText').textContent = timer.is_paused ? 'PAUSED (IN SHOT)' : 'SHOT CLOCK';
 
-      const ratio = rem / def;
+      const ratio = Math.min(1, rem / def);
       const offset = CIRCUMFERENCE * (1 - ratio);
       const circle = document.getElementById('timerCircle');
       circle.style.strokeDashoffset = `${offset}`;
@@ -893,6 +1260,47 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ scenario }),
         });
+      }
+    }
+
+    async function toggleRuleMode() {
+      const nextMode = currentRuleMode === 'STANDARD' ? 'PBA' : 'STANDARD';
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'SET_RULE_MODE', rule_mode: nextMode }));
+      } else {
+        await fetch('/api/match/rule-mode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rule_mode: nextMode }),
+        });
+      }
+    }
+
+    async function adjustScore(playerId, delta) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'ADJUST_SCORE', player_id: playerId, delta }));
+      } else {
+        await fetch('/api/match/adjust-score', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ player_id: playerId, delta }),
+        });
+      }
+    }
+
+    async function useTimeout() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'USE_TIMEOUT' }));
+      } else {
+        await fetch('/api/match/timeout', { method: 'POST' });
+      }
+    }
+
+    async function swapCueBalls() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'SWAP_CUES' }));
+      } else {
+        await fetch('/api/match/swap-cues', { method: 'POST' });
       }
     }
 
