@@ -49,6 +49,25 @@ class ColorLocker:
         self.locked_ball_colors: Dict[int, str] = {}
         self.locked_cue_ball_id: Optional[int] = None
         self.active_player: Optional[str] = None
+        # [1단계 강화] 정지 상태 다중 프레임 누적 투표(EMA) 히스토리 및 주행 중 색상 분석 OFF 자물쇠
+        self._ab_ema_history: Dict[int, Tuple[float, float]] = {}
+        self.is_color_locked_for_shot: bool = False
+
+    def set_shot_lock(self, locked: bool) -> None:
+        """
+        [2단계 연동] 수구가 출발하면 색상 감지기를 완전히 OFF(locked=True)하고,
+        모든 공이 완전히 정지하면 다시 ON(locked=False)으로 전환합니다.
+        """
+        self.is_color_locked_for_shot = locked
+        if not locked:
+            self._ab_ema_history.clear()
+
+    def get_color_without_specular(self, bgr_crop: np.ndarray) -> str:
+        """
+        [1단계] 천장 조명 하이라이트(중심 35%)와 바닥 그림자(외곽 15%)를 도려낸
+        도넛 마스크를 씌워 순수 표면 색상(WHITE, YELLOW, RED)을 판별합니다.
+        """
+        return self.classify_single_ball(bgr_crop)
 
     def create_annular_mask(self, height: int, width: int) -> np.ndarray:
         """
@@ -129,7 +148,9 @@ class ColorLocker:
         # 3순위: 그 외는 백구(WHITE)
         return "WHITE"
 
-    def classify_balls(self, ball_crops: Dict[int, np.ndarray]) -> Dict[int, str]:
+    def classify_balls(
+        self, ball_crops: Dict[int, np.ndarray], use_temporal_smoothing: bool = False
+    ) -> Dict[int, str]:
         """
         정지 상태의 공 3개 BGR 크롭 영상 딕셔너리({ball_id: bgr_crop})를 입력받아,
         각 공의 색상을 "WHITE", "YELLOW", "RED"로 100% 확정하여 반환합니다.
@@ -139,10 +160,14 @@ class ColorLocker:
 
         Args:
             ball_crops: {공 ID(int): BGR 크롭 영상(np.ndarray)} 형태의 딕셔너리 (총 3개 공)
+            use_temporal_smoothing: 다중 프레임 지수 이동 평균(EMA) 누적 투표를 사용할지 여부
 
         Returns:
             classifications: {공 ID(int): 색상 문자열("WHITE" | "YELLOW" | "RED")}
         """
+        if self.is_color_locked_for_shot and len(self.locked_ball_colors) == 3:
+            return self.locked_ball_colors.copy()
+
         if len(ball_crops) != 3:
             raise ValueError(
                 f"3쿠션 판독을 위해 정확히 3개의 공 크롭 영상이 필요합니다. (입력된 개수: {len(ball_crops)})"
@@ -153,6 +178,13 @@ class ColorLocker:
 
         for ball_id, crop in ball_crops.items():
             mean_a, mean_b = self.extract_lab_ab_mean(crop)
+            if use_temporal_smoothing and ball_id in self._ab_ema_history:
+                prev_a, prev_b = self._ab_ema_history[ball_id]
+                mean_a = prev_a * 0.70 + mean_a * 0.30
+                mean_b = prev_b * 0.70 + mean_b * 0.30
+            if use_temporal_smoothing:
+                self._ab_ema_history[ball_id] = (mean_a, mean_b)
+
             ab_stats[ball_id] = (mean_a, mean_b)
             if mean_a >= self.red_a_th:
                 classifications[ball_id] = "RED"

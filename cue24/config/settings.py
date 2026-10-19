@@ -47,9 +47,12 @@ DEFAULT_SHOT_TIMER: int = 40
 # 3. 컴퓨터 비전 색상 분류 임계값 (OpenCV 8-bit CIE-LAB 색공간 기준: 0 ~ 255)
 # =====================================================================
 # L: 명도(밝기), A: 초록(-) ~ 빨강(+), B: 파랑(-) ~ 노랑(+)
-# 조명 반사(하이라이트)에 흔들리지 않고 적구(Red), 황구(Yellow), 백구(White)를 구분하는 기준값
+# 색상 분류 임계값
 LAB_RED_A_TH: int = 146      # A 채널 값이 146 이상이면 적구(RED)로 판정
 LAB_YELLOW_B_TH: int = 142   # 적구가 아닌 공 중 B 채널 값이 142 이상이면 황구(YELLOW), 미만이면 백구(WHITE)로 판정
+
+# 실시간 스코어보드 연동 기본 녹화 영상 경로
+DEFAULT_VIDEO_PATH: str = r"J:\내 드라이브\L-billiard.mp4"
 
 
 class Cue24Settings(BaseModel):
@@ -61,6 +64,7 @@ class Cue24Settings(BaseModel):
     # 프로젝트 메타 정보
     PROJECT_NAME: str = Field(default="CUE24", description="대대 3쿠션 무인 관제 및 자동 판독 SaaS 시스템")
     VERSION: str = Field(default="1.0.0", description="시스템 버전")
+    DEFAULT_VIDEO_PATH: str = Field(default=DEFAULT_VIDEO_PATH, description="실시간 스코어보드 테스트용 기본 당구 녹화 영상 경로")
 
     # 테이블 및 당구공 물리 규격
     TABLE_WIDTH_MM: float = Field(default=TABLE_WIDTH_MM, description="국제식 대대 가로 내경 (mm)")

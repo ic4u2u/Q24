@@ -34,40 +34,48 @@
       -webkit-user-select: none;
     }
 
+    html,
+    body {
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+      max-height: 100dvh;
+      overflow: hidden;
+    }
+
     body {
       background: radial-gradient(circle at 50% 0%, #101c38 0%, var(--bg-dark) 78%);
       color: var(--text-main);
       font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      min-height: 100vh;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
-      overflow-x: hidden;
-      padding: 14px 22px;
-      gap: 12px;
+      padding: 0.9vh 1.2vw;
+      gap: 0.8vh;
     }
 
     /* 상단 헤더 바 */
     .top-bar {
+      flex: 0 0 auto;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 10px 20px;
+      padding: 0.65vh 1.2vw;
       background: rgba(12, 19, 36, 0.92);
       border: 1px solid var(--border-dim);
-      border-radius: 14px;
+      border-radius: 12px;
       backdrop-filter: blur(10px);
     }
 
     .brand-box {
       display: flex;
       align-items: center;
-      gap: 14px;
+      gap: 12px;
     }
 
     .brand-logo {
       font-family: 'Chakra Petch', sans-serif;
-      font-size: 1.65rem;
+      font-size: clamp(1.25rem, 2.1vh, 1.65rem);
       font-weight: 800;
       letter-spacing: 2px;
       background: linear-gradient(90deg, #38bdf8, #818cf8);
@@ -76,7 +84,7 @@
     }
 
     .brand-sub {
-      font-size: 0.85rem;
+      font-size: clamp(0.72rem, 1.2vh, 0.85rem);
       color: var(--text-muted);
       border-left: 2px solid var(--border-dim);
       padding-left: 12px;
@@ -86,19 +94,19 @@
     .top-controls {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
     }
 
     /* 일반 3C (1점) <-> PBA 룰 (뱅크샷 2점) 토글 버튼 */
     .rule-toggle-btn {
-      min-height: 44px;
-      padding: 0 16px;
-      border-radius: 10px;
+      min-height: clamp(34px, 4.2vh, 42px);
+      padding: 0 14px;
+      border-radius: 9px;
       border: 1px solid #38bdf8;
       background: rgba(56, 189, 248, 0.14);
       color: #7dd3fc;
       font-weight: 800;
-      font-size: 0.88rem;
+      font-size: clamp(0.76rem, 1.25vh, 0.88rem);
       cursor: pointer;
       transition: all 0.2s ease;
     }
@@ -114,13 +122,13 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 6px 14px;
+      padding: 5px 12px;
       border-radius: 999px;
       background: rgba(16, 185, 129, 0.12);
       border: 1px solid rgba(16, 185, 129, 0.35);
       color: #34d399;
       font-weight: 700;
-      font-size: 0.85rem;
+      font-size: clamp(0.74rem, 1.2vh, 0.84rem);
     }
 
     .ws-pill.disconnected {
@@ -130,20 +138,22 @@
     }
 
     .ws-dot {
-      width: 9px;
-      height: 9px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
       background: currentColor;
       box-shadow: 0 0 8px currentColor;
     }
 
-    /* 메인 스코어보드 3단 그리드 (좌: P1, 중: 라이브캠/타이머/쿠션, 우: P2) */
+    /* 메인 스코어보드 3단 그리드 (남는 세로 공간을 정확히 100% 채움, 스크롤 없음) */
     .scoreboard-grid {
       display: grid;
-      grid-template-columns: 1fr 450px 1fr;
-      gap: 18px;
+      grid-template-columns: 1fr clamp(370px, 31vw, 520px) 1fr;
+      gap: 1.1vw;
       align-items: stretch;
-      flex: 1;
+      flex: 1 1 0;
+      min-height: 0;
+      overflow: hidden;
     }
 
     /* 플레이어 카드 */
@@ -151,25 +161,28 @@
       position: relative;
       background: var(--bg-panel);
       border: 2px solid var(--border-dim);
-      border-radius: 22px;
-      padding: 20px 26px;
+      border-radius: 20px;
+      padding: 1.6vh 1.6vw;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
       transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
     }
 
     .player-card.active-p1 {
       background: linear-gradient(160deg, #112242 0%, #0a1224 100%);
       border-color: var(--border-active-white);
-      box-shadow: 0 0 38px rgba(56, 189, 248, 0.26);
+      box-shadow: 0 0 34px rgba(56, 189, 248, 0.25);
     }
 
     .player-card.active-p2 {
       background: linear-gradient(160deg, #29220f 0%, #0a1224 100%);
       border-color: var(--border-active-yellow);
-      box-shadow: 0 0 38px rgba(250, 204, 21, 0.26);
+      box-shadow: 0 0 34px rgba(250, 204, 21, 0.25);
     }
 
     .player-header {
@@ -181,25 +194,26 @@
     .player-title-wrap {
       display: flex;
       align-items: center;
-      gap: 14px;
+      gap: 12px;
     }
 
     /* 수구 표시등 (WHITE / YELLOW 구체) */
     .cue-ball-lamp {
-      width: 40px;
-      height: 40px;
+      width: clamp(30px, 4.2vh, 40px);
+      height: clamp(30px, 4.2vh, 40px);
       border-radius: 50%;
       position: relative;
+      flex-shrink: 0;
       box-shadow: inset -5px -5px 10px rgba(0, 0, 0, 0.45), 0 0 16px rgba(255, 255, 255, 0.3);
     }
 
     .cue-ball-lamp::after {
       content: '';
       position: absolute;
-      top: 6px;
-      left: 8px;
-      width: 11px;
-      height: 6px;
+      top: 16%;
+      left: 20%;
+      width: 28%;
+      height: 16%;
       border-radius: 50%;
       background: rgba(255, 255, 255, 0.9);
       transform: rotate(-25deg);
@@ -215,7 +229,7 @@
     }
 
     .player-name {
-      font-size: 2.05rem;
+      font-size: clamp(1.35rem, 2.8vh, 2.05rem);
       font-weight: 900;
       letter-spacing: 0.5px;
     }
@@ -223,7 +237,7 @@
     .header-right-badges {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
     }
 
     .timeout-dots {
@@ -231,17 +245,17 @@
       gap: 5px;
       align-items: center;
       background: rgba(15, 23, 42, 0.8);
-      padding: 5px 10px;
+      padding: 4px 9px;
       border-radius: 999px;
       border: 1px solid #334155;
-      font-size: 0.75rem;
+      font-size: 0.72rem;
       font-weight: 800;
       color: var(--text-muted);
     }
 
     .t-dot {
-      width: 10px;
-      height: 10px;
+      width: 9px;
+      height: 9px;
       border-radius: 50%;
       background: #334155;
     }
@@ -252,9 +266,9 @@
     }
 
     .attack-badge {
-      padding: 6px 14px;
+      padding: 5px 12px;
       border-radius: 999px;
-      font-size: 0.82rem;
+      font-size: clamp(0.7rem, 1.15vh, 0.82rem);
       font-weight: 800;
       letter-spacing: 1px;
       text-transform: uppercase;
@@ -281,14 +295,14 @@
 
     /* 빌리보드(PBA) 스타일 목표 점수 진행률 바 */
     .target-progress-row {
-      margin-top: 10px;
+      margin-top: 0.8vh;
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
     }
 
     .target-label {
-      font-size: 0.78rem;
+      font-size: clamp(0.68rem, 1.1vh, 0.78rem);
       font-weight: 800;
       color: var(--text-muted);
       white-space: nowrap;
@@ -296,7 +310,7 @@
 
     .progress-track {
       flex: 1;
-      height: 8px;
+      height: 7px;
       background: #1e293b;
       border-radius: 999px;
       overflow: hidden;
@@ -314,86 +328,108 @@
       background: linear-gradient(90deg, #facc15, #f97316);
     }
 
-    /* 큐스코(CUESCO) 스타일 초대형 고대비 디지털 스코어 숫자 폰트 */
+    /* 큐스코(CUESCO) 스타일 초대형 고대비 디지털 스코어 숫자 폰트 (점수판 영역 100% 꽉 찬 구성) */
     .score-zone {
+      position: relative;
+      flex: 1 1 0;
+      min-height: 0;
+      width: 100%;
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      margin: 6px 0;
+      justify-content: center;
+      margin: 0;
+      overflow: hidden;
     }
 
     .score-adj-btn {
-      width: 52px;
-      height: 52px;
-      border-radius: 14px;
-      border: 1px solid #334155;
-      background: rgba(30, 41, 59, 0.55);
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 4;
+      width: clamp(44px, 5.2vh, 54px);
+      height: clamp(44px, 6.2vh, 64px);
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      background: rgba(15, 23, 42, 0.55);
       color: #cbd5e1;
-      font-size: 1.35rem;
+      font-size: clamp(1.05rem, 1.9vh, 1.35rem);
       font-weight: 900;
       cursor: pointer;
+      opacity: 0.55;
       transition: all 0.2s ease;
+    }
+
+    .score-zone .score-adj-btn:first-of-type {
+      left: 0;
+    }
+
+    .score-zone .score-adj-btn:last-of-type {
+      right: 0;
     }
 
     .score-adj-btn:hover {
       background: #334155;
       color: #ffffff;
-      transform: scale(1.06);
+      opacity: 1;
+      transform: translateY(-50%) scale(1.06);
     }
 
     .score-display {
+      width: 100%;
       font-family: 'Oswald', 'Chakra Petch', sans-serif;
-      font-size: 11.8rem;
+      font-size: clamp(11rem, min(48vh, 25vw), 32rem);
       font-weight: 700;
-      line-height: 0.92;
+      line-height: 0.78;
       text-align: center;
-      letter-spacing: -2px;
+      letter-spacing: -4px;
       font-variant-numeric: tabular-nums;
+      transform: scaleY(1.08);
       transition: transform 0.25s ease, filter 0.25s ease;
     }
 
     .score-display.white-theme {
       color: var(--score-white);
-      text-shadow: 0 0 28px rgba(56, 189, 248, 0.4), 0 10px 24px rgba(0, 0, 0, 0.85);
+      text-shadow: 0 0 36px rgba(56, 189, 248, 0.45), 0 12px 28px rgba(0, 0, 0, 0.9);
     }
 
     .score-display.yellow-theme {
       color: var(--score-yellow);
-      text-shadow: 0 0 28px rgba(250, 204, 21, 0.45), 0 10px 24px rgba(0, 0, 0, 0.85);
+      text-shadow: 0 0 36px rgba(250, 204, 21, 0.5), 0 12px 28px rgba(0, 0, 0, 0.9);
     }
 
     .score-display.bump {
-      transform: scale(1.14);
+      transform: scale(1.08) scaleY(1.12);
       filter: brightness(1.35);
     }
 
     /* 플레이어 하단 스탯 그리드 (이닝, 에버리지, 하이런, 뱅크샷) */
     .player-stats {
+      flex: 0 0 auto;
       display: grid;
       grid-template-columns: repeat(4, 1fr);
-      gap: 10px;
+      gap: 8px;
       border-top: 1px solid rgba(148, 163, 184, 0.15);
-      padding-top: 14px;
+      padding-top: 1vh;
     }
 
     .stat-box {
       background: rgba(15, 23, 42, 0.65);
       border: 1px solid rgba(148, 163, 184, 0.14);
-      border-radius: 12px;
-      padding: 10px 10px;
+      border-radius: 10px;
+      padding: 0.7vh 0.5vw;
       text-align: center;
     }
 
     .stat-label {
-      font-size: 0.74rem;
+      font-size: clamp(0.64rem, 1.05vh, 0.74rem);
       color: var(--text-muted);
       font-weight: 700;
-      margin-bottom: 3px;
+      margin-bottom: 2px;
     }
 
     .stat-value {
       font-family: 'Chakra Petch', sans-serif;
-      font-size: 1.45rem;
+      font-size: clamp(1.05rem, 2vh, 1.45rem);
       font-weight: 800;
       font-variant-numeric: tabular-nums;
     }
@@ -402,22 +438,27 @@
     .center-hub {
       background: var(--bg-panel);
       border: 1px solid var(--border-dim);
-      border-radius: 22px;
-      padding: 14px 16px;
+      border-radius: 20px;
+      padding: 1.1vh 1vw;
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: space-between;
-      gap: 10px;
-      box-shadow: 0 14px 36px rgba(0, 0, 0, 0.55);
+      gap: 0.7vh;
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
     }
 
     /* Step 9 & Step 10: 보드판 중앙 상단 실시간 카메라 & 자동 리플레이 & 터치 전체화면/줌 모니터 */
     .cam-monitor-box {
       width: 100%;
-      background: #030712;
+      flex: 1 1 0;
+      min-height: 0;
+      background: #020617;
       border: 2px solid #334155;
-      border-radius: 16px;
+      border-radius: 14px;
       overflow: hidden;
       display: flex;
       flex-direction: column;
@@ -432,11 +473,11 @@
     /* Step 10: 라이브캠 화면 터치 시 전체화면(Fullscreen) 전환 모드 */
     .cam-monitor-box.fullscreen-mode {
       position: fixed;
-      inset: 16px;
+      inset: 14px;
       width: auto;
       height: auto;
       z-index: 960;
-      border-radius: 22px;
+      border-radius: 20px;
       border: 2px solid #38bdf8;
       box-shadow: 0 0 0 9999px rgba(2, 6, 23, 0.88), 0 25px 60px rgba(0, 0, 0, 0.95);
     }
@@ -444,8 +485,9 @@
     .cam-viewport {
       position: relative;
       width: 100%;
-      aspect-ratio: 16 / 8.5;
-      background: #020617;
+      flex: 1 1 0;
+      min-height: 95px;
+      background: #000000;
       overflow: hidden;
       display: flex;
       align-items: center;
@@ -456,7 +498,6 @@
 
     .cam-monitor-box.fullscreen-mode .cam-viewport {
       flex: 1;
-      aspect-ratio: auto;
       height: 100%;
     }
 
@@ -468,10 +509,11 @@
       cursor: grabbing;
     }
 
+    /* 카메라/녹화영상 원본이 좌우 잘림이나 사이즈 변형 없이 100% 원본 비율 그대로 표시되도록 contain 적용 */
     .cam-stream-img {
       width: 100%;
       height: 100%;
-      object-fit: cover;
+      object-fit: contain;
       display: block;
       transform-origin: center center;
       transition: transform 0.14s ease-out;
@@ -485,9 +527,9 @@
 
     .cam-overlay-top {
       position: absolute;
-      top: 8px;
-      left: 10px;
-      right: 10px;
+      top: 6px;
+      left: 8px;
+      right: 8px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -497,9 +539,9 @@
 
     .cam-overlay-bottom {
       position: absolute;
-      bottom: 8px;
-      left: 10px;
-      right: 10px;
+      bottom: 6px;
+      left: 8px;
+      right: 8px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -508,23 +550,23 @@
     }
 
     .cam-touch-hint {
-      padding: 3px 10px;
+      padding: 2px 9px;
       border-radius: 999px;
       background: rgba(2, 6, 23, 0.78);
       border: 1px solid rgba(148, 163, 184, 0.35);
       color: #e2e8f0;
-      font-size: 0.7rem;
+      font-size: 0.68rem;
       font-weight: 700;
     }
 
     .cam-zoom-pill {
-      padding: 3px 9px;
+      padding: 2px 8px;
       border-radius: 999px;
       background: rgba(15, 23, 42, 0.88);
       border: 1px solid #38bdf8;
       color: #38bdf8;
       font-family: 'Chakra Petch', sans-serif;
-      font-size: 0.72rem;
+      font-size: 0.7rem;
       font-weight: 800;
     }
 
@@ -550,13 +592,13 @@
     .cam-mode-badge {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      padding: 4px 11px;
+      gap: 5px;
+      padding: 3px 9px;
       border-radius: 999px;
       font-family: 'Chakra Petch', sans-serif;
-      font-size: 0.76rem;
+      font-size: 0.72rem;
       font-weight: 800;
-      letter-spacing: 0.8px;
+      letter-spacing: 0.6px;
       background: rgba(239, 68, 68, 0.88);
       color: #ffffff;
       box-shadow: 0 2px 10px rgba(239, 68, 68, 0.5);
@@ -569,23 +611,24 @@
     }
 
     .cam-shot-tag {
-      padding: 3px 9px;
+      padding: 2px 8px;
       border-radius: 6px;
       background: rgba(15, 23, 42, 0.82);
       border: 1px solid rgba(56, 189, 248, 0.45);
       color: #7dd3fc;
       font-family: 'Chakra Petch', sans-serif;
-      font-size: 0.72rem;
+      font-size: 0.68rem;
       font-weight: 800;
     }
 
     .cam-controls-bar {
+      flex: 0 0 auto;
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
-      gap: 5px;
-      padding: 6px 8px;
+      gap: 4px;
+      padding: 4px 6px;
       background: rgba(15, 23, 42, 0.95);
       border-top: 1px solid #1e293b;
     }
@@ -593,18 +636,18 @@
     .cam-btn-group {
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 3px;
     }
 
     .cam-ctrl-btn {
-      min-height: 34px;
-      padding: 0 8px;
-      border-radius: 8px;
+      min-height: clamp(28px, 3.3vh, 34px);
+      padding: 0 7px;
+      border-radius: 7px;
       border: 1px solid #334155;
       background: #1e293b;
       color: #cbd5e1;
       font-family: 'Chakra Petch', sans-serif;
-      font-size: 0.73rem;
+      font-size: 0.7rem;
       font-weight: 800;
       cursor: pointer;
       transition: all 0.2s ease;
@@ -635,25 +678,26 @@
 
     /* 타이머 + 현재 이닝 가로 통합 로우 */
     .timer-inning-row {
+      flex: 0 0 auto;
       display: flex;
       align-items: center;
       justify-content: space-around;
       width: 100%;
-      gap: 10px;
-      padding: 4px 6px;
+      gap: 8px;
+      padding: 2px 4px;
     }
 
     .inning-header {
       text-align: center;
       background: rgba(15, 23, 42, 0.65);
       border: 1px solid rgba(148, 163, 184, 0.16);
-      border-radius: 14px;
-      padding: 10px 16px;
-      min-width: 118px;
+      border-radius: 12px;
+      padding: 0.8vh 1vw;
+      min-width: 104px;
     }
 
     .inning-label {
-      font-size: 0.72rem;
+      font-size: 0.68rem;
       color: var(--text-muted);
       letter-spacing: 1.5px;
       font-weight: 800;
@@ -661,7 +705,7 @@
 
     .inning-number {
       font-family: 'Chakra Petch', sans-serif;
-      font-size: 2.35rem;
+      font-size: clamp(1.6rem, 3vh, 2.25rem);
       font-weight: 800;
       color: #38bdf8;
       line-height: 1.05;
@@ -671,16 +715,16 @@
     /* 40초 원형 프로그레스 타이머 */
     .timer-wrapper {
       position: relative;
-      width: 138px;
-      height: 138px;
+      width: clamp(92px, 12.2vh, 132px);
+      height: clamp(92px, 12.2vh, 132px);
       display: flex;
       align-items: center;
       justify-content: center;
     }
 
     .timer-svg {
-      width: 138px;
-      height: 138px;
+      width: 100%;
+      height: 100%;
       transform: rotate(-90deg);
     }
 
@@ -710,33 +754,34 @@
 
     .timer-seconds {
       font-family: 'Oswald', sans-serif;
-      font-size: 3.1rem;
+      font-size: clamp(1.9rem, 3.8vh, 2.9rem);
       font-weight: 700;
       line-height: 1;
       font-variant-numeric: tabular-nums;
     }
 
     .timer-unit {
-      font-size: 0.68rem;
+      font-size: 0.6rem;
       color: var(--text-muted);
-      margin-top: 3px;
+      margin-top: 2px;
       font-weight: 800;
     }
 
     .quick-hub-actions {
+      flex: 0 0 auto;
       display: flex;
       width: 100%;
-      gap: 8px;
+      gap: 6px;
     }
 
     .hub-btn {
       flex: 1;
-      min-height: 44px;
-      border-radius: 10px;
+      min-height: clamp(32px, 3.8vh, 40px);
+      border-radius: 9px;
       border: 1px solid #334155;
       background: #162238;
       color: #e2e8f0;
-      font-size: 0.82rem;
+      font-size: clamp(0.72rem, 1.15vh, 0.8rem);
       font-weight: 800;
       cursor: pointer;
       transition: all 0.2s ease;
@@ -748,17 +793,18 @@
 
     /* 쿠션 카운트 배지 */
     .cushion-counter-box {
+      flex: 0 0 auto;
       width: 100%;
       background: rgba(2, 6, 23, 0.75);
       border: 1px solid #334155;
-      border-radius: 14px;
-      padding: 10px 14px;
+      border-radius: 12px;
+      padding: 0.6vh 10px;
       text-align: center;
     }
 
     .cushion-title {
       font-family: 'Chakra Petch', sans-serif;
-      font-size: 1.25rem;
+      font-size: clamp(0.95rem, 1.65vh, 1.18rem);
       font-weight: 800;
       letter-spacing: 1.5px;
       color: #e2e8f0;
@@ -766,20 +812,20 @@
 
     .cushion-title span {
       color: #38bdf8;
-      font-size: 1.65rem;
+      font-size: clamp(1.2rem, 2.1vh, 1.5rem);
       margin-left: 6px;
     }
 
     .cushion-pips {
       display: flex;
       justify-content: center;
-      gap: 10px;
-      margin-top: 8px;
+      gap: 8px;
+      margin-top: 4px;
     }
 
     .pip {
-      width: 44px;
-      height: 9px;
+      width: 40px;
+      height: 7px;
       border-radius: 999px;
       background: #1e293b;
       transition: all 0.25s ease;
@@ -792,43 +838,48 @@
 
     /* 경기 상태 배너 */
     .state-banner {
+      flex: 0 0 auto;
       width: 100%;
-      padding: 10px 12px;
-      border-radius: 12px;
+      padding: 0.6vh 10px;
+      border-radius: 10px;
       background: rgba(56, 189, 248, 0.12);
       border: 1px solid rgba(56, 189, 248, 0.3);
       text-align: center;
     }
 
     .state-code {
-      font-size: 0.78rem;
+      font-size: 0.72rem;
       font-weight: 800;
       color: #38bdf8;
       letter-spacing: 1px;
-      margin-bottom: 3px;
+      margin-bottom: 1px;
     }
 
     .state-message {
-      font-size: 0.88rem;
+      font-size: clamp(0.74rem, 1.15vh, 0.85rem);
       color: #f1f5f9;
       font-weight: 600;
-      line-height: 1.3;
+      line-height: 1.25;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     /* 빌리보드 & 큐스코 스타일 하단 가로형 이닝 기록지 (INNING SCORE SHEET) */
     .inning-sheet-panel {
+      flex: 0 0 auto;
       background: rgba(12, 19, 36, 0.92);
       border: 1px solid var(--border-dim);
-      border-radius: 14px;
-      padding: 10px 16px;
+      border-radius: 12px;
+      padding: 0.55vh 1vw;
       display: flex;
       align-items: center;
-      gap: 14px;
+      gap: 12px;
       overflow-x: auto;
     }
 
     .sheet-title {
-      font-size: 0.82rem;
+      font-size: 0.78rem;
       font-weight: 800;
       color: #38bdf8;
       letter-spacing: 1px;
@@ -840,30 +891,30 @@
     .sheet-table {
       border-collapse: collapse;
       flex: 1;
-      min-width: 680px;
+      width: 100%;
     }
 
     .sheet-table th,
     .sheet-table td {
       border: 1px solid rgba(148, 163, 184, 0.16);
       text-align: center;
-      padding: 4px 8px;
-      min-width: 38px;
+      padding: 2px 6px;
+      min-width: 34px;
       font-family: 'Chakra Petch', sans-serif;
-      font-size: 0.9rem;
+      font-size: clamp(0.74rem, 1.2vh, 0.86rem);
       font-weight: 700;
     }
 
     .sheet-table th {
       background: rgba(30, 41, 59, 0.6);
       color: var(--text-muted);
-      font-size: 0.78rem;
+      font-size: 0.72rem;
     }
 
     .sheet-player-col {
       text-align: left !important;
       padding-left: 10px !important;
-      min-width: 110px !important;
+      min-width: 100px !important;
       color: #e2e8f0;
     }
 
@@ -875,13 +926,13 @@
     /* 우측 상단 오버레이: [CUE24 HAWK-EYE VAR] 현미경 판독 팝업창 */
     .var-popup {
       position: fixed;
-      top: 76px;
-      right: 28px;
-      width: 410px;
+      top: 68px;
+      right: 24px;
+      width: 400px;
       background: rgba(9, 14, 28, 0.96);
       border: 2px solid #38bdf8;
       border-radius: 18px;
-      padding: 20px 22px;
+      padding: 18px 20px;
       box-shadow: 0 20px 50px rgba(0, 0, 0, 0.85), 0 0 30px rgba(56, 189, 248, 0.35);
       z-index: 999;
       transform: translateX(460px);
@@ -968,40 +1019,43 @@
       font-weight: 600;
     }
 
-    /* 하단 시뮬레이션 & 관제 컨트롤 바 (터치 영역 최소 44px 이상) */
+    /* 하단 시뮬레이션 & 관제 컨트롤 바 */
     .control-bar {
+      flex: 0 0 auto;
       display: flex;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
       align-items: center;
       justify-content: space-between;
       gap: 10px;
-      padding: 10px 18px;
+      padding: 0.6vh 1.2vw;
       background: rgba(12, 19, 36, 0.92);
       border: 1px solid var(--border-dim);
-      border-radius: 14px;
+      border-radius: 12px;
     }
 
     .control-label {
-      font-size: 0.85rem;
+      font-size: clamp(0.75rem, 1.2vh, 0.85rem);
       font-weight: 800;
       color: var(--text-muted);
+      white-space: nowrap;
     }
 
     .btn-group {
       display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
+      flex-wrap: nowrap;
+      gap: 6px;
     }
 
     .ctrl-btn {
-      min-height: 44px;
-      padding: 0 16px;
-      border-radius: 10px;
+      min-height: clamp(34px, 4.2vh, 42px);
+      padding: 0 12px;
+      border-radius: 9px;
       border: 1px solid #334155;
       background: #1e293b;
       color: #f8fafc;
-      font-size: 0.88rem;
+      font-size: clamp(0.75rem, 1.2vh, 0.86rem);
       font-weight: 700;
+      white-space: nowrap;
       cursor: pointer;
       transition: all 0.2s ease;
     }
@@ -1027,15 +1081,6 @@
       background: rgba(239, 68, 68, 0.18);
       border-color: #ef4444;
       color: #fca5a5;
-    }
-
-    @media (max-width: 1180px) {
-      .scoreboard-grid {
-        grid-template-columns: 1fr;
-      }
-      .score-display {
-        font-size: 7.5rem;
-      }
     }
   </style>
 </head>

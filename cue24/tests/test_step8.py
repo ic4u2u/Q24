@@ -31,11 +31,12 @@ class TestStep8CuescoAndBilliBoardUI(unittest.TestCase):
         self.assertIn("sheetHeadRow", html)
         self.assertIn("renderInningSheet", html)
 
-        # 3. PBA 룰 토글, 타임아웃(+40s), 수구 스왑, 수동 점수 보정 버튼 확인
+        # 3. PBA 룰 토글, 타임아웃(+40s), 수구 스왑, 수동 점수 보정 버튼 및 초대형 꽉 찬 득점 숫자 확인
         self.assertIn("toggleRuleMode", html)
         self.assertIn("TIME-OUT (+40s)", html)
         self.assertIn("adjustScore('P1', 1)", html)
         self.assertIn("swapCueBalls()", html)
+        self.assertIn("clamp(11rem, min(48vh, 25vw), 32rem)", html)
 
 
 if __name__ == "__main__":

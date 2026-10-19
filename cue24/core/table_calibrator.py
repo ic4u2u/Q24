@@ -88,6 +88,69 @@ class TableCalibrator:
             self.dst_points, self.src_points
         )
 
+    def auto_detect_table_corners(self, frame: np.ndarray) -> List[Point2D]:
+        """
+        카메라(또는 카메라 대용 영상) 프레임에서 파란색 당구대 라사지 영역을 비전으로 검출하고,
+        고무 쿠션 레일 폭을 제외한 실제 당구대 내경(쿠션 코 끝 4모서리) 좌표를 자동으로 찾아 보정 행렬을 갱신합니다.
+        """
+        if frame is None or frame.size == 0:
+            raise ValueError("유효하지 않은 빈 프레임이 입력되었습니다.")
+
+        h_img, w_img = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        blue_mask = cv2.inRange(hsv, np.array([92, 70, 50], dtype=np.uint8), np.array([135, 255, 255], dtype=np.uint8))
+
+        contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            corners: List[Point2D] = [
+                (0.0, 0.0),
+                (float(w_img), 0.0),
+                (float(w_img), float(h_img)),
+                (0.0, float(h_img)),
+            ]
+            self.update_corners(corners)
+            return corners
+
+        largest_cnt = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(largest_cnt))
+        if area < (w_img * h_img * 0.20):
+            corners = [
+                (0.0, 0.0),
+                (float(w_img), 0.0),
+                (float(w_img), float(h_img)),
+                (0.0, float(h_img)),
+            ]
+            self.update_corners(corners)
+            return corners
+
+        x_box, y_box, w_box, h_box = cv2.boundingRect(largest_cnt)
+
+        # 이미 화면 전체가 내경으로 꽉 찬 합성/데모 영상인 경우 전체 프레임 모서리 사용
+        if w_box >= w_img * 0.96 and h_box >= h_img * 0.96:
+            corners = [
+                (0.0, 0.0),
+                (float(w_img), 0.0),
+                (float(w_img), float(h_img)),
+                (0.0, float(h_img)),
+            ]
+            self.update_corners(corners)
+            return corners
+
+        # 실제 탑뷰 카메라 영상: 파란색 외곽 사각형에서 상/하/좌/우 고무 쿠션 턱 두께를 안쪽으로 보정하여 내경 산출
+        left_x = float(x_box) + float(w_box) * 0.018
+        right_x = float(x_box + w_box) - float(w_box) * 0.018
+        top_y = float(y_box) + float(h_box) * 0.042
+        bottom_y = float(y_box + h_box) - float(h_box) * 0.039
+
+        corners = [
+            (round(left_x, 1), round(top_y, 1)),
+            (round(right_x, 1), round(top_y, 1)),
+            (round(right_x, 1), round(bottom_y, 1)),
+            (round(left_x, 1), round(bottom_y, 1)),
+        ]
+        self.update_corners(corners)
+        return corners
+
     def warp(self, frame: np.ndarray) -> np.ndarray:
         """
         원본 카메라 프레임을 2840 x 1420 밀리미터 표준 평면 영상으로 원근 보정(Warp)합니다.

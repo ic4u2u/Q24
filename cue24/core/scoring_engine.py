@@ -55,11 +55,12 @@ class ScoringEngine:
         self.cushion_margin_mm: float = cushion_margin_mm
         self.ball_contact_th: float = ball_diameter_mm + contact_tolerance_mm
 
-        # 4면 쿠션 경계선 좌표 (LEFT: 32, RIGHT: 2808, TOP: 32, BOTTOM: 1388)
-        self.left_bound: float = cushion_margin_mm
-        self.right_bound: float = table_width_mm - cushion_margin_mm
-        self.top_bound: float = cushion_margin_mm
-        self.bottom_bound: float = table_height_mm - cushion_margin_mm
+        # 30fps 카메라 샘플링 간격 및 쿠션 그림자 마진을 고려한 유효 쿠션 반사 감지 경계 (82.0mm와 설정 마진 중 큰 값 적용)
+        effective_rail_zone = max(cushion_margin_mm, 82.0)
+        self.left_bound: float = effective_rail_zone
+        self.right_bound: float = table_width_mm - effective_rail_zone
+        self.top_bound: float = effective_rail_zone
+        self.bottom_bound: float = table_height_mm - effective_rail_zone
 
         # 샷 상태 관리 변수 초기화
         self.cue_ball_id: Optional[int] = None
@@ -90,6 +91,15 @@ class ScoringEngine:
         # 쿠션 법선 속도 반전(Velocity Reversal) 추적용 상태
         self._prev_cue_pos: Optional[Point2D] = None
         self._prev_cue_vel: Optional[Point2D] = None
+        self._prev_ball_positions: Dict[int, Point2D] = {}
+        self._initial_ball_positions: Dict[int, Point2D] = {}
+        self._last_rail_hit: Optional[str] = None
+        self._last_cushion_frame: Dict[str, int] = {
+            "LEFT": -999,
+            "RIGHT": -999,
+            "TOP": -999,
+            "BOTTOM": -999,
+        }
         # 쿠션 마진 내부에서 아직 반전 카운트가 처리되지 않은 접근 상태 기록
         self._approaching_rail: Dict[str, bool] = {
             "LEFT": False,
@@ -105,7 +115,15 @@ class ScoringEngine:
     ) -> None:
         """
         유효 1쿠션 접촉(법선 속도 반전 확인 완료)을 이벤트 시퀀스에 기록합니다.
+        다른 레일이나 목적구 접촉 없이 동일 레일을 따라 구르며 연속 중복 카운트되는 현상을 방지합니다.
         """
+        if self._last_rail_hit == rail_name:
+            return
+        if frame_idx - self._last_cushion_frame.get(rail_name, -999) <= 2:
+            return
+        self._last_rail_hit = rail_name
+        self._last_cushion_frame[rail_name] = frame_idx
+
         self.total_cushion_count += 1
         if self.first_object_ball_id is None:
             self.cushion_count_before_first_hit += 1
@@ -129,6 +147,7 @@ class ScoringEngine:
         """
         if self.first_object_ball_id is None:
             self.first_object_ball_id = target_ball_id
+            self._last_rail_hit = None
             self.events.append(
                 ShotEvent(
                     frame_idx=frame_idx,
@@ -142,6 +161,7 @@ class ScoringEngine:
             and self.second_object_ball_id is None
         ):
             self.second_object_ball_id = target_ball_id
+            self._last_rail_hit = None
             self.events.append(
                 ShotEvent(
                     frame_idx=frame_idx,
@@ -151,6 +171,19 @@ class ScoringEngine:
                 )
             )
 
+    @staticmethod
+    def _segment_to_point_dist(p1: Point2D, p2: Point2D, target: Point2D) -> float:
+        """프레임 간 수구 이동 선분(p1 -> p2)과 목적구 중심(target) 사이의 최단 거리를 계산합니다."""
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        len_sq = dx * dx + dy * dy
+        if len_sq < 1e-6:
+            return math.hypot(target[0] - p1[0], target[1] - p1[1])
+        t = max(0.0, min(1.0, ((target[0] - p1[0]) * dx + (target[1] - p1[1]) * dy) / len_sq))
+        proj_x = p1[0] + t * dx
+        proj_y = p1[1] + t * dy
+        return math.hypot(target[0] - proj_x, target[1] - proj_y)
+
     def _check_cushion_velocity_reversal(
         self, frame_idx: int, cue_pos: Point2D, cue_vel: Point2D
     ) -> List[str]:
@@ -158,10 +191,10 @@ class ScoringEngine:
         단순 마진 진입이 아닌, 쿠션 마진 영역 내에서 벽면을 향하던 법선 속도의 부호가
         반전(Velocity Reversal)되었을 때만 유효 1쿠션으로 판정합니다.
 
-        - LEFT 쿠션 (x <= 32.0): 접근 속도 vx < 0 -> 반사 속도 vx > 0
-        - RIGHT 쿠션 (x >= 2808.0): 접근 속도 vx > 0 -> 반사 속도 vx < 0
-        - TOP 쿠션 (y <= 32.0): 접근 속도 vy < 0 -> 반사 속도 vy > 0
-        - BOTTOM 쿠션 (y >= 1388.0): 접근 속도 vy > 0 -> 반사 속도 vy < 0
+        - LEFT 쿠션 (x <= left_bound): 접근 속도 vx < 0 -> 반사 속도 vx > 0
+        - RIGHT 쿠션 (x >= right_bound): 접근 속도 vx > 0 -> 반사 속도 vx < 0
+        - TOP 쿠션 (y <= top_bound): 접근 속도 vy < 0 -> 반사 속도 vy > 0
+        - BOTTOM 쿠션 (y >= bottom_bound): 접근 속도 vy > 0 -> 반사 속도 vy < 0
         """
         triggered_rails: List[str] = []
         x, y = cue_pos
@@ -244,6 +277,11 @@ class ScoringEngine:
         if self.cue_ball_id is None or self.cue_ball_id not in ball_positions:
             raise ValueError("수구(cue_ball_id)가 설정되지 않았거나 좌표 딕셔너리에 없습니다.")
 
+        if not self._initial_ball_positions:
+            self._initial_ball_positions = {
+                bid: (float(pt[0]), float(pt[1])) for bid, pt in ball_positions.items()
+            }
+
         cue_pos = ball_positions[self.cue_ball_id]
 
         if cue_velocity is None:
@@ -260,13 +298,44 @@ class ScoringEngine:
         # 1. 4면 쿠션 법선 속도 부호 반전(Velocity Reversal) 판정
         self._check_cushion_velocity_reversal(frame_idx, cue_pos, cue_vel)
 
-        # 2. 목적구(제1적구, 제2적구) 충돌 판정
+        # 2. 목적구(제1적구, 제2적구) 충돌 판정 (중심 거리 + 선분 접촉 + 3차 스플라인 곡선 복원 + 정지 목적구 피격 감지)
+        spline_pts: List[Point2D] = []
+        if self._prev_cue_pos is not None and self._prev_cue_vel is not None:
+            from cue24.core.physics_tracker import PhysicsTracker
+
+            spline_pts = PhysicsTracker.interpolate_cubic_spline(
+                self._prev_cue_pos, self._prev_cue_vel, cue_pos, cue_vel, num_steps=8
+            )
+
         for bid, pos in ball_positions.items():
             if bid == self.cue_ball_id:
                 continue
 
             dist = math.hypot(cue_pos[0] - pos[0], cue_pos[1] - pos[1])
-            if dist <= self.ball_contact_th:
+            seg_dist = (
+                self._segment_to_point_dist(self._prev_cue_pos, cue_pos, pos)
+                if self._prev_cue_pos is not None
+                else dist
+            )
+            spline_dist = (
+                min(math.hypot(sp[0] - pos[0], sp[1] - pos[1]) for sp in spline_pts)
+                if spline_pts
+                else dist
+            )
+            min_approach_dist = min(dist, seg_dist, spline_dist)
+
+            # 목적구가 직전 프레임 대비 충격을 받아 갑자기 움직였는지 확인 (30fps 샘플링 보완)
+            target_impact_moved = False
+            if bid in self._prev_ball_positions and bid in self._initial_ball_positions:
+                prev_t = self._prev_ball_positions[bid]
+                init_t = self._initial_ball_positions[bid]
+                step_move = math.hypot(pos[0] - prev_t[0], pos[1] - prev_t[1])
+                init_disp = math.hypot(prev_t[0] - init_t[0], prev_t[1] - init_t[1])
+                # 정지해 있던 목적구(초기 위치에서 15mm 이내)가 1프레임에 6mm 이상 튕겨 나가고 수구가 근처에 있었던 경우
+                if init_disp <= 15.0 and step_move >= 6.0 and min_approach_dist <= 220.0:
+                    target_impact_moved = True
+
+            if min_approach_dist <= self.ball_contact_th or target_impact_moved:
                 if not self._in_contact_with_ball.get(bid, False):
                     self.record_ball_hit(bid, frame_idx, cue_pos)
                     self._in_contact_with_ball[bid] = True
@@ -275,6 +344,9 @@ class ScoringEngine:
 
         self._prev_cue_pos = cue_pos
         self._prev_cue_vel = cue_vel
+        self._prev_ball_positions = {
+            bid: (float(pt[0]), float(pt[1])) for bid, pt in ball_positions.items()
+        }
 
     def evaluate_shot(self, has_double_touch_foul: bool = False) -> Dict[str, object]:
         """

@@ -9,15 +9,15 @@
 - **서비스 목적**: 대대 3쿠션 무인 관제 및 컴퓨터 비전 기반 자동 판독 SaaS 시스템
 - **절대 깨지면 안 되는 핵심 기능**:
   - 국제식 대대(2840x1420mm) 및 당구공(61.5mm) 전역 물리/비전 규격 상수 설정 (`cue24/config/settings.py`)
-  - 호모그래피 기반 2840x1420mm 표준 당구대 평면 정규화 (`cue24/core/table_calibrator.py`)
-  - 도넛(환형) 마스크 기반 반사광/그림자 제거 당구공 3색 분류 및 수구 ID 고정 (`cue24/core/color_locker.py`)
+  - 호모그래피 기반 2840x1420mm 표준 당구대 평면 정규화 및 카메라 당구대 내경 4모서리 자동 보정 (`cue24/core/table_calibrator.py`)
+  - 도넛(환형) 마스크 기반 반사광/그림자 제거 당구공 3색(`WHITE`, `YELLOW`, `RED`) 실시간 분류 및 처음 움직이는 공 수구(Cue Ball) 자동 인식 (`cue24/core/color_locker.py`, `cue24/api/server.py`)
   - 진원도(>0.72) 필터 당구공 검출, 충돌 법선 벡터(N) 기반 ID 스왑 원복 물리 가드, 15프레임 스핀 정지 감지 (`cue24/core/physics_tracker.py`)
-  - 법선 속도 부호 반전 기반 쿠션 판정 및 일반 3C/뱅크샷/공타 룰 평가 엔진 (`cue24/core/scoring_engine.py`)
+  - 법선 속도 부호 반전 기반 쿠션 판정(동일 레일 연속 중복 방지 포함) 및 일반 3C/뱅크샷/공타 룰 평가 엔진 (`cue24/core/scoring_engine.py`)
   - Micro-Hawk 서브픽셀 미세 접촉(간극 <= 0mm, 굴절각 > 0.35도) 및 쿠션 이중 터치(90ms 내 극솟점 2회) VAR 심판 모듈 (`cue24/core/var_referee.py`)
-  - 3쿠션 경기 FSM(WAIT_SHOT / SHOT_IN_PROGRESS / BALL_STOPPED), 점수/이닝/에버리지/40초 타이머, PBA 뱅크샷 2점제/이닝 기록지/타임아웃 관리 (`cue24/services/match_manager.py`)
+  - 3쿠션 경기 FSM(WAIT_SHOT / SHOT_IN_PROGRESS / BALL_STOPPED), 수구 출발 시 샷 클락 자동 정지 및 3공 정지 시 득점 카운트/실패 시 자동 턴 전환·샷 클락 재작동 (`cue24/services/match_manager.py`)
   - 실시간 라이브캠 & 3공 정지 시 직전 샷 자동 리플레이(Auto-Replay) 링버퍼 엔진 (`cue24/core/replay_buffer.py`)
-  - FastAPI 실시간 WebSocket(`/ws/scoreboard`) 브로드캐스트, MJPEG 라이브/리플레이 스트리밍 및 비전 파이프라인 서버 (`cue24/api/server.py`)
-  - 20인치 태블릿 CUESCO 스타일 다크 모드 디지털 점수판 및 Hawk-Eye VAR 팝업 UI (`cue24/static/index.html`)
+  - FastAPI 실시간 WebSocket(`/ws/scoreboard`) 브로드캐스트, MJPEG 라이브/리플레이 스트리밍 및 실시간 비전 판독 파이프라인 서버 (`cue24/api/server.py`)
+  - 20인치 태블릿 CUESCO 스타일 점수판에 꽉 찬 초대형 득점 숫자(`clamp(11rem, min(48vh, 25vw), 32rem)`) 및 Hawk-Eye VAR 팝업 UI (`cue24/static/index.html`)
 
 ---
 

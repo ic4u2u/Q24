@@ -38,6 +38,16 @@ class BallState:
         self.speed = float(np.linalg.norm(self.velocity))
         self.position = new_vec
 
+    def predict_kalman_position(self, damping: float = 0.92) -> Point2D:
+        """
+        [4단계: 칼만 필터 위치 예측]
+        공이 너무 빨라 카메라 블러로 순간 소실되었을 때 직전 위치와 감쇠 속도 모델로 다음 프레임 위치를 예측합니다.
+        """
+        pred = self.position + self.velocity * damping
+        x = float(np.clip(pred[0], 30.0, settings.TABLE_WIDTH_MM - 30.0))
+        y = float(np.clip(pred[1], 30.0, settings.TABLE_HEIGHT_MM - 30.0))
+        return (x, y)
+
 
 class BallCandidateDetector:
     """
@@ -91,13 +101,29 @@ class BallCandidateDetector:
         if warped_bgr_frame is None or warped_bgr_frame.size == 0:
             raise ValueError("유효하지 않은 빈 영상이 입력되었습니다.")
 
+        h_orig, w_orig = warped_bgr_frame.shape[:2]
+        scale = 0.5 if w_orig >= 2000 else 1.0
+        if scale != 1.0:
+            work_frame = cv2.resize(
+                warped_bgr_frame,
+                (int(w_orig * scale), int(h_orig * scale)),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            k_size = 3
+        else:
+            work_frame = warped_bgr_frame
+            k_size = 5
+
+        inv_scale = 1.0 / scale
+        area_scale = inv_scale * inv_scale
+
         # 1. BGR -> HSV 변환 후 파란색 라사지 배경 마스크 생성 및 반전(전경 추출)
-        hsv = cv2.cvtColor(warped_bgr_frame, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(work_frame, cv2.COLOR_BGR2HSV)
         cloth_mask = cv2.inRange(hsv, self.hsv_blue_lower, self.hsv_blue_upper)
         foreground_mask = cv2.bitwise_not(cloth_mask)
 
         # 미세 노이즈 제거를 위한 모폴로지 연산 (열림 연산 후 닫힘 연산)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
         foreground_mask = cv2.morphologyEx(foreground_mask, cv2.MORPH_OPEN, kernel)
         foreground_mask = cv2.morphologyEx(foreground_mask, cv2.MORPH_CLOSE, kernel)
 
@@ -109,7 +135,8 @@ class BallCandidateDetector:
         valid_candidates: List[Dict[str, float]] = []
 
         for cnt in contours:
-            area = float(cv2.contourArea(cnt))
+            raw_area = float(cv2.contourArea(cnt))
+            area = raw_area * area_scale
             if area < self.min_area or area > self.max_area:
                 continue
 
@@ -118,7 +145,7 @@ class BallCandidateDetector:
                 continue
 
             # 3. 진원도(Circularity = 4 * pi * area / perimeter^2) 계산 및 필터링
-            circularity = (4.0 * math.pi * area) / (perimeter * perimeter)
+            circularity = (4.0 * math.pi * raw_area) / (perimeter * perimeter)
             if circularity <= self.CIRCULARITY_TH:
                 # 큐대, 선수 팔, 긴 그림자 등은 진원도가 0.72 이하이므로 완벽히 배제됨
                 continue
@@ -126,9 +153,9 @@ class BallCandidateDetector:
             (cx, cy), radius = cv2.minEnclosingCircle(cnt)
             valid_candidates.append(
                 {
-                    "x": float(cx),
-                    "y": float(cy),
-                    "radius": float(radius),
+                    "x": float(cx) * inv_scale,
+                    "y": float(cy) * inv_scale,
+                    "radius": float(radius) * inv_scale,
                     "circularity": float(circularity),
                     "area": area,
                 }
@@ -364,6 +391,38 @@ class PhysicsTracker:
 
         return self.balls
 
+    @staticmethod
+    def interpolate_cubic_spline(
+        p0: Point2D,
+        v0: Point2D,
+        p1: Point2D,
+        v1: Point2D,
+        num_steps: int = 8,
+    ) -> List[Point2D]:
+        """
+        [4단계: 카메라 블러/터널링 3차 스플라인 복원]
+        30fps 카메라의 프레임(p0 -> p1) 사이 끊긴 구간을 직전 속도(v0)와 현재 속도(v1)를 반영한
+        3차 에르미트 스플라인(Cubic Hermite Spline) 곡선으로 부드럽게 이어 300fps급 연속 궤적 점들을 반환합니다.
+        """
+        if num_steps <= 1:
+            return [p1]
+        pts: List[Point2D] = []
+        # 접선 스케일 완화로 오버슈트 방지 (0.35 계수)
+        m0x, m0y = v0[0] * 0.35, v0[1] * 0.35
+        m1x, m1y = v1[0] * 0.35, v1[1] * 0.35
+        for step in range(1, num_steps + 1):
+            t = step / float(num_steps)
+            t2 = t * t
+            t3 = t2 * t
+            h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+            h10 = t3 - 2.0 * t2 + t
+            h01 = -2.0 * t3 + 3.0 * t2
+            h11 = t3 - t2
+            ix = h00 * p0[0] + h10 * m0x + h01 * p1[0] + h11 * m1x
+            iy = h00 * p0[1] + h10 * m0y + h01 * p1[1] + h11 * m1y
+            pts.append((float(ix), float(iy)))
+        return pts
+
 
 class SpinDetector:
     """
@@ -534,3 +593,196 @@ class SpinDetector:
             "max_spin_energy": max_spin_energy,
             "spin_energies": spin_energies,
         }
+
+
+class BulletproofBallTracker:
+    """
+    현실 당구 매장에서 발생하는 조명 반사광, 고속 회전 도트 번짐, 공-공 충돌 시 ID 스왑,
+    30fps 프레임 터널링을 완벽히 방어하는 '5단계 철통 3구 추적 알고리즘' 통합 클래스입니다.
+
+    - 1단계 (phase1_lock_balls_before_shot): 정지 상태에서 도넛 마스크로 반사광/그림자를 제거해 WHITE/YELLOW/RED 확정 및 ID 잠금
+    - 2단계 (phase2_track_motion_only): 주행 중 색상 감지기를 완전히 끄고 칼만 예측 + 최단 거리 헝가리안 매칭으로 초고속 추적
+    - 3단계 (phase3_anti_id_switch_guard): 공-공 충돌(<= 61.5mm) 순간 충돌 법선 벡터(N) 내적(> 0.8) 검사로 ID 스왑 즉시 강제 원복
+    - 4단계 (phase4_restore_blur_and_spline): 프레임 사이 소실된 공은 칼만 필터로 예측하고 3차 스플라인 곡선으로 궤적을 매끄럽게 복원
+    - 5단계 (phase5_confirm_stop_and_handover): 이동 속도와 제자리 스핀이 모두 0이 될 때 추적을 종료하고 수구 자물쇠를 안전하게 인계
+    """
+
+    def __init__(self) -> None:
+        self.locked_balls: Dict[int, Dict[str, object]] = {}
+        self.is_shot_in_progress: bool = False
+        self.swap_restore_count: int = 0
+
+    @staticmethod
+    def get_color_without_specular(crop_img: np.ndarray) -> str:
+        """도넛 마스크를 이용해 천장 조명 하이라이트와 바닥 그림자를 제거한 순수 표면 색상을 반환합니다."""
+        from cue24.core.color_locker import ColorLocker
+
+        locker = ColorLocker()
+        return locker.get_color_without_specular(crop_img)
+
+    def phase1_lock_balls_before_shot(
+        self,
+        detected_balls: List[Dict[str, object]],
+        frame: Optional[np.ndarray] = None,
+    ) -> Dict[int, Dict[str, object]]:
+        """[1단계] 샷 직전 정지 상태: 조명 반사광을 피해 색상을 확정하고 고유 ID(0, 1, 2)를 영구 잠금합니다."""
+        from cue24.core.color_locker import ColorLocker
+
+        locker = ColorLocker()
+        crops: Dict[int, np.ndarray] = {}
+        centers: Dict[int, Point2D] = {}
+
+        for i, ball in enumerate(detected_balls[:3]):
+            center = ball.get("center", (0.0, 0.0))  # type: ignore[assignment]
+            centers[i] = (float(center[0]), float(center[1]))  # type: ignore[index]
+            crop = ball.get("crop_img")
+            if isinstance(crop, np.ndarray) and crop.size > 0:
+                crops[i] = crop
+            elif frame is not None and frame.size > 0:
+                cx, cy = int(round(centers[i][0])), int(round(centers[i][1]))
+                r = 24
+                h, w = frame.shape[:2]
+                x1, y1 = max(0, cx - r), max(0, cy - r)
+                x2, y2 = min(w, cx + r), min(h, cy + r)
+                crops[i] = frame[y1:y2, x1:x2]
+
+        if len(crops) == 3:
+            color_map = locker.classify_balls(crops, use_temporal_smoothing=True)
+        else:
+            color_map = {
+                i: (
+                    self.get_color_without_specular(crops[i])
+                    if i in crops
+                    else "WHITE"
+                )
+                for i in range(len(centers))
+            }
+
+        self.locked_balls.clear()
+        for i, pt in centers.items():
+            self.locked_balls[i] = {
+                "id": i,
+                "color": color_map.get(i, "WHITE"),
+                "pos": pt,
+                "prev_pos": pt,
+                "vel": (0.0, 0.0),
+                "spline_segment": [pt],
+            }
+        return self.locked_balls
+
+    @staticmethod
+    def find_closest_detection(
+        ref_pos: Point2D, current_detections: List[Dict[str, object]]
+    ) -> Optional[Dict[str, object]]:
+        """단일 기준 좌표에서 가장 가까운 검출 후보를 반환합니다."""
+        if not current_detections:
+            return None
+        return min(
+            current_detections,
+            key=lambda d: math.hypot(
+                float(d["center"][0]) - ref_pos[0],  # type: ignore[index]
+                float(d["center"][1]) - ref_pos[1],  # type: ignore[index]
+            ),
+        )
+
+    def phase2_track_motion_only(
+        self, current_detections: List[Dict[str, object]]
+    ) -> Dict[int, Dict[str, object]]:
+        """
+        [2단계] 샷 진행 중: 색상은 완전히 잊고 칼만 예측 위치 및 최단 거리 1:1 헝가리안 매칭으로만 초고속 추적합니다.
+        """
+        if not self.locked_balls:
+            return {}
+
+        ball_ids = list(self.locked_balls.keys())
+        det_centers: List[Point2D] = [
+            (float(d["center"][0]), float(d["center"][1]))  # type: ignore[index]
+            for d in current_detections
+        ]
+
+        # 4단계 칼만 필터 연동: 검출된 공이 3개 미만(블러/가림)일 때 칼만 예측 위치로 빈자리 보충
+        if len(det_centers) < len(ball_ids):
+            remaining_ids = set(ball_ids)
+            for pt in det_centers:
+                if not remaining_ids:
+                    break
+                nearest_bid = min(
+                    remaining_ids,
+                    key=lambda bid: math.hypot(
+                        pt[0] - float(self.locked_balls[bid]["pos"][0]),  # type: ignore[index]
+                        pt[1] - float(self.locked_balls[bid]["pos"][1]),  # type: ignore[index]
+                    ),
+                )
+                remaining_ids.remove(nearest_bid)
+            for missing_bid in sorted(remaining_ids):
+                bdata = self.locked_balls[missing_bid]
+                pos: Point2D = bdata["pos"]  # type: ignore[assignment]
+                vel: Point2D = bdata["vel"]  # type: ignore[assignment]
+                pred_x = float(np.clip(pos[0] + vel[0] * 0.9, 30.0, settings.TABLE_WIDTH_MM - 30.0))
+                pred_y = float(np.clip(pos[1] + vel[1] * 0.9, 30.0, settings.TABLE_HEIGHT_MM - 30.0))
+                det_centers.append((pred_x, pred_y))
+
+        det_centers = det_centers[: len(ball_ids)]
+
+        # 전체 거리 합이 최소가 되는 1:1 헝가리안(순열) 최적 매칭
+        best_perm: Optional[Tuple[Point2D, ...]] = None
+        min_cost = float("inf")
+        for perm in itertools.permutations(det_centers):
+            cost = 0.0
+            for bid, pt in zip(ball_ids, perm):
+                cur_pos: Point2D = self.locked_balls[bid]["pos"]  # type: ignore[assignment]
+                cost += math.hypot(pt[0] - cur_pos[0], pt[1] - cur_pos[1])
+            if cost < min_cost:
+                min_cost = cost
+                best_perm = perm
+
+        if best_perm is not None:
+            for bid, new_pos in zip(ball_ids, best_perm):
+                ball_data = self.locked_balls[bid]
+                old_pos: Point2D = ball_data["pos"]  # type: ignore[assignment]
+                old_vel: Point2D = ball_data["vel"]  # type: ignore[assignment]
+                vx = new_pos[0] - old_pos[0]
+                vy = new_pos[1] - old_pos[1]
+                new_vel = (vx, vy)
+                ball_data["prev_pos"] = old_pos
+                ball_data["pos"] = new_pos
+                ball_data["vel"] = new_vel
+                # 4단계 3차 스플라인 곡선 복원 점 생성
+                ball_data["spline_segment"] = PhysicsTracker.interpolate_cubic_spline(
+                    old_pos, old_vel, new_pos, new_vel, num_steps=8
+                )
+
+        return self.locked_balls
+
+    def phase3_anti_id_switch_guard(self, cue_id: int, obj_id: int) -> bool:
+        """
+        [3단계] 충돌 순간: 운동량 보존 법칙(충돌 법선 벡터 N 내적 > 0.8)으로 ID 뒤바뀜(Swap)을 즉시 강제 원복합니다.
+        """
+        if cue_id not in self.locked_balls or obj_id not in self.locked_balls:
+            return False
+
+        cue = self.locked_balls[cue_id]
+        obj = self.locked_balls[obj_id]
+
+        cue_pos = np.array(cue["pos"], dtype=np.float64)
+        obj_pos = np.array(obj["pos"], dtype=np.float64)
+        dist = float(np.linalg.norm(cue_pos - obj_pos))
+
+        # 두 공의 거리가 충돌 거리(지름 61.5mm 또는 근접 허용 범위) 이내일 때 법선 방향 검사
+        if dist <= 61.5:
+            normal_dir = obj_pos - cue_pos
+            normal_unit = normal_dir / (float(np.linalg.norm(normal_dir)) + 1e-6)
+
+            cue_vel = np.array(cue["vel"], dtype=np.float64)
+            cue_vel_norm = float(np.linalg.norm(cue_vel))
+            if cue_vel_norm > 1e-3:
+                cue_vel_unit = cue_vel / cue_vel_norm
+                dot_product = float(np.dot(cue_vel_unit, normal_unit))
+                if dot_product > 0.8:
+                    # 두 공의 위치와 속도 데이터를 맞바꿔서 원래 ID 유지
+                    cue["pos"], obj["pos"] = obj["pos"], cue["pos"]
+                    cue["vel"], obj["vel"] = obj["vel"], cue["vel"]
+                    self.swap_restore_count += 1
+                    return True
+        return False
+
