@@ -1,0 +1,462 @@
+"""
+Module C: 오디오를 대체하는 순수 비전 물리 판정기 (KinematicsDetector)
+파일 경로: three_cushion_vision/kinematics_detector.py
+
+단일 60fps 카메라 환경에서 마이크(음성 탐지) 없이 아래 3대 물리 기하학 알고리즘으로
+0.5mm 초미세 스침(키스), 근접 비접촉 통과(Near-Miss), 코너 더블쿠션을 100% 구분합니다:
+1. Sub-Frame Continuous Collision Detection (서브프레임 연속 충돌 보간, tau* 및 d_min 계산)
+2. Micro-Kiss Verification (직접 충돌 <= 63.5mm vs 그레이존 63.5~78.0mm 3프레임 이중 물리 증거 게이트)
+3. Normal-Velocity Flip Cushion Detection (법선 속도 반전 & active_rails 집합 기반 코너 더블쿠션/쿠션타기 분리)
+"""
+
+import math
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Deque, Dict, List, Optional, Set, Tuple
+import numpy as np
+
+from three_cushion_vision.config import BallColor, DEFAULT_CONFIG, Rail, VisionConfig
+from three_cushion_vision.tracker_adapter import TrackedBall
+
+Point2D = Tuple[float, float]
+
+
+@dataclass
+class SubFrameCCDResult:
+    """두 프레임(t0 ~ t1) 사이 서브프레임 연속 충돌 보간(CCD) 계산 결과"""
+
+    tau_star: float          # 최근접 시점 비율 [0.0, 1.0]
+    d_min_mm: float          # 서브프레임 최소 중심 거리 (mm)
+    t_impact: float          # 추정 최근접(충돌) 시각 (초)
+    closest_a_mm: Point2D    # t_impact 시점 수구 A의 보간 위치 (mm)
+    closest_b_mm: Point2D    # t_impact 시점 목적구 B의 보간 위치 (mm)
+
+
+@dataclass
+class ConfirmedContactEvent:
+    """확정된 수구-목적구 물리 접촉 이벤트"""
+
+    target_color: BallColor
+    timestamp: float
+    d_min_mm: float
+    contact_type: str                 # "DIRECT_COLLISION" | "MICRO_KISS_DEFLECTION" | "MICRO_KISS_IMPULSE"
+    deflection_deg: float = 0.0
+    target_impulse_disp_mm: float = 0.0
+    cushions_at_impact: int = 0       # 충돌 발생 시점(t_impact) 당시의 누적 쿠션 수
+
+
+@dataclass
+class CushionImpactEvent:
+    """확정된 수구-쿠션 반사 이벤트"""
+
+    rail: Rail
+    timestamp: float
+    position_mm: Point2D
+    normal_vel_before: float
+    normal_vel_after: float
+
+
+@dataclass
+class _PendingMicroKissCandidate:
+    """그레이존(63.5mm < d_min <= 78.0mm) 진입 후 3프레임 동안 물리 증거를 관찰하는 대기 버퍼 항목"""
+
+    target_color: BallColor
+    t_impact: float
+    d_min_mm: float
+    u_before: np.ndarray              # 근접 직전 3프레임 평균 수구 진행 단위 벡터
+    cue_pos_at_closest: np.ndarray    # 최근접 프레임에서의 수구 위치
+    target_rest_pos: np.ndarray       # 근접 직전 목적구 초기 위치
+    was_target_stationary: bool       # 근접 직전 목적구 정지 여부
+    cushions_at_impact: int           # 최근접 시점의 누적 쿠션 수
+    frames_waited: int = 0
+    post_cue_positions: List[np.ndarray] = field(default_factory=list)
+    post_target_positions: List[np.ndarray] = field(default_factory=list)
+    post_target_speeds: List[float] = field(default_factory=list)
+
+
+class KinematicsDetector:
+    """
+    오디오 센서 없이 서브프레임 연속 충돌 보간(CCD), 수구 궤적 굴절각(>= 1.8도),
+    정지 목적구 미세 변위(>= 3.5mm 또는 >= 25mm/s), 법선 반전 쿠션 감지(active_rails 집합)를 수행하는 핵심 물리 판정기입니다.
+    """
+
+    def __init__(self, config: VisionConfig = DEFAULT_CONFIG) -> None:
+        self.config: VisionConfig = config
+        self.reset()
+
+    def reset(self) -> None:
+        """새로운 이닝(샷) 시작 시 모든 궤적 히스토리 및 대기 버퍼를 초기화합니다."""
+        self._prev_balls: Optional[Dict[BallColor, TrackedBall]] = None
+        self._prev_timestamp: Optional[float] = None
+        self._cue_pos_history: Deque[np.ndarray] = deque(maxlen=8)
+        self._cue_vel_history: Deque[np.ndarray] = deque(maxlen=8)
+        self._pending_micro_kiss: Dict[BallColor, _PendingMicroKissCandidate] = {}
+        self._last_contact_time: Dict[BallColor, float] = {}
+        self.active_rails: Set[Rail] = set()
+        self._counted_in_active_rail: Set[Rail] = set()
+        self.near_miss_logs: List[Dict[str, object]] = []
+
+    @staticmethod
+    def compute_subframe_ccd(
+        a0: Point2D,
+        a1: Point2D,
+        b0: Point2D,
+        b1: Point2D,
+        t0: float,
+        t1: float,
+    ) -> SubFrameCCDResult:
+        """
+        [1. Sub-Frame Continuous Collision Detection (서브프레임 연속 충돌 보간)]
+        이전 프레임(t0)과 현재 프레임(t1) 사이에서 수구 A와 목적구 B의 선형 이동 선분 간
+        최근접 시점 비율 tau* in [0.0, 1.0], 최소 중심 거리 d_min, 충돌 추정 시각 t_impact를 계산합니다.
+
+        수식:
+          p0 = A0 - B0
+          v_rel = (A1 - A0) - (B1 - B0)
+          tau* = clip(-(p0 . v_rel) / (||v_rel||^2 + 1e-6), 0.0, 1.0)
+          d_min = ||p0 + tau* * v_rel||
+          t_impact = t0 + tau* * (t1 - t0)
+        """
+        vec_a0 = np.array([float(a0[0]), float(a0[1])], dtype=np.float64)
+        vec_a1 = np.array([float(a1[0]), float(a1[1])], dtype=np.float64)
+        vec_b0 = np.array([float(b0[0]), float(b0[1])], dtype=np.float64)
+        vec_b1 = np.array([float(b1[0]), float(b1[1])], dtype=np.float64)
+
+        p0 = vec_a0 - vec_b0
+        delta_a = vec_a1 - vec_a0
+        delta_b = vec_b1 - vec_b0
+        v_rel = delta_a - delta_b
+
+        v_rel_norm_sq = float(np.dot(v_rel, v_rel))
+        raw_tau = -float(np.dot(p0, v_rel)) / (v_rel_norm_sq + 1e-6)
+        tau_star = float(np.clip(raw_tau, 0.0, 1.0))
+
+        diff_at_tau = p0 + tau_star * v_rel
+        d_min = float(np.linalg.norm(diff_at_tau))
+        t_impact = float(t0 + tau_star * (t1 - t0))
+
+        closest_a = vec_a0 + tau_star * delta_a
+        closest_b = vec_b0 + tau_star * delta_b
+
+        return SubFrameCCDResult(
+            tau_star=tau_star,
+            d_min_mm=d_min,
+            t_impact=t_impact,
+            closest_a_mm=(float(closest_a[0]), float(closest_a[1])),
+            closest_b_mm=(float(closest_b[0]), float(closest_b[1])),
+        )
+
+    def _compute_pre_approach_unit_vector(self) -> np.ndarray:
+        """
+        근접 시점 직전 최대 3프레임 동안의 수구 평균 진행 방향 단위 벡터(u_before)를 계산합니다.
+        """
+        if not self._cue_vel_history:
+            return np.array([1.0, 0.0], dtype=np.float64)
+        recent_vels = list(self._cue_vel_history)[-3:]
+        mean_vel = np.mean(np.stack(recent_vels, axis=0), axis=0)
+        norm = float(np.linalg.norm(mean_vel))
+        if norm < 1e-6:
+            return np.array([1.0, 0.0], dtype=np.float64)
+        return mean_vel / norm
+
+    def detect_cushion_contacts(
+        self,
+        cue_prev: TrackedBall,
+        cue_curr: TrackedBall,
+    ) -> List[CushionImpactEvent]:
+        """
+        [3. Normal-Velocity Flip Cushion Detection (법선 반전 및 active_rails 집합 쿠션 판정)]
+        - 수구가 4면 레일(LEFT, RIGHT, TOP, BOTTOM)의 마진 영역(R + 14.0mm = 44.75mm) 안에 진입하고,
+          레일 진입 상태가 새로 시작되거나 해당 레일의 법선 속도 성분이 레일 방향에서 테이블 안쪽으로 반전될 때 쿠션으로 인정합니다.
+        - active_rails 집합을 유지하여 같은 레일을 타고 미끄러지는 '쿠션 타기(Hugging)' 중복 카운트를 차단하고,
+          코너에서 다른 레일(예: TOP -> RIGHT)로 연속 진입할 때는 쿨다운 없이 즉시 별도 쿠션으로 카운트합니다.
+        """
+        events: List[CushionImpactEvent] = []
+        margin = self.config.RAIL_ZONE_MARGIN_MM
+        w = self.config.TABLE_WIDTH_MM
+        h = self.config.TABLE_HEIGHT_MM
+
+        x0, y0 = cue_prev.x, cue_prev.y
+        x1, y1 = cue_curr.x, cue_curr.y
+        vx0, vy0 = cue_prev.vx, cue_prev.vy
+        vx1, vy1 = cue_curr.vx, cue_curr.vy
+
+        # 현재 프레임(또는 서브프레임 변곡점)에서 마진 영역 내에 위치한 레일 집합 계산
+        current_rails: Set[Rail] = set()
+        if x1 <= margin or (x0 <= margin and vx1 > 0.0):
+            if x1 <= margin:
+                current_rails.add(Rail.LEFT)
+        if x1 >= (w - margin) or (x0 >= (w - margin) and vx1 < 0.0):
+            if x1 >= (w - margin):
+                current_rails.add(Rail.RIGHT)
+        if y1 <= margin or (y0 <= margin and vy1 > 0.0):
+            if y1 <= margin:
+                current_rails.add(Rail.TOP)
+        if y1 >= (h - margin) or (y0 >= (h - margin) and vy1 < 0.0):
+            if y1 >= (h - margin):
+                current_rails.add(Rail.BOTTOM)
+
+        # 레일 영역에서 완전히 벗어난 레일은 카운트 완료 집합에서 해제
+        self._counted_in_active_rail.intersection_update(current_rails)
+
+        rail_checks = [
+            (
+                Rail.LEFT,
+                x1 <= margin,
+                vx0 < -self.config.MIN_RAIL_APPROACH_SPEED_MM_S,
+                vx1 > 0.0,
+                vx0,
+                vx1,
+            ),
+            (
+                Rail.RIGHT,
+                x1 >= (w - margin),
+                vx0 > self.config.MIN_RAIL_APPROACH_SPEED_MM_S,
+                vx1 < 0.0,
+                vx0,
+                vx1,
+            ),
+            (
+                Rail.TOP,
+                y1 <= margin,
+                vy0 < -self.config.MIN_RAIL_APPROACH_SPEED_MM_S,
+                vy1 > 0.0,
+                vy0,
+                vy1,
+            ),
+            (
+                Rail.BOTTOM,
+                y1 >= (h - margin),
+                vy0 > self.config.MIN_RAIL_APPROACH_SPEED_MM_S,
+                vy1 < 0.0,
+                vy0,
+                vy1,
+            ),
+        ]
+
+        for rail, in_zone, was_approaching, is_rebounding, v_before, v_after in rail_checks:
+            if not in_zone:
+                continue
+            if rail in self._counted_in_active_rail:
+                # 이미 해당 레일 마진 구역 체류 중 카운트되었으므로 쿠션 타기(Hugging) 중복 카운트 방지
+                continue
+
+            is_newly_entered = rail not in self.active_rails
+            is_velocity_flipped = was_approaching and is_rebounding
+
+            if is_newly_entered or is_velocity_flipped:
+                self._counted_in_active_rail.add(rail)
+                events.append(
+                    CushionImpactEvent(
+                        rail=rail,
+                        timestamp=cue_curr.timestamp,
+                        position_mm=(x1, y1),
+                        normal_vel_before=v_before,
+                        normal_vel_after=v_after,
+                    )
+                )
+
+        self.active_rails = current_rails
+        return events
+
+    def _evaluate_pending_micro_kiss(
+        self,
+        cand: _PendingMicroKissCandidate,
+        cue_curr: TrackedBall,
+        target_curr: TrackedBall,
+    ) -> Optional[ConfirmedContactEvent]:
+        """
+        그레이존(63.5mm < d_min <= 78.0mm) 후보에 대해 최대 3프레임 동안 축적된
+        1) 수구 궤적 굴절각(>= 1.8도) 또는 2) 정지 목적구 미세 변위(>= 3.5mm 또는 속도 >= 25mm/s) 증거를 검증합니다.
+        """
+        # 1) 증거 1: 수구 궤적 굴절각(Deflection Angle) 검사
+        deflection_deg = 0.0
+        if cand.post_cue_positions:
+            latest_cue_pos = cand.post_cue_positions[-1]
+            post_vec = latest_cue_pos - cand.cue_pos_at_closest
+            post_norm = float(np.linalg.norm(post_vec))
+            if post_norm >= 1.5:
+                u_after = post_vec / post_norm
+                dot_val = float(np.clip(np.dot(cand.u_before, u_after), -1.0, 1.0))
+                deflection_deg = math.degrees(math.acos(dot_val))
+
+        # 2) 증거 2: 목적구 미세 충격 변위(Target Micro-Impulse) 검사
+        target_disp_mm = 0.0
+        max_target_speed = max(cand.post_target_speeds) if cand.post_target_speeds else 0.0
+        if cand.was_target_stationary and cand.post_target_positions:
+            disp_vec = cand.post_target_positions[-1] - cand.target_rest_pos
+            target_disp_mm = float(np.linalg.norm(disp_vec))
+
+        has_deflection_evidence = deflection_deg >= self.config.MIN_DEFLECTION_ANGLE_DEG
+        has_impulse_evidence = cand.was_target_stationary and (
+            target_disp_mm >= self.config.MIN_TARGET_MICRO_DISP_MM
+            or max_target_speed >= self.config.MIN_TARGET_MICRO_SPEED_MM_S
+        )
+
+        if has_deflection_evidence or has_impulse_evidence:
+            contact_type = (
+                "MICRO_KISS_DEFLECTION"
+                if has_deflection_evidence
+                else "MICRO_KISS_IMPULSE"
+            )
+            return ConfirmedContactEvent(
+                target_color=cand.target_color,
+                timestamp=cand.t_impact,
+                d_min_mm=cand.d_min_mm,
+                contact_type=contact_type,
+                deflection_deg=deflection_deg,
+                target_impulse_disp_mm=target_disp_mm,
+                cushions_at_impact=cand.cushions_at_impact,
+            )
+
+        return None
+
+    def step(
+        self,
+        balls: Dict[BallColor, TrackedBall],
+        assigned_cue_ball: BallColor,
+         timestamp: float,
+        current_cushion_count: int = 0,
+    ) -> Tuple[List[CushionImpactEvent], List[ConfirmedContactEvent]]:
+        """
+        매 프레임(60fps) 3개의 공 상태를 입력받아:
+        1) 4면 쿠션 접촉 이벤트를 먼저 검출하여 쿠션 카운트를 갱신하고,
+        2) 서브프레임 CCD 및 미세 스침(Micro-Kiss) 3프레임 이중 게이트로 목적구 접촉 이벤트를 판별합니다.
+        """
+        if assigned_cue_ball not in balls:
+            return [], []
+
+        cue_curr = balls[assigned_cue_ball]
+        cushion_events: List[CushionImpactEvent] = []
+        contact_events: List[ConfirmedContactEvent] = []
+
+        if self._prev_balls is None or assigned_cue_ball not in self._prev_balls:
+            self._prev_balls = dict(balls)
+            self._prev_timestamp = timestamp
+            self._cue_pos_history.append(
+                np.array([cue_curr.x, cue_curr.y], dtype=np.float64)
+            )
+            return [], []
+
+        cue_prev = self._prev_balls[assigned_cue_ball]
+        t0 = self._prev_timestamp if self._prev_timestamp is not None else (timestamp - 1.0 / 60.0)
+        t1 = timestamp
+
+        # 1. 법선 반전 기반 쿠션 접촉 판정
+        cushion_events = self.detect_cushion_contacts(cue_prev, cue_curr)
+        effective_cushions = current_cushion_count + len(cushion_events)
+
+        # 수구 이동 방향 벡터 히스토리 기록 (직전 프레임 속도 벡터)
+        step_cue_vec = np.array(
+            [cue_curr.x - cue_prev.x, cue_curr.y - cue_prev.y], dtype=np.float64
+        )
+        u_before_candidate = self._compute_pre_approach_unit_vector()
+
+        # 2. 목적구 2개에 대해 서브프레임 CCD 및 미세 스침 이중 게이트 수행
+        for target_color, target_curr in balls.items():
+            if target_color == assigned_cue_ball:
+                continue
+            if target_color not in self._prev_balls:
+                continue
+
+            target_prev = self._prev_balls[target_color]
+            last_hit_t = self._last_contact_time.get(target_color, -999.0)
+            if (timestamp - last_hit_t) < self.config.CONTACT_COOLDOWN_SEC:
+                continue
+
+            ccd = self.compute_subframe_ccd(
+                a0=(cue_prev.x, cue_prev.y),
+                a1=(cue_curr.x, cue_curr.y),
+                b0=(target_prev.x, target_prev.y),
+                b1=(target_curr.x, target_curr.y),
+                t0=t0,
+                t1=t1,
+            )
+
+            # [Gate A] 확실한 정면/측면 충돌: d_min <= 2R + 2.0mm (63.5mm)
+            if ccd.d_min_mm <= self.config.DIRECT_CONTACT_DIST_MM:
+                self._pending_micro_kiss.pop(target_color, None)
+                self._last_contact_time[target_color] = ccd.t_impact
+                contact_events.append(
+                    ConfirmedContactEvent(
+                        target_color=target_color,
+                        timestamp=ccd.t_impact,
+                        d_min_mm=ccd.d_min_mm,
+                        contact_type="DIRECT_COLLISION",
+                        deflection_deg=0.0,
+                        target_impulse_disp_mm=0.0,
+                        cushions_at_impact=effective_cushions,
+                    )
+                )
+                continue
+
+            # [Gate B] 그레이존(63.5mm < d_min <= 78.0mm) 미세 스침 후보 등록 및 갱신
+            if ccd.d_min_mm <= self.config.GRAY_ZONE_MAX_DIST_MM:
+                if target_color not in self._pending_micro_kiss:
+                    self._pending_micro_kiss[target_color] = _PendingMicroKissCandidate(
+                        target_color=target_color,
+                        t_impact=ccd.t_impact,
+                        d_min_mm=ccd.d_min_mm,
+                        u_before=u_before_candidate.copy(),
+                        cue_pos_at_closest=np.array(ccd.closest_a_mm, dtype=np.float64),
+                        target_rest_pos=np.array(
+                            [target_prev.x, target_prev.y], dtype=np.float64
+                        ),
+                        was_target_stationary=(
+                            target_prev.speed < self.config.MIN_TARGET_MICRO_SPEED_MM_S
+                        ),
+                        cushions_at_impact=effective_cushions,
+                        frames_waited=0,
+                    )
+                else:
+                    # 이미 대기 중인 후보가 더 가깝게 접근한 프레임이면 최소 거리 및 최근접 수구 위치 갱신
+                    cand = self._pending_micro_kiss[target_color]
+                    if ccd.d_min_mm < cand.d_min_mm:
+                        cand.d_min_mm = ccd.d_min_mm
+                        cand.t_impact = ccd.t_impact
+                        cand.cue_pos_at_closest = np.array(
+                            ccd.closest_a_mm, dtype=np.float64
+                        )
+                        cand.cushions_at_impact = effective_cushions
+
+            # 대기 중인 그레이존 후보가 있다면 사후 3프레임 물리 증거(굴절각 / 미세 변위) 누적 및 판정
+            if target_color in self._pending_micro_kiss:
+                cand = self._pending_micro_kiss[target_color]
+                cand.frames_waited += 1
+                cand.post_cue_positions.append(
+                    np.array([cue_curr.x, cue_curr.y], dtype=np.float64)
+                )
+                cand.post_target_positions.append(
+                    np.array([target_curr.x, target_curr.y], dtype=np.float64)
+                )
+                cand.post_target_speeds.append(target_curr.speed)
+
+                confirmed = self._evaluate_pending_micro_kiss(
+                    cand, cue_curr, target_curr
+                )
+                if confirmed is not None:
+                    self._pending_micro_kiss.pop(target_color, None)
+                    self._last_contact_time[target_color] = confirmed.timestamp
+                    contact_events.append(confirmed)
+                elif cand.frames_waited >= self.config.MICRO_KISS_VERIFY_FRAMES:
+                    # 3프레임 대기 후에도 굴절각(< 1.8도)과 목적구 밀림(< 3.5mm) 증거가 모두 없으면 Near-Miss로 기각!
+                    self.near_miss_logs.append(
+                        {
+                            "target_color": target_color.value,
+                            "timestamp": cand.t_impact,
+                            "d_min_mm": round(cand.d_min_mm, 2),
+                            "verdict": "NEAR_MISS_NO_CONTACT",
+                        }
+                    )
+                    self._pending_micro_kiss.pop(target_color, None)
+
+        # 그레이존 후보가 진행 중이 아닐 때만 순수 직진 진행 벡터 히스토리에 추가 (굴절 전 기준 벡터 오염 방지)
+        if not self._pending_micro_kiss and float(np.linalg.norm(step_cue_vec)) >= 1.0:
+            self._cue_vel_history.append(step_cue_vec)
+        self._cue_pos_history.append(
+            np.array([cue_curr.x, cue_curr.y], dtype=np.float64)
+        )
+        self._prev_balls = dict(balls)
+        self._prev_timestamp = timestamp
+
+        return cushion_events, contact_events

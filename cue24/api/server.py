@@ -312,9 +312,10 @@ class LiveStreamReader:
                 continue
             circ = (4.0 * math.pi * raw_area) / (perim * perim)
             (cx, cy), rad = cv2.minEnclosingCircle(cnt)
+            tilt = self.calibrator.camera_tilt_ratio
             cand_item = {
                 "x": float(cx) * 4.0,
-                "y": float(cy) * 4.0,
+                "y": (float(cy) + float(rad) * tilt) * 4.0,
                 "radius": float(rad) * 4.0,
                 "circularity": float(circ),
                 "area": area,
@@ -999,13 +1000,22 @@ class LiveStreamReader:
             ):
                 hit1 = "접촉완료" if self.scoring_engine.first_object_ball_id is not None else "대기"
                 hit2 = "접촉완료" if self.scoring_engine.second_object_ball_id is not None else "대기"
+                fsm_val = self.scoring_engine.fsm_state.value
+                if fsm_val == "VALID_SCORE_PENDING":
+                    fsm_ko = "득점대기(3쿠션완료)"
+                elif fsm_val == "NO_SCORE_LOCKED":
+                    fsm_ko = "노카운트잠금(조기키스)"
+                else:
+                    fsm_ko = "진행중"
+
                 self.match_manager.last_shot_result = {
                     "is_scored": False,
                     "points_awarded": 0,
                     "shot_type": "IN_PROGRESS",
                     "reason_code": "TRACKING",
+                    "fsm_state": fsm_val,
                     "message": (
-                        f"실시간 추적 중: {self.scoring_engine.total_cushion_count}쿠션 "
+                        f"실시간 추적 중[{fsm_ko}]: {self.scoring_engine.total_cushion_count}쿠션 "
                         f"| 제1적구({hit1}) / 제2적구({hit2})"
                     ),
                     "cushions_before_second_hit": self.scoring_engine.cushion_count_before_second_hit,

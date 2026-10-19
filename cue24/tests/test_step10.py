@@ -452,6 +452,95 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
         self.assertEqual(rec["second_object_ball_id"], 1)
         self.assertGreaterEqual(rec["cushions_before_second_hit"], 3)
 
+    def test_hybrid_vision_upgrades_parallax_ocsort_fsm_and_pure_vision_kiss(self) -> None:
+        """
+        [하이브리드 비전·물리 5대 업그레이드 통합 검증]
+        1. 대각선 카메라 3D 당구공 시차(Parallax) 보정 (ball_to_table_mm, bbox_to_table_mm)
+        2. OC-SORT 비선형 추적 (EMA 속도 필터, OCM 방향 모멘텀 매칭, ORU 가림 복구 역추적, 저속 분리 색상 재검증)
+        3. 오디오 배제 순수 비전 초미세 스침(0.5mm 키스) 판독 (스플라인 근접 <= 78mm + 미세 굴절 >= 2.2도 + 미세 이동 >= 1.5mm)
+        4. 결정론적 4단계 FSM 조기 키스 영구 잠금(NO_SCORE_LOCKED / EARLY_SECOND_BALL_CONTACT):
+           2쿠션 시점에 제2적구를 먼저 맞히면, 그 뒤 3쿠션을 채우고 다시 제2적구를 맞혀도 무조건 노카운트!
+        5. 코너 더블쿠션(TOP -> RIGHT 연속 반사) 즉시 2쿠션 인정 및 in_rail_zone 쿠션 타기 중복 차단
+        """
+        from cue24.core.physics_tracker import PhysicsTracker
+        from cue24.core.scoring_engine import FailureReason, ScoringEngine, ShotFSMState
+        from cue24.core.table_calibrator import TableCalibrator
+        from cue24.mcp.billiard_physics_mcp import physics_ai_engine
+
+        # 1. 대각선 카메라 3D 구 시차(Parallax) 보정 검증
+        cal = TableCalibrator(
+            src_corners=[(0.0, 0.0), (2840.0, 0.0), (2840.0, 1420.0), (0.0, 1420.0)],
+            camera_tilt_ratio=0.12,
+        )
+        pt_mm = cal.ball_to_table_mm((1000.0, 500.0), radius_px=30.0)
+        self.assertAlmostEqual(pt_mm[0], 1000.0, places=2)
+        self.assertAlmostEqual(pt_mm[1], 503.6, places=2)  # 500 + 30 * 0.12 = 503.6
+        bbox_mm = cal.bbox_to_table_mm((970.0, 470.0, 1030.0, 530.0))
+        self.assertAlmostEqual(bbox_mm[1], 503.6, places=2)
+
+        # 2. OC-SORT ORU 가림 구간 거울 반사 역추적 복원 및 저속 분리 구간 색상 재검증
+        oru_pts = PhysicsTracker.recover_occluded_trajectory_oru(
+            last_obs_pos=(1000.0, 80.0),
+            reappeared_pos=(1200.0, 120.0),
+            missing_steps=4,
+            last_obs_vel=(50.0, -30.0),  # TOP 레일(32mm)을 향해 진행 중 가려졌다가 반사되어 재등장
+        )
+        self.assertEqual(len(oru_pts), 4)
+        # 중간 경유점이 TOP 레일 마진(32.0mm) 부근까지 도달했다가 복귀했는지 확인
+        self.assertLessEqual(min(p[1] for p in oru_pts), 40.0)
+
+        tracker = PhysicsTracker()
+        tracker.initialize_tracks(
+            initial_positions={1: (300.0, 300.0), 2: (1000.0, 500.0), 3: (2000.0, 700.0)},
+            cue_ball_id=1,
+            ball_colors={1: "WHITE", 2: "YELLOW", 3: "RED"},
+        )
+        # 저속 분리 구간에서 만약 트랙 1과 트랙 2의 관측 색상이 뒤바뀌어 있다면 즉시 원복되는지 검증
+        swapped = tracker.verify_and_correct_colors_at_low_speed(
+            observed_colors={1: "YELLOW", 2: "WHITE", 3: "RED"}
+        )
+        self.assertTrue(swapped)
+
+        # 3. 오디오 배제 순수 비전 0.5mm 초미세 스침(키스) 판독 검증
+        is_micro_kiss = physics_ai_engine.verify_direct_cue_hit(
+            min_cue_to_target_dist_mm=74.0,   # 스플라인 최근접 74mm (직접 중첩 64mm보다 10mm 여유)
+            target_step_move_mm=1.8,          # 목적구 1.8mm 미세 움찔
+            target_init_disp_mm=0.0,
+            curr_init_disp_mm=2.2,
+            other_object_to_target_dist_mm=900.0,
+            contact_threshold_mm=64.0,
+            is_first_object_hit_Done=True,
+            cue_deflection_deg=2.6,           # 수구 진행 각도 2.6도 미세 굴절
+        )
+        self.assertTrue(is_micro_kiss)
+
+        # 4. 결정론적 4단계 FSM: 조기 키스 영구 잠금(NO_SCORE_LOCKED) 검증
+        engine = ScoringEngine()
+        engine.reset_shot(cue_ball_id=1, object_ball_ids=[2, 3])
+        self.assertEqual(engine.fsm_state, ShotFSMState.IDLE)
+
+        # 제1적구(2번) 타격 -> 2쿠션만 기록된 상태에서 제2적구(3번) 조기 접촉!
+        engine.record_ball_hit(2, frame_idx=1, cue_pos=(500.0, 500.0))
+        self.assertEqual(engine.fsm_state, ShotFSMState.IN_PLAY)
+        engine.record_cushion_touch("TOP", frame_idx=5, cue_pos=(800.0, 32.0))
+        engine.record_cushion_touch("RIGHT", frame_idx=6, cue_pos=(2808.0, 60.0))  # 코너 더블쿠션 (1프레임 간격 즉시 인정!)
+        self.assertEqual(engine.total_cushion_count, 2)
+
+        # 2쿠션 시점에 제2적구(3번) 조기 접촉 -> 즉시 NO_SCORE_LOCKED 잠금!
+        engine.record_ball_hit(3, frame_idx=10, cue_pos=(2200.0, 400.0))
+        self.assertEqual(engine.fsm_state, ShotFSMState.NO_SCORE_LOCKED)
+        self.assertTrue(engine.failed_early)
+        self.assertEqual(engine.failure_reason, FailureReason.EARLY_SECOND_BALL_CONTACT)
+
+        # 그 뒤 수구가 계속 굴러 3번째, 4번째 쿠션을 치더라도 이미 NO_SCORE_LOCKED이므로 절대 득점이 되지 않음!
+        engine.record_cushion_touch("BOTTOM", frame_idx=15, cue_pos=(1800.0, 1388.0))
+        engine.record_cushion_touch("LEFT", frame_idx=22, cue_pos=(32.0, 700.0))
+        eval_res = engine.evaluate_shot()
+        self.assertFalse(bool(eval_res["is_scored"]))
+        self.assertEqual(eval_res["fsm_state"], ShotFSMState.NO_SCORE_LOCKED.value)
+        self.assertEqual(eval_res["failure_reason"], FailureReason.EARLY_SECOND_BALL_CONTACT.value)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

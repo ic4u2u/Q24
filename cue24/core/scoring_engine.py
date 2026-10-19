@@ -9,11 +9,32 @@
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from enum import Enum
+from typing import Dict, List, Optional, Set, Tuple
 
 from cue24.config.settings import settings
 
 Point2D = Tuple[float, float]
+
+
+class ShotFSMState(str, Enum):
+    """결정론적 3쿠션 샷 판정 유한 상태 머신(FSM) 4단계 상태"""
+
+    IDLE = "IDLE"                                # 정지 대기 상태 (저전력 감시 모드)
+    IN_PLAY = "IN_PLAY"                          # 스트로크 후 샷 진행 중 (초고속 정밀 추적 모드)
+    VALID_SCORE_PENDING = "VALID_SCORE_PENDING"  # 3쿠션 이상 달성 후 제2목적구 타격 성공 (정지 시 1점 확정)
+    NO_SCORE_LOCKED = "NO_SCORE_LOCKED"          # 3쿠션 미만 조기 제2목적구 키스 또는 파울 발생 (영구 노카운트 잠금)
+
+
+class FailureReason(str, Enum):
+    """노카운트(공타) 및 파울 상세 사유 코드"""
+
+    NONE = "NONE"
+    INSUFFICIENT_CUSHIONS = "INSUFFICIENT_CUSHIONS"              # 3쿠션 미만
+    EARLY_SECOND_BALL_CONTACT = "EARLY_SECOND_BALL_CONTACT"      # 3쿠션 달성 전 제2목적구 조기 접촉(키스 파울)
+    MISSING_SECOND_BALL = "MISSING_SECOND_BALL"                  # 제2목적구 미접촉
+    WRONG_CUE_BALL_FOUL = "WRONG_CUE_BALL_FOUL"                  # 상대방 수구 타격 파울
+    BALL_OUT_OF_TABLE = "BALL_OUT_OF_TABLE"                      # 당구대 장외 이탈 파울
 
 
 @dataclass
@@ -74,12 +95,17 @@ class ScoringEngine:
         object_ball_ids: Optional[List[int]] = None,
     ) -> None:
         """
-        새로운 샷 시작 시 이벤트 타임라인 및 쿠션/목적구 충돌 상태를 초기화합니다.
+        새로운 샷 시작 시 이벤트 타임라인, 결정론적 4단계 FSM 및 쿠션 집합(in_rail_zone) 상태를 초기화합니다.
         """
         if cue_ball_id is not None:
             self.cue_ball_id = cue_ball_id
         if object_ball_ids is not None:
             self.object_ball_ids = list(object_ball_ids)
+
+        self.fsm_state: ShotFSMState = ShotFSMState.IDLE
+        self.failure_reason: FailureReason = FailureReason.NONE
+        self.failed_early: bool = False
+        self.in_rail_zone: Set[str] = set()
 
         self.events: List[ShotEvent] = []
         self.first_object_ball_id: Optional[int] = None
@@ -119,7 +145,8 @@ class ScoringEngine:
     ) -> None:
         """
         유효 1쿠션 접촉(법선 속도 반전 확인 완료)을 이벤트 시퀀스에 기록합니다.
-        다른 레일이나 목적구 접촉 없이 동일 레일을 따라 구르며 연속 중복 카운트되는 현상을 방지합니다.
+        - 코너 더블쿠션(예: TOP -> RIGHT 연속 반사)은 서로 다른 쿠션이므로 쿨타임 없이 즉시 2쿠션으로 인정합니다.
+        - 같은 레일을 따라 굴러가는 '쿠션 타기(Rail-hugging)'는 동일 레일 연속 카운트 방지 로직으로 차단합니다.
         """
         if self._last_rail_hit == rail_name:
             return
@@ -131,7 +158,7 @@ class ScoringEngine:
         self.total_cushion_count += 1
         if self.first_object_ball_id is None:
             self.cushion_count_before_first_hit += 1
-        if self.second_object_ball_id is None:
+        if self.second_object_ball_id is None and not self.failed_early:
             self.cushion_count_before_second_hit += 1
 
         self.events.append(
@@ -147,11 +174,14 @@ class ScoringEngine:
         self, target_ball_id: int, frame_idx: int, cue_pos: Point2D
     ) -> None:
         """
-        수구와 목적구(제1적구 또는 제2적구)의 충돌을 이벤트 시퀀스에 기록합니다.
+        수구와 목적구(제1적구 또는 제2적구)의 충돌을 이벤트 시퀀스에 기록하고,
+        결정론적 4단계 FSM(VALID_SCORE_PENDING vs NO_SCORE_LOCKED) 상태를 전이합니다.
         """
         if self.first_object_ball_id is None:
             self.first_object_ball_id = target_ball_id
             self._last_rail_hit = None
+            if self.fsm_state == ShotFSMState.IDLE:
+                self.fsm_state = ShotFSMState.IN_PLAY
             self.events.append(
                 ShotEvent(
                     frame_idx=frame_idx,
@@ -166,6 +196,19 @@ class ScoringEngine:
         ):
             self.second_object_ball_id = target_ball_id
             self._last_rail_hit = None
+
+            # [결정론적 FSM 잠금 규칙]
+            # 제2목적구 최초 접촉 시점에 누적 쿠션이 3회 미만이면 즉시 NO_SCORE_LOCKED(조기 키스 파울)로 영구 잠금!
+            # 그 이후 공이 굴러 3쿠션을 채우고 다시 제2목적구를 맞혀도 절대 득점으로 인정되지 않습니다.
+            if not self.failed_early and self.fsm_state != ShotFSMState.NO_SCORE_LOCKED:
+                if self.cushion_count_before_second_hit >= 3:
+                    self.fsm_state = ShotFSMState.VALID_SCORE_PENDING
+                    self.failure_reason = FailureReason.NONE
+                else:
+                    self.failed_early = True
+                    self.fsm_state = ShotFSMState.NO_SCORE_LOCKED
+                    self.failure_reason = FailureReason.EARLY_SECOND_BALL_CONTACT
+
             self.events.append(
                 ShotEvent(
                     frame_idx=frame_idx,
@@ -208,6 +251,16 @@ class ScoringEngine:
         prev_vel_tuple = (prev_vx, prev_vy)
 
         from cue24.mcp.billiard_physics_mcp import physics_ai_engine
+
+        current_zones: Set[str] = set()
+        if x <= self.left_bound:
+            current_zones.add("LEFT")
+        if x >= self.right_bound:
+            current_zones.add("RIGHT")
+        if y <= self.top_bound:
+            current_zones.add("TOP")
+        if y >= self.bottom_bound:
+            current_zones.add("BOTTOM")
 
         # 1. LEFT 레일 검사
         if x <= self.left_bound:
@@ -273,6 +326,7 @@ class ScoringEngine:
                     triggered_rails.append("BOTTOM")
             self._approaching_rail["BOTTOM"] = False
 
+        self.in_rail_zone = current_zones
         return triggered_rails
 
     def update_frame(
@@ -318,6 +372,9 @@ class ScoringEngine:
         else:
             cue_vel = cue_velocity
 
+        if self.fsm_state == ShotFSMState.IDLE and math.hypot(cue_vel[0], cue_vel[1]) > 0.5:
+            self.fsm_state = ShotFSMState.IN_PLAY
+
         if self._prev_cue_pos is not None:
             self.cue_travel_distance_mm += math.hypot(
                 cue_pos[0] - self._prev_cue_pos[0],
@@ -332,7 +389,7 @@ class ScoringEngine:
         if not triggered_rails and self._prev_cue_vel is not None:
             v1_norm = math.hypot(self._prev_cue_vel[0], self._prev_cue_vel[1])
             v2_norm = math.hypot(cue_vel[0], cue_vel[1])
-            if v1_norm >= 3.0 and v2_norm >= 3.0:
+            if v1_norm >= 2.5 and v2_norm >= 2.5:
                 cos_ang = (
                     self._prev_cue_vel[0] * cue_vel[0]
                     + self._prev_cue_vel[1] * cue_vel[1]
@@ -417,12 +474,12 @@ class ScoringEngine:
 
     def evaluate_shot(self, has_double_touch_foul: bool = False) -> Dict[str, object]:
         """
-        샷이 완전히 정지한 후 기록된 물리 이벤트 시퀀스 및 전체 시계열 궤적 텐서를 기반으로
-        로컬 물리/AI 3쿠션 검증 엔진(LocalPhysics3CushionAI)을 통해 최종 3쿠션 룰을 평가합니다.
+        샷이 완전히 정지한 후 기록된 물리 이벤트 시퀀스, 결정론적 4단계 FSM 상태(NO_SCORE_LOCKED 등) 및
+        전체 시계열 궤적 텐서를 기반으로 로컬 물리/AI 3쿠션 검증 엔진을 통해 최종 3쿠션 룰을 평가합니다.
 
         - 일반 3C: 1적구 충돌 -> (2적구 충돌 전 총 쿠션 접촉 >= 3회) -> 2적구 충돌 성립 시에만 득점 인정
         - 뱅크 샷: 공 접촉 전 쿠션 접촉 >= 3회 선행 -> 1적구 충돌 -> 2적구 충돌 성립 시에만 득점 인정
-        - 그 외: 2쿠션 이하에서 제2적구를 맞혔거나 제2적구를 맞히지 못한 경우 엄격히 공타(MISS) 처리
+        - 조기 키스 파울(NO_SCORE_LOCKED): 3쿠션 전에 제2적구를 먼저 건드린 경우 이후 3쿠션을 채워도 영구 노카운트 처리
         """
         from cue24.mcp.billiard_physics_mcp import physics_ai_engine
 
@@ -440,6 +497,7 @@ class ScoringEngine:
             right_bound=self.right_bound,
             top_bound=self.top_bound,
             bottom_bound=self.bottom_bound,
+            failed_early=self.failed_early,
         )
         if bool(reconstructed.get("reconstructed", False)):
             self.first_object_ball_id = reconstructed["first_object_ball_id"]
@@ -451,6 +509,14 @@ class ScoringEngine:
                 reconstructed["cushions_before_second_hit"]
             )
             self.total_cushion_count = int(reconstructed["total_cushions"])
+            if self.second_object_ball_id is None:
+                self.failed_early = False
+                self.fsm_state = ShotFSMState.IN_PLAY
+                self.failure_reason = FailureReason.MISSING_SECOND_BALL
+            elif self.cushion_count_before_second_hit >= 3:
+                self.failed_early = False
+                self.fsm_state = ShotFSMState.VALID_SCORE_PENDING
+                self.failure_reason = FailureReason.NONE
 
         verified = physics_ai_engine.verify_3cushion_shot(
             first_object_ball_id=self.first_object_ball_id,
@@ -459,12 +525,27 @@ class ScoringEngine:
             cushions_before_second_hit=self.cushion_count_before_second_hit,
             total_cushions=self.total_cushion_count,
             has_double_touch_foul=has_double_touch_foul,
+            failed_early=self.failed_early,
         )
+
+        if bool(verified["is_scored"]):
+            self.fsm_state = ShotFSMState.VALID_SCORE_PENDING
+            self.failure_reason = FailureReason.NONE
+        else:
+            if self.failed_early:
+                self.fsm_state = ShotFSMState.NO_SCORE_LOCKED
+                self.failure_reason = FailureReason.EARLY_SECOND_BALL_CONTACT
+            elif self.second_object_ball_id is None:
+                self.failure_reason = FailureReason.MISSING_SECOND_BALL
+            elif self.cushion_count_before_second_hit < 3:
+                self.failure_reason = FailureReason.INSUFFICIENT_CUSHIONS
 
         return {
             "is_scored": bool(verified["is_scored"]),
             "shot_type": str(verified["shot_type"]),
             "reason_code": str(verified["reason_code"]),
+            "failure_reason": self.failure_reason.value,
+            "fsm_state": self.fsm_state.value,
             "message": str(verified["message"]),
             "confidence": float(verified.get("confidence", 1.0)),
             "cushions_before_first_hit": self.cushion_count_before_first_hit,

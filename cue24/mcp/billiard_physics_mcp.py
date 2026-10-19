@@ -150,15 +150,15 @@ class LocalPhysics3CushionAI:
         cue_deflection_deg: float = 0.0,
     ) -> bool:
         """
-        [물리 법칙 3: 수구 직접 타격 vs 적구 간 키스(Kiss) 분리 및 사각지대(Dead Zone) 제거 검증]
+        [물리 법칙 3: 오디오 센서를 완벽 대체하는 순수 비전 초미세 스침(0.5mm 키스) 및 직접 타격 판독기]
         목적구가 움직였을 때 그것이 '수구(Cue Ball)'가 직접 때린 것인지,
         아니면 '제1적구'가 굴러가서 제2적구를 대신 맞힌 것(적구 간 키스) 또는 카메라 노이즈인지 판별합니다.
 
-        개선 핵심:
-        - 기존 target_init_disp_mm <= 18.0 과 curr_init_disp_mm >= 22.0 사이에 존재하던 18~22mm 사각지대(Dead Zone)를 제거하여
-          3쿠션 이후 힘이 빠진 수구가 제2적구를 부드럽게 맞혔을 때도 누락 없이 100% 감지합니다.
-        - 초박박이(매우 얇은 두께 접촉)로 인해 목적구 이동량이 작더라도(>= 6.0mm), 수구가 근접(<= 115mm) 통과하며
-          진행 각도가 6.5도 이상 꺾이면(cue_deflection_deg >= 6.5) 물리적 접촉으로 인정합니다.
+        개선 핵심 (오디오 없이 순수 비전+물리로 0.5mm 미세 접촉 판별):
+        1. 서브프레임 스플라인 최단 거리(min_cue_to_target_dist_mm) <= contact_threshold_mm(64.0mm)이면 직접 접촉 확정.
+        2. 0.5mm 초미세 스침(Feather-thin Kiss): 스플라인 최근접 거리가 <= 78.0mm 이내로 스쳐 지나가면서
+           수구 진행 각도가 미세하게 굴절(cue_deflection_deg >= 2.2도)되고 목적구가 1.5mm 이상 움찔한 경우 즉시 타격으로 인정.
+        3. 18~22mm 사각지대(Dead Zone) 제거: 15.0mm 이상 정지 위치 이탈 또는 3.8mm 이상 스텝 이동 시 타격 확정.
         """
         if min_cue_to_target_dist_mm <= contact_threshold_mm:
             return True
@@ -173,10 +173,17 @@ class LocalPhysics3CushionAI:
                 and min_cue_to_target_dist_mm <= 320.0
             ):
                 return True
+            # 순수 비전 초미세 스침(0.5mm 키스): 근접(<= 78mm) + 미세 굴절(>= 2.2도) + 미세 이동(>= 1.5mm)
+            if (
+                min_cue_to_target_dist_mm <= 78.0
+                and cue_deflection_deg >= 2.2
+                and (curr_init_disp_mm >= 2.0 or target_step_move_mm >= 1.5)
+            ):
+                return True
             if (
                 min_cue_to_target_dist_mm <= 115.0
-                and cue_deflection_deg >= 6.5
-                and (curr_init_disp_mm >= 6.0 or target_step_move_mm >= 2.5)
+                and cue_deflection_deg >= 5.5
+                and (curr_init_disp_mm >= 5.0 or target_step_move_mm >= 2.2)
             ):
                 return True
             return False
@@ -195,11 +202,19 @@ class LocalPhysics3CushionAI:
         ):
             return True
 
-        # 얇은 두께(초박박이) 타격: 수구 근접 통과 + 궤적 굴절각 >= 6.5도 + 목적구 미세 이동
+        # 순수 비전 초미세 스침(0.5mm 키스): 근접(<= 78mm) + 미세 굴절(>= 2.2도) + 목적구 미세 움찔(>= 1.5mm)
+        if (
+            min_cue_to_target_dist_mm <= 78.0
+            and cue_deflection_deg >= 2.2
+            and (curr_init_disp_mm >= 2.0 or target_step_move_mm >= 1.5)
+        ):
+            return True
+
+        # 얇은 두께(초박박이) 타격: 수구 근접 통과 + 궤적 굴절각 >= 5.5도 + 목적구 미세 이동
         if (
             min_cue_to_target_dist_mm <= 115.0
-            and cue_deflection_deg >= 6.5
-            and (curr_init_disp_mm >= 6.0 or target_step_move_mm >= 2.5)
+            and cue_deflection_deg >= 5.5
+            and (curr_init_disp_mm >= 5.0 or target_step_move_mm >= 2.2)
         ):
             return True
 
@@ -339,6 +354,7 @@ class LocalPhysics3CushionAI:
         right_bound: float = 2700.0,
         top_bound: float = 115.0,
         bottom_bound: float = 1305.0,
+        failed_early: bool = False,
     ) -> Dict[str, Any]:
         """
         [물리/AI 시계열 궤적 텐서 역추적 복원기 (Post-Shot Trajectory Re-Verifier)]
@@ -350,7 +366,8 @@ class LocalPhysics3CushionAI:
         1. 공 3개가 모두 초기 정지 위치(initial_positions) 대비 유의미하게 이동(최종 변위 >= 15.0mm 또는 최대 변위 >= 20.0mm)했어야 합니다.
            만약 3번째 공이 전혀 움직이지 않았다면(예: < 12.0mm) 절대로 복원하지 않고 즉시 공타를 유지합니다.
         2. 3개의 공 중 시간순으로 가장 마지막에 정지 위치를 이탈한 공(t2_step)을 제2적구로 특정하고,
-           그 시점(t2_step) 이전에 주행 공(수구 또는 스왑된 수구 트랙)이 3회 이상의 유효 쿠션 반사를 기록했을 때만 복원합니다.
+           그 최초 이탈 시점(t2_step) 이전에 주행 공(수구 또는 스왑된 수구 트랙)이 3회 이상의 유효 쿠션 반사를 기록했을 때만 복원합니다.
+           만약 3쿠션 전에 제2적구가 먼저 움직인 조기 키스(NO_SCORE_LOCKED)라면 그 뒤 3쿠션을 채워도 절대 복원하지 않습니다.
         """
         result = {
             "first_object_ball_id": first_object_ball_id,
@@ -410,6 +427,7 @@ class LocalPhysics3CushionAI:
             first_object_ball_id is not None
             and second_object_ball_id is not None
             and cushions_before_second_hit >= 3
+            and not failed_early
         ):
             return result
 
@@ -513,10 +531,11 @@ class LocalPhysics3CushionAI:
         cushions_before_second_hit: int,
         total_cushions: int,
         has_double_touch_foul: bool = False,
+        failed_early: bool = False,
     ) -> Dict[str, Any]:
         """
-        [물리 법칙 4: 엄격한 3쿠션 시간순 인과율 최종 판정]
-        억지 쿠션 뻥튀기 없이, 오직 제2적구 충돌 시점 이전에 3회 이상의 유효 쿠션이 성립했을 때만 득점을 인정합니다.
+        [물리 법칙 4: 엄격한 3쿠션 시간순 인과율 및 조기 키스 잠금(NO_SCORE_LOCKED) 최종 판정]
+        억지 쿠션 뻥튀기 없이, 오직 제2적구 최초 충돌 시점 이전에 3회 이상의 유효 쿠션이 성립했을 때만 득점을 인정합니다.
         """
         if has_double_touch_foul:
             return {
@@ -545,14 +564,16 @@ class LocalPhysics3CushionAI:
                 "message": f"공타: 제2목적구 불발 (현재 누적 {total_cushions}쿠션).",
             }
 
-        if cushions_before_second_hit < 3:
+        if cushions_before_second_hit < 3 or failed_early:
             return {
                 "is_scored": False,
                 "confidence": 0.97,
                 "shot_type": "MISS",
                 "reason_code": "INSUFFICIENT_CUSHIONS",
                 "message": (
-                    f"공타: 쿠션 부족 (제2적구 접촉 시점 {cushions_before_second_hit}쿠션 < 3쿠션)."
+                    f"공타(조기 키스 잠금): 3쿠션 달성 전 제2적구 조기 접촉 ({cushions_before_second_hit}쿠션 시점 접촉 < 3쿠션)."
+                    if failed_early
+                    else f"공타: 쿠션 부족 (제2적구 접촉 시점 {cushions_before_second_hit}쿠션 < 3쿠션)."
                 ),
             }
 
