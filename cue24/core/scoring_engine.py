@@ -290,23 +290,6 @@ class ScoringEngine:
         결정론적 4단계 FSM(VALID_SCORE_PENDING vs NO_SCORE_LOCKED) 상태를 전이합니다.
         """
         if self.first_object_ball_id is None:
-            # 제1적구 최초 접촉 직전에 선수 신체/큐대 가림으로 당구대 반대편(예: 12프레임 이내 950mm 이상 점프)에서
-            # 잘못 찍힌 가짜 선행 1쿠션이 있다면 자동으로 무효화하여 정확한 쿠션 수를 보장합니다.
-            if self.cushion_count_before_first_hit == 1 and len(self.events) == 1:
-                ev0 = self.events[0]
-                dt_f = max(1, frame_idx - ev0.frame_idx)
-                dist_f = math.hypot(
-                    cue_pos[0] - ev0.position_mm[0],
-                    cue_pos[1] - ev0.position_mm[1],
-                )
-                if dt_f <= 12 and dist_f > 950.0:
-                    self.events.clear()
-                    self.cushion_count_before_first_hit = 0
-                    self.cushion_count_before_second_hit = 0
-                    self.total_cushion_count = 0
-                    self._rail_armed[ev0.detail] = True
-                    self._last_cushion_hit_pos = None
-
             self.first_object_ball_id = target_ball_id
             self._first_hit_frame = frame_idx
             self._last_rail_hit = None

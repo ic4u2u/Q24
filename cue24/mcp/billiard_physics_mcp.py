@@ -600,14 +600,15 @@ class LocalPhysics3CushionAI:
                 ),
             }
 
-        if cushions_before_first_hit >= 3:
+        # 제1적구 접촉 전 1쿠션 이상 선행(원쿠션·투쿠션·쓰리쿠션 걸어치기 포함) 후 총 3쿠션 이상 득점 시 뱅크샷 인정
+        if cushions_before_first_hit >= 1:
             return {
                 "is_scored": True,
                 "confidence": 0.99,
                 "shot_type": "BANK_SHOT",
                 "reason_code": "VALID_BANK_SHOT",
                 "message": (
-                    f"득점 인정 (뱅크 샷): 선행 {cushions_before_first_hit}쿠션 후 제1·2적구 충돌 성공!"
+                    f"득점 인정 (뱅크 샷): 선행 {cushions_before_first_hit}쿠션(총 {cushions_before_second_hit}쿠션) 후 제2적구 충돌 성공!"
                 ),
             }
 
