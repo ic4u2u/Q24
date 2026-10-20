@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from scoring_fsm import BallColor
+from three_cushion_vision.causal_kiss_fsm import BallColor
 
 
 class LabHungarianBallIdentifier:

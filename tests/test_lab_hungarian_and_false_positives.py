@@ -4,6 +4,11 @@ CIE LAB + 헝가리안 3구 정밀 식별기(LabHungarianBallIdentifier) 및
 파일 경로: tests/test_lab_hungarian_and_false_positives.py
 """
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import cv2
 import numpy as np
 
@@ -94,8 +99,8 @@ def test_2_ordinary_miss_false_positive_blocked() -> None:
     for c_pt, y_pt in pass_points:
         frames.append((c_pt, y_pt, (620.0, 800.0)))
 
-    # 정지 프레임
-    for _ in range(10):
+    # 정지 프레임 (EMA 속도 감쇠 + STOP_HOLD_FRAMES 충족)
+    for _ in range(25):
         frames.append(((1266.0, 128.0), (1500.0, 600.0), (620.0, 800.0)))
 
     final_res = None
