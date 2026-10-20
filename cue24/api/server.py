@@ -1237,11 +1237,13 @@ class LiveStreamReader:
                 and (causal_instant_scored or engine_instant_scored or kinematics_instant_scored)
             ):
                 is_bank = bool(
-                    (maybe_causal is not None and maybe_causal.is_bank_shot)
+                    self.scoring_engine.cushion_count_before_first_hit >= 1
+                    or (maybe_causal is not None and maybe_causal.is_bank_shot)
+                    or self.causal_kiss_fsm.is_bank_shot
                     or (
-                        self.scoring_engine.first_object_ball_id is not None
-                        and len(self.scoring_engine.events) > 0
-                        and str(self.scoring_engine.events[0].event_type) == "CUSHION_HIT"
+                        len(self.scoring_engine.events) > 0
+                        and str(self.scoring_engine.events[0].event_type)
+                        in ("CUSHION", "CUSHION_HIT")
                     )
                 )
                 cush_at_2nd = max(
@@ -1249,12 +1251,16 @@ class LiveStreamReader:
                     int(maybe_causal.cushions_at_second_hit) if maybe_causal is not None else 3,
                 )
                 tot_cush = cush_at_2nd
+                bank_tag = "뱅크샷 " if is_bank else ""
                 immediate_eval = {
                     "is_scored": True,
                     "shot_type": "BANK_SHOT" if is_bank else "REGULAR_3C",
                     "reason_code": "IMMEDIATE_SECOND_BALL_HIT",
                     "message": (
-                        f"⚡ 제2적구 충돌 즉시 득점! ({cush_at_2nd}쿠션 충족 실시간 +1 반영)"
+                        f"⚡ 제2적구 충돌 즉시 득점! ({bank_tag}{cush_at_2nd}쿠션 충족 실시간 +1 반영)"
+                    ),
+                    "cushions_before_first_hit": int(
+                        self.scoring_engine.cushion_count_before_first_hit
                     ),
                     "cushions_before_second_hit": cush_at_2nd,
                     "total_cushions": tot_cush,
@@ -1355,20 +1361,28 @@ class LiveStreamReader:
                 # ScoringEngine이 유효 3쿠션 득점으로 판정한 샷은 사후 '3체 인과 판독'이 절대 노득점으로 뒤집지 않음!
                 if bool(shot_eval.get("already_dispatched", False)):
                     shot_eval["is_scored"] = True
-                    if str(shot_eval.get("shot_type", "")) not in ("REGULAR_3C", "BANK_SHOT"):
-                        shot_eval["shot_type"] = "REGULAR_3C"
-                    if not str(shot_eval.get("reason_code", "")).startswith("VALID_"):
-                        shot_eval["reason_code"] = (
-                            "VALID_BANK_SHOT"
-                            if shot_eval["shot_type"] == "BANK_SHOT"
-                            else "VALID_REGULAR_3C"
-                        )
+                    is_bank_final = bool(
+                        int(shot_eval.get("cushions_before_first_hit", 0)) >= 1
+                        or self.scoring_engine.cushion_count_before_first_hit >= 1
+                        or causal_res.is_bank_shot
+                        or str(shot_eval.get("shot_type", "")) == "BANK_SHOT"
+                    )
+                    shot_eval["shot_type"] = (
+                        "BANK_SHOT" if is_bank_final else "REGULAR_3C"
+                    )
+                    shot_eval["reason_code"] = (
+                        "VALID_BANK_SHOT"
+                        if is_bank_final
+                        else "VALID_REGULAR_3C"
+                    )
                     c_b2 = max(3, int(shot_eval.get("cushions_before_second_hit", 3)))
                     shot_eval["cushions_before_second_hit"] = c_b2
                     shot_eval["total_cushions"] = c_b2
                     if "득점" not in str(shot_eval.get("message", "")):
                         shot_eval["message"] = (
-                            f"득점 인정 (일반 3쿠션): 총 {c_b2}쿠션 후 제2적구 충돌 성공!"
+                            f"득점 인정 (뱅크 샷): 총 {c_b2}쿠션 후 제2적구 충돌 성공!"
+                            if is_bank_final
+                            else f"득점 인정 (일반 3쿠션): 총 {c_b2}쿠션 후 제2적구 충돌 성공!"
                         )
                 elif (
                     not bool(shot_eval.get("is_scored", False))

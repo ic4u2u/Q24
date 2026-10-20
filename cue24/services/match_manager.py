@@ -128,6 +128,7 @@ class MatchManager:
         self._last_shot_was_miss: bool = False
         self._last_shot_prev_run: int = 0
         self.score_dispatched_for_current_shot: bool = False
+        self.bank_shot_dispatched_for_current_shot: bool = False
 
         # 직전 샷 판정 요약 메시지 및 코드
         self.last_shot_result: Dict[str, object] = {
@@ -607,6 +608,7 @@ class MatchManager:
         self.fsm_state = MatchState.SHOT_IN_PROGRESS
         self.is_timer_paused = True
         self.score_dispatched_for_current_shot = False
+        self.bank_shot_dispatched_for_current_shot = False
         return self.get_match_payload()
 
     def on_immediate_second_ball_hit(
@@ -654,6 +656,7 @@ class MatchManager:
 
         if shot_type == "BANK_SHOT":
             current_player.bank_shots += 1
+            self.bank_shot_dispatched_for_current_shot = True
 
         current_player.score += points_awarded
         current_player.current_run += points_awarded
@@ -746,13 +749,17 @@ class MatchManager:
         already_dispatched = self.score_dispatched_for_current_shot or bool(
             shot_eval.get("already_dispatched", False)
         )
+        was_bank_dispatched = self.bank_shot_dispatched_for_current_shot
         # [불변 원칙] 제2적구 충돌 즉시 한 번 올라간 점수(+1)는 절대 롤백(차감)하지 않으며,
         # 공이 멈췄을 때도 해당 선수의 득점 인정과 공격권을 100% 그대로 유지합니다!
         is_scored = True if already_dispatched else bool(shot_eval.get("is_scored", False))
         self.score_dispatched_for_current_shot = False
+        self.bank_shot_dispatched_for_current_shot = False
         shot_type = str(shot_eval.get("shot_type", "REGULAR_3C" if is_scored else "MISS"))
         if is_scored and shot_type not in ("REGULAR_3C", "BANK_SHOT"):
             shot_type = "REGULAR_3C"
+        if is_scored and was_bank_dispatched:
+            shot_type = "BANK_SHOT"
         prev_player_id = self.active_player_id
         prev_inning = max(1, self.current_inning)
 
@@ -767,6 +774,17 @@ class MatchManager:
         if is_scored:
             if already_dispatched:
                 # 이미 제2적구 충돌 순간에 즉시 득점(+1)이 반영되었으므로 중복 가산 및 롤백을 모두 차단하고 턴을 유지!
+                # 단, 즉시 득점 시점에는 일반 3C였다가 정지 시점에 뱅크샷으로 최종 확인된 경우 뱅크샷 카운트를 보정합니다.
+                if shot_type == "BANK_SHOT" and not was_bank_dispatched:
+                    current_player.bank_shots += 1
+                    if self.rule_mode == "PBA":
+                        current_player.score += 1
+                        current_player.current_run += 1
+                        current_player.inning_scores[self.current_inning] = (
+                            current_player.inning_scores.get(self.current_inning, 0) + 1
+                        )
+                        if current_player.current_run > current_player.high_run:
+                            current_player.high_run = current_player.current_run
                 points_awarded = 0
                 self.active_player_id = prev_player_id
                 event_type = "SCORE_UPDATED"

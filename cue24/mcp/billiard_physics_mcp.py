@@ -160,11 +160,10 @@ class LocalPhysics3CushionAI:
            수구 진행 각도가 미세하게 굴절(cue_deflection_deg >= 2.2도)되고 목적구가 1.5mm 이상 움찔한 경우 즉시 타격으로 인정.
         3. 18~22mm 사각지대(Dead Zone) 제거: 15.0mm 이상 정지 위치 이탈 또는 3.8mm 이상 스텝 이동 시 타격 확정.
         """
-        if min_cue_to_target_dist_mm <= contact_threshold_mm:
-            return True
-
-        # 제1적구 타격 전: 당구대 위에 움직이는 공은 수구뿐이므로 목적구가 정지 위치에서 15mm 이상 튕겨나가면 수구 타격 확정
+        # 제1적구 타격 전: 당구대 위에 움직이는 공은 수구뿐이므로 중심 중첩(<=contact_threshold_mm) 또는 정지 위치 이탈로 판정
         if not is_first_object_hit_Done:
+            if min_cue_to_target_dist_mm <= contact_threshold_mm:
+                return True
             if curr_init_disp_mm >= 15.0 and min_cue_to_target_dist_mm <= 480.0:
                 return True
             if (
@@ -173,22 +172,23 @@ class LocalPhysics3CushionAI:
                 and min_cue_to_target_dist_mm <= 320.0
             ):
                 return True
-            # 순수 비전 초미세 스침(0.5mm 키스): 근접(<= 78mm) + 미세 굴절(>= 2.2도) + 미세 이동(>= 1.5mm)
             if (
-                min_cue_to_target_dist_mm <= 78.0
-                and cue_deflection_deg >= 2.2
-                and (curr_init_disp_mm >= 2.0 or target_step_move_mm >= 1.5)
+                min_cue_to_target_dist_mm <= 75.0
+                and cue_deflection_deg >= 4.0
+                and (curr_init_disp_mm >= 3.5 or target_step_move_mm >= 2.5)
             ):
                 return True
             if (
                 min_cue_to_target_dist_mm <= 115.0
                 and cue_deflection_deg >= 5.5
-                and (curr_init_disp_mm >= 5.0 or target_step_move_mm >= 2.2)
+                and (curr_init_disp_mm >= 5.2 or target_step_move_mm >= 3.5)
             ):
                 return True
             return False
 
-        # 제2적구 타격 판정: 사각지대(18~22mm) 제거 + 고속 터널링 보완 + 제1적구에 의한 키스(Kiss) 엄격 차단
+        # [제2적구 타격 판정 - 평범한 득점 실패 오인식(False Positive) 원천 차단]
+        # 1) 대각선 시차로 min_cue_to_target_dist_mm <= 64.0mm 가 찍히더라도 물리적 충격 증거가 없으면 절대 True를 반환하지 않음!
+        # 2) 제1적구에 의한 키스(Kiss) 엄격 차단
         is_kiss_from_other_ball = (
             other_object_to_target_dist_mm < 82.0
             and other_object_to_target_dist_mm < min_cue_to_target_dist_mm
@@ -196,25 +196,31 @@ class LocalPhysics3CushionAI:
         if is_kiss_from_other_ball:
             return False
 
+        # 증거 1: 제2적구가 정지 앵커 위치로부터 실제로 영구 순이동(>= 5.2mm)하고 스텝 충격이 발생한 경우
         if (
-            (curr_init_disp_mm >= 15.0 or target_step_move_mm >= 3.8)
+            min_cue_to_target_dist_mm <= contact_threshold_mm
+            and (curr_init_disp_mm >= 5.2 or target_step_move_mm >= 3.5)
+        ):
+            return True
+
+        if (
+            (curr_init_disp_mm >= 15.0 or (curr_init_disp_mm >= 5.2 and target_step_move_mm >= 3.8))
             and min_cue_to_target_dist_mm <= 245.0
         ):
             return True
 
-        # 순수 비전 초미세 스침(0.5mm 키스): 근접(<= 78mm) + 미세 굴절(>= 2.2도) + 목적구 미세 움찔(>= 1.5mm)
+        # 증거 2: 얇은 스침(박박이) 타격 - 접촉 반경(<= 66.5mm) 내에서 수구 직선이 명확히 꺾이고(>= 4.0도) 목적구도 이동한 경우
         if (
-            min_cue_to_target_dist_mm <= 78.0
-            and cue_deflection_deg >= 2.2
-            and (curr_init_disp_mm >= 2.0 or target_step_move_mm >= 1.5)
+            min_cue_to_target_dist_mm <= 66.5
+            and cue_deflection_deg >= 4.0
+            and (curr_init_disp_mm >= 3.5 or target_step_move_mm >= 2.2)
         ):
             return True
 
-        # 얇은 두께(초박박이) 타격: 수구 근접 통과 + 궤적 굴절각 >= 5.5도 + 목적구 미세 이동
         if (
             min_cue_to_target_dist_mm <= 115.0
             and cue_deflection_deg >= 5.5
-            and (curr_init_disp_mm >= 5.0 or target_step_move_mm >= 2.2)
+            and (curr_init_disp_mm >= 5.5 or target_step_move_mm >= 3.5)
         ):
             return True
 

@@ -179,6 +179,7 @@ class CausalKissSafeFSM:
         # [즉시 득점 발송 상태] 제2적구 충돌 즉시 점수판 반영 여부 및 해당 프레임 즉시 반환용 결과
         self.score_dispatched: bool = False
         self._pending_immediate_result: Optional[ShotResult] = None
+        self.idle_anchor_pos: Dict[BallColor, np.ndarray] = {}
 
     def _predict_next_state_with_gpt(self, color: BallColor, dt: float) -> Tuple[np.ndarray, np.ndarray]:
         buf = self.gpt_buffers[color]
@@ -522,13 +523,34 @@ class CausalKissSafeFSM:
         )
 
         if self.state == ShotState.IDLE:
+            for c in BallColor:
+                spd_c = float(np.linalg.norm(vel_map[c]))
+                if c not in self.idle_anchor_pos:
+                    prev_s = self.history[-2] if len(self.history) >= 2 else self.history[-1]
+                    self.idle_anchor_pos[c] = prev_s.pos[c].copy()
+                elif spd_c < 45.0:
+                    self.idle_anchor_pos[c] = 0.85 * self.idle_anchor_pos[c] + 0.15 * pos_map[c]
+
             fastest_color = max(vel_map.keys(), key=lambda c: float(np.linalg.norm(vel_map[c])))
-            if float(np.linalg.norm(vel_map[fastest_color])) >= self.STROKE_START_SPEED:
+            fastest_speed = float(np.linalg.norm(vel_map[fastest_color]))
+            anchor_p = self.idle_anchor_pos.get(
+                fastest_color,
+                self.history[0].pos[fastest_color],
+            )
+            displacement = float(np.linalg.norm(pos_map[fastest_color] - anchor_p))
+            min_disp_req = 18.0 if len(self.history) >= 4 else 6.0
+
+            if fastest_speed >= self.STROKE_START_SPEED and displacement >= min_disp_req:
+                saved_anchors = {c: self.idle_anchor_pos[c].copy() for c in BallColor if c in self.idle_anchor_pos}
                 self._reset_shot()
                 self.stroke_start_time = t
                 self.active_cue_ball = fastest_color
                 prev_snap = self.history[-2] if len(self.history) >= 2 else self.history[-1]
-                self.initial_positions = {c: prev_snap.pos[c].copy() for c in BallColor}
+                self.initial_positions = (
+                    saved_anchors
+                    if len(saved_anchors) == 3
+                    else {c: prev_snap.pos[c].copy() for c in BallColor}
+                )
                 cue_init_p = self.initial_positions[fastest_color]
                 self.initial_ball_distances = {
                     c: float(np.linalg.norm(self.initial_positions[c] - cue_init_p))
@@ -653,36 +675,98 @@ class CausalKissSafeFSM:
         # 5. 스트로크 직후 0.15초 내 투터치(Double Hit) 파울 검사
         self._check_double_hit_foul(t_eval, v_pre, v_post2, h5)
 
+    def _line_fit_rmse_and_kink(self, ball: BallColor) -> Tuple[float, np.ndarray, np.ndarray, float]:
+        """
+        최근 프레임들의 궤적에 대해:
+        1) 단일 등속 직선 모델 p(t) = p0 + v*t 로 피팅했을 때의 직선 잔차(line_rmse_mm)를 계산하고,
+        2) 충돌 전 구간(history[-6:-3])과 충돌 후 구간(history[-3:]) 각각의 선형 회귀 속도 벡터(v_pre, v_post) 및
+           굴절각(kink_deg)을 반환합니다.
+        평범한 득점 실패(안 맞고 직진 통과)는 line_rmse_mm < 2.0mm 이고 kink_deg ≈ 0° 로 나타납니다.
+        """
+        snaps = list(self.history)[-6:]
+        t_arr = np.array([s.t for s in snaps], dtype=np.float64)
+        p_arr = np.array([s.pos[ball] for s in snaps], dtype=np.float64)  # (N, 2)
+
+        t_mean = np.mean(t_arr)
+        p_mean = np.mean(p_arr, axis=0)
+        dt_arr = t_arr - t_mean
+        denom = float(np.sum(dt_arr ** 2))
+        if denom < 1e-8:
+            return 0.0, np.zeros(2), np.zeros(2), 0.0
+
+        # 전체 구간 단일 직선 최소자승(OLS) 기울기 및 잔차 RMSE 계산
+        v_ols = np.sum(dt_arr[:, None] * (p_arr - p_mean), axis=0) / denom
+        p_pred_line = p_mean + dt_arr[:, None] * v_ols
+        residuals = np.linalg.norm(p_arr - p_pred_line, axis=1)
+        line_rmse_mm = float(np.sqrt(np.mean(residuals ** 2)))
+
+        # 전반부(충돌 전) / 후반부(충돌 후) 구간 평균 속도 벡터
+        pre_snaps = snaps[:3]
+        post_snaps = snaps[-3:]
+        dt_pre = max(pre_snaps[-1].t - pre_snaps[0].t, 1e-4)
+        dt_post = max(post_snaps[-1].t - post_snaps[0].t, 1e-4)
+
+        v_pre_reg = (pre_snaps[-1].pos[ball] - pre_snaps[0].pos[ball]) / dt_pre
+        v_post_reg = (post_snaps[-1].pos[ball] - post_snaps[0].pos[ball]) / dt_post
+        kink_deg = self._angle_between_deg(v_pre_reg, v_post_reg)
+
+        return line_rmse_mm, v_pre_reg, v_post_reg, kink_deg
+
     def _verify_pair_collision(
         self,
         ball_x: BallColor,
         ball_y: BallColor,
-        other_ball: BallColor,
-        v_pre: Dict[BallColor, np.ndarray],
-        v_post1: Dict[BallColor, np.ndarray],
-        v_post2: Dict[BallColor, np.ndarray],
-        x_near_rail: bool,
-        is_cue_second_target_check: bool,
-        bc_kiss_this_frame: bool
+        f_pre2: Optional[FrameSnapshot] = None,
+        f_prev: Optional[FrameSnapshot] = None,
+        f_curr: Optional[FrameSnapshot] = None,
+        f_post2: Optional[FrameSnapshot] = None,
+        x_near_rail: bool = False,
+        other_ball: Optional[BallColor] = None,
+        subpixel_phase_hit: bool = False,
+        *,
+        v_pre: Optional[Dict[BallColor, np.ndarray]] = None,
+        v_post1: Optional[Dict[BallColor, np.ndarray]] = None,
+        v_post2: Optional[Dict[BallColor, np.ndarray]] = None,
+        is_cue_second_target_check: bool = False,
+        bc_kiss_this_frame: bool = False,
     ) -> bool:
         """
-        [핵심 해결책 2 & 3]
-        - 무조건 거리 통과(is_hard_overlap) 폐지: 거리가 60mm 이하라도 물리적 충격량 교환이 없으면 기각!
-        - 운동량 보존 기반 적구 키스 충격 차감: Δv_Y_net = Δv_Y + Δv_other (other_ball과 Y가 충돌 중일 때)
-        - A -> B -> C 간접 연쇄 충돌(Chain Cannon) 기하학적 차폐
-        - 적구 키스 발생 후 또는 이동 중인 제2적구(Y)에 대해 쌍방 작용-반작용(AND 게이트) 강제
-        - 0쿠션 초기 그레이존 엄격화: 제1적구 접촉 직후 0.18초 이내 0쿠션 조기키스 오탐 차단
+        [평범한 실패 오판(False Positive) 원천 차단 + 3체 인과 키스 분리 통합 버전]
+        - 단순 거리 중첩(is_hard_overlap)만으로 무조건 True를 반환하던 버그를 폐지합니다.
+        - 대각선 시차로 인해 d_min <= 63mm가 찍히거나 바운딩 박스 노이즈(1~2px) 및 회전 휨(2~3°)이 있더라도,
+          1) 피타격구(Y)의 정지 앵커 대비 영구 순이동(>= 5.2mm) + 법선 충격 속도(>= 45mm/s)가 입증되거나,
+          2) 수구(X)의 6프레임 직선 회귀가 깨지며(line_rmse >= 1.6mm) 실제 접촉 반경(d_min <= 66.5mm)에서
+             법선 반대 방향으로 명확히 꺾인 경우(>= 4.0°)에만 충돌로 인정합니다.
         """
-        h2, h3 = self.history[2], self.history[3]
+        h2 = f_prev if f_prev is not None else self.history[2]
+        h3 = f_curr if f_curr is not None else self.history[3]
         t_eval = h3.t
+
+        if other_ball is None:
+            remaining = [c for c in BallColor if c not in (ball_x, ball_y)]
+            other_ball = remaining[0]
 
         pair_key = frozenset([ball_x, ball_y])
         if (t_eval - self.pair_last_hit_time.get(pair_key, -999.0)) < self.PAIR_COOLDOWN_SEC:
             return False
 
         d_min, _, n_xy = self._subframe_ccd(h2.pos[ball_x], h3.pos[ball_x], h2.pos[ball_y], h3.pos[ball_y])
-        if d_min > self.GRAY_ZONE_MAX_DIST:
+        if d_min > 75.0:
             return False
+
+        # 제3의 공(other_ball)과의 최근접 거리 및 법선 벡터 계산
+        d_x_other, _, n_x_other = self._subframe_ccd(h2.pos[ball_x], h3.pos[ball_x], h2.pos[other_ball], h3.pos[other_ball])
+        d_y_other, _, n_other_y = self._subframe_ccd(h2.pos[other_ball], h3.pos[other_ball], h2.pos[ball_y], h3.pos[ball_y])
+
+        # 1. 공격구(X) 및 피타격구(Y)의 6프레임 단일 직선 회귀 잔차(line_rmse_mm)와 굴절각(kink_deg) 추출
+        line_rmse_x, vx_pre_reg, vx_post_reg, kink_deg_x = self._line_fit_rmse_and_kink(ball_x)
+        _, vy_pre_reg, vy_post_reg, _ = self._line_fit_rmse_and_kink(ball_y)
+
+        if v_pre is None or v_post1 is None or v_post2 is None:
+            v_pre_c, v_post1_c, v_post2_c = self._compute_split_velocities()
+            v_pre = v_pre or v_pre_c
+            v_post1 = v_post1 or v_post1_c
+            v_post2 = v_post2 or v_post2_c
 
         vx_pre, vx_post = v_pre[ball_x], v_post2[ball_x]
         vy_pre, vy_post = v_pre[ball_y], v_post2[ball_y]
@@ -695,16 +779,16 @@ class CausalKissSafeFSM:
             delta_vy = np.zeros(2, dtype=np.float64)
             vy_post_immediate = vy_pre.copy()
 
-        # 제3의 공(other_ball)과의 최근접 거리 및 법선 벡터 계산
-        d_x_other, _, n_x_other = self._subframe_ccd(h2.pos[ball_x], h3.pos[ball_x], h2.pos[other_ball], h3.pos[other_ball])
-        d_y_other, _, n_other_y = self._subframe_ccd(h2.pos[other_ball], h3.pos[other_ball], h2.pos[ball_y], h3.pos[ball_y])
+        # 2. 피타격구(Y)의 접근 전 정지 앵커(Anchor) 대비 영구 순변위(Net Displacement) 계산
+        snaps = list(self.history)
+        anchor_y = np.mean([s.pos[ball_y] for s in snaps[:2]], axis=0)
+        post_y = np.mean([s.pos[ball_y] for s in snaps[-2:]], axis=0)
+        net_disp_vec_y = post_y - anchor_y
+        net_disp_mag_y = float(np.linalg.norm(net_disp_vec_y))
+        net_disp_along_normal_y = float(np.dot(net_disp_vec_y, n_xy))
 
         # -----------------------------------------------------------------
         # [방어 A] A -> B -> C 간접 연쇄 키스(Chain Cannon) 차폐
-        # 수구(X)가 제1적구(other_ball)를 치고 제1적구가 제2적구(Y)를 친 경우:
-        # 1) d(X, other) <= d(X, Y) 및 d(other, Y) <= 75mm 이면서
-        # 2) other_ball이 X와 Y 사이에 위치(내적 > 0)하고 Y의 충격 방향이 n_other_y와 일치하면
-        # X가 Y를 직접 친 것이 아니라 other_ball이 Y를 친 것이므로 즉시 기각!
         # -----------------------------------------------------------------
         delta_v_other = v_post2[other_ball] - v_pre[other_ball]
         if is_cue_second_target_check and d_y_other <= self.GRAY_ZONE_MAX_DIST:
@@ -713,12 +797,8 @@ class CausalKissSafeFSM:
             dist_xy = max(float(np.linalg.norm(vec_xy)), 1e-6)
             proj_ratio = float(np.dot(vec_x_other, vec_xy / dist_xy)) / dist_xy
 
-            # other_ball(1적구)이 수구(X)와 2적구(Y) 사이에 끼어 있거나 X가 1적구에 더 가깝게 부딪힌 경우
             other_is_between = (0.0 < proj_ratio < 1.05) and (d_x_other <= d_min + 6.0)
             if other_is_between or bc_kiss_this_frame:
-                # 1적구(other)가 2적구(Y)에 전달한 운동량(-Δv_other)을 Y의 속도 변화에서 차감!
-                # 단, X가 other를 쳤다면 other도 X로부터 충격을 받았으므로,
-                # X가 Y에 직접 준 충격이 있는지는 X의 반작용 방향이 n_xy인지 n_x_other인지로 판별
                 recoil_along_other = float(np.dot(delta_vx, -n_x_other))
                 recoil_along_y = float(np.dot(delta_vx, -n_xy))
                 if d_x_other < d_min - 1.5 and recoil_along_other >= recoil_along_y * 0.9:
@@ -726,25 +806,19 @@ class CausalKissSafeFSM:
 
         # -----------------------------------------------------------------
         # [방어 B] 뉴턴 제3법칙 운동량 보존 기반 적구 키스 충격량 차감
-        # 만약 Y와 other_ball이 현재 근접 충돌 중이라면(d_y_other <= 75mm),
-        # Y가 받은 충격 중 other_ball이 잃은 운동량(-Δv_other)만큼은 other_ball 때문이므로 차감합니다.
         # -----------------------------------------------------------------
         delta_vy_net = delta_vy.copy()
         if d_y_other <= self.GRAY_ZONE_MAX_DIST:
             other_pushed_y = float(np.dot(delta_v_other, -n_other_y)) > 18.0 and float(np.dot(delta_vy, n_other_y)) > 18.0
             if other_pushed_y:
-                # other_ball이 Y에 전달한 법선 운동량 성분을 차감
                 transferred_from_other = float(np.dot(-delta_v_other, n_other_y)) * n_other_y
                 delta_vy_net = delta_vy - transferred_from_other
-                # 적구 간 키스 플래그도 즉시 활성화
                 if is_cue_second_target_check:
                     self.object_ball_kiss_occurred = True
                     self.last_object_kiss_time = t_eval
 
         # -----------------------------------------------------------------
         # [방어 C] 즉각 충격 일관성 검증 (미래 프레임 h[4]->h[5] 충돌의 역방향 누수 차단)
-        # 진짜로 현재 프레임(h[2]->h[3])에서 충돌했다면, 직후 1프레임 속도(v_post1)에서도
-        # 이미 속도 변화가 시작되었어야 합니다.
         # -----------------------------------------------------------------
         delta_vy_imm = vy_post_immediate - vy_pre
         delta_vx_imm = vx_post_immediate - vx_pre
@@ -755,11 +829,9 @@ class CausalKissSafeFSM:
 
         recoil_x_normal = float(np.dot(delta_vx, -n_xy))
         recoil_x_imm_normal = float(np.dot(delta_vx_imm, -n_xy))
-        deflection_deg_x = self._angle_between_deg(vx_pre, vx_post)
+        deflection_deg_x = max(self._angle_between_deg(vx_pre, vx_post), kink_deg_x)
 
         # [0쿠션 초기 그레이존 엄격화]
-        # cushion_count == 0 이고 제1적구 접촉 직후 0.18초 이내에는 제2적구 그레이존 판정을 엄격히 제한
-        # (d_min <= 64.0mm 또는 확실한 제2적구 법선 충격 >= 42.0mm/s 일 때만 허용하여 0쿠션 조기키스 오탐 차단)
         if (
             is_cue_second_target_check
             and self.cushion_count == 0
@@ -769,20 +841,25 @@ class CausalKissSafeFSM:
             if d_min > 64.0 and impulse_y_normal < 42.0:
                 return False
 
-        # 접근 속도(Closing Speed): 충돌 직전 두 공이 실제로 가까워지고 있었는지 확인
         closing_speed = float(np.dot(vx_pre - vy_pre, n_xy))
         if closing_speed < -15.0:
             return False
 
-        # X가 제3의 공(other_ball)과 더 가깝게 충돌하여 꺾인 경우 X의 굴절 증거 무효화
         x_deflected_off_other = (
-            d_x_other < d_min - 1.5
-            and float(np.dot(delta_vx, -n_x_other)) > max(recoil_x_normal * 0.85, 15.0)
+            (
+                d_x_other < d_min - 1.5
+                and float(np.dot(delta_vx, -n_x_other)) > max(recoil_x_normal * 0.85, 15.0)
+            )
+            or (
+                d_x_other <= 72.0
+                and float(np.linalg.norm(delta_v_other)) >= 35.0
+                and net_disp_mag_y < 3.0
+            )
+            or bc_kiss_this_frame
         )
-        if x_deflected_off_other:
+        if x_deflected_off_other and net_disp_mag_y < 5.2:
             return False
 
-        # Y의 충격이 현재 프레임(h[3])에서 즉시 시작되었는지 확인 (다음 프레임 키스 역류 방지)
         y_impulse_is_immediate = (impulse_y_imm_normal >= impulse_y_normal * 0.35) or (impulse_y_imm_normal >= 15.0)
         x_recoil_is_immediate = (recoil_x_imm_normal >= recoil_x_normal * 0.35) or (recoil_x_imm_normal >= 15.0)
 
@@ -795,7 +872,7 @@ class CausalKissSafeFSM:
         # -----------------------------------------------------------------
         # [방어 D] 상태별 엄격한 물리 게이트 분기 (무조건 거리 통과 완전 폐지!)
         # -----------------------------------------------------------------
-        # Case 1: 적구 간 키스가 있었거나, 제2적구(Y)가 이미 굴러가고 있는 상태 (오판 위험 최고 구간!)
+        # Case 1: 적구 간 키스가 있었거나, 제2적구(Y)가 이미 굴러가고 있는 상태 (speed_y_pre >= 35mm/s 등)
         if is_cue_second_target_check and (speed_y_pre >= 20.0 or recent_kiss_contaminating):
             deflection_deg_y = self._angle_between_deg(vy_pre, vy_post)
             strong_y_kink = (
@@ -816,24 +893,35 @@ class CausalKissSafeFSM:
                 return True
             return False
 
-        # Case 2: 피타격구(Y)가 완전 정지 상태(speed_y_pre < 20mm/s)이고 주변 적구 간섭이 없는 깨끗한 상태
-        y_cleanly_launched = (
-            y_impulse_is_immediate
-            and delta_vy_net_mag >= self.MIN_TARGET_DELTA_V
-            and impulse_y_normal >= self.MIN_TARGET_DELTA_V * 0.60
-            and d_min <= d_y_other + 4.0
-        )
+        # Case 2: 피타격구(Y)가 정지 상태(speed_y_pre < 35mm/s)일 때
+        # [증거 1] 피타격구(Y)가 실제 물리적 타격을 받아 정지 앵커 대비 영구 이동(>= 5.2mm)하고 법선 충격 속도가 발생했는가?
+        y_truly_moved = (
+            (
+                y_impulse_is_immediate
+                and net_disp_mag_y >= 5.2
+                and net_disp_along_normal_y >= 3.5
+                and delta_vy_net_mag >= 45.0
+                and impulse_y_normal >= 30.0
+            )
+            or (subpixel_phase_hit and d_min <= 68.0)
+        ) and (d_min <= d_y_other + 3.0)
 
-        # 정지한 Y를 초박두께(0.5mm)로 스친 경우: X가 쿠션 밖에서 명확히 꺾이고 동시에 Y도 최소 미동(>=8mm/s)해야 함
-        thin_graze_verified = (
-            not x_near_rail
+        # [증거 2] 목적구(Y)가 거의 안 밀린 얇은 스침(박박이)일 때, 수구(X)의 6프레임 직선이 실제로 부러졌는가?
+        # 단순 스핀 휘어짐이나 노이즈(1.8°)에 속지 않도록 실제 접촉 가능 거리(d_min <= 66.5mm) 내에서만 허용하되
+        # 직선 회귀 오차가 깨지고(line_rmse_x >= 1.6mm) 굴절각 >= 4.0° 이며 Y에도 최소한의 반작용 미동이 있을 때만 인정!
+        x_truly_deflected = (
+            d_min <= 66.5
+            and (not x_near_rail)
+            and (not x_deflected_off_other)
             and x_recoil_is_immediate
-            and deflection_deg_x >= self.MIN_CUE_DEFLECTION_DEG
-            and recoil_x_normal >= 20.0
-            and impulse_y_normal >= 8.0
+            and (impulse_y_normal >= 8.0 or net_disp_mag_y >= 1.0 or subpixel_phase_hit)
+            and (
+                (deflection_deg_x >= 4.0 and line_rmse_x >= 1.6 and recoil_x_normal >= 30.0)
+                or (d_min <= 62.5 and recoil_x_normal >= 60.0)
+            )
         )
 
-        # 정면 타격 후 수구 급정지 케이스 (합성 키프레임 호환용: d_min <= 60mm 이고 수구가 정면에서 급감속 정지)
+        # 정면 타격 후 수구 급정지 케이스 (d_min <= 60mm 이고 수구가 정면에서 급감속 정지)
         head_on_stop_verified = (
             d_min <= 60.0
             and closing_speed >= 400.0
@@ -842,7 +930,9 @@ class CausalKissSafeFSM:
             and (not recent_kiss_contaminating)
         )
 
-        if y_cleanly_launched or thin_graze_verified or head_on_stop_verified:
+        # [최종 판정] 시차로 인해 d_min <= 60mm로 겹쳐 보여도,
+        # 수구가 직진(not x_truly_deflected)하고 목적구도 제자리에 가만히(not y_truly_moved) 있으면 100% 노카운트(False)!
+        if y_truly_moved or x_truly_deflected or head_on_stop_verified:
             self.pair_last_hit_time[pair_key] = t_eval
             return True
 

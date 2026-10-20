@@ -17,6 +17,7 @@ from three_cushion_vision.causal_kiss_fsm import (
     ShotState,
 )
 from three_cushion_vision.scoring_fsm import ThreeCushionScoringFSM
+from ball_identity_tracker import LabHungarianBallIdentifier
 
 BallID = BallColor
 
@@ -29,6 +30,7 @@ __all__ = [
     "BallID",
     "CausalKissSafeFSM",
     "FrameSnapshot",
+    "LabHungarianBallIdentifier",
     "Rail",
     "ShotResult",
     "ShotState",
