@@ -14,6 +14,11 @@ from three_cushion_vision.config import (
     ShotState,
     VisionConfig,
 )
+from three_cushion_vision.demo_visualizer import (
+    BilliardDemoVisualizer,
+    UltralyticsOCSortDetector,
+    run_video_demo,
+)
 from three_cushion_vision.homography import TableHomography
 from three_cushion_vision.kinematics_detector import (
     ConfirmedContactEvent,
@@ -41,4 +46,7 @@ __all__ = [
     "ShotResult",
     "ThreeCushionScoringFSM",
     "ScoreboardBridge",
+    "UltralyticsOCSortDetector",
+    "BilliardDemoVisualizer",
+    "run_video_demo",
 ]

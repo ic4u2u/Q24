@@ -338,6 +338,109 @@ class TestThreeCushionVisionScenarios(unittest.TestCase):
         self.assertFalse(result_4b.is_bank_shot)
         self.assertGreaterEqual(result_4b.cushions_before_second_ball, 3)
 
+    def test_scenario_5_cue_ball_color_missed_score_auto_compensation(self) -> None:
+        """
+        [시나리오 5: 수구 색상 감지 기반 미인지 득점 자동 소급 보정]
+        1) 1이닝 첫 샷에서 P1(WHITE)이 타구했으나 비전 사각지대 등으로 인해 노카운트(MISS)로 오판되어
+           FSM의 assigned_cue_ball이 YELLOW로 넘어가고 점수판도 P2(후공) 차례로 넘어감.
+        2) 그러나 실제 경기에서는 P1이 득점에 성공했기 때문에 다음 샷에서도 P1이 흰공(WHITE)을 다시 타구하여 3쿠션 득점 성공!
+        3) FSM과 ScoreboardBridge + MatchManager가 선수가 친 공의 색깔(WHITE)을 감지하여:
+           - 직전 누락되었던 득점(+1점)을 P1에게 즉시 소급 복구하고,
+           - 이번 샷 득점(+1점)까지 합산하여 P1의 1이닝 점수가 총 2점(score=2, current_run=2, active_player=P1)으로 정확히 반영되는지 검증!
+        """
+        from cue24.services.match_manager import MatchManager
+
+        mm = MatchManager(p1_name="선공선수", p2_name="후공선수")
+        fsm = ThreeCushionScoringFSM(
+            initial_cue_ball=BallColor.WHITE,
+            auto_compensate_missed_score=True,
+        )
+        bridge = ScoreboardBridge(match_manager=mm)
+
+        # 1차 샷: 비전이 제2목적구 접촉을 놓쳐 MISS로 판정된 상황 시뮬레이션
+        miss_waypoints = [
+            (400.0, 700.0),
+            (800.0, 500.0),   # 제1목적구(RED: 800, 450) 접촉
+            (1500.0, 32.0),   # 1쿠션
+            (2808.0, 650.0),  # 2쿠션
+            (1900.0, 1388.0), # 3쿠션 후 제2목적구 미접촉으로 오판된 경로
+            (1500.0, 1000.0),
+        ]
+        cue_path_1 = _interpolate_waypoints_60fps(miss_waypoints, frames_per_segment=8)
+        red_path_1 = [(800.0, 450.0)] * len(cue_path_1)
+        yellow_path_1 = [(1200.0, 600.0)] * len(cue_path_1)
+
+        res_1 = _run_60fps_simulation(fsm, cue_path_1, red_path_1, yellow_path_1)
+        self.assertIsNotNone(res_1)
+        assert res_1 is not None
+        bridge.publish_shot_result(res_1)
+
+        # 1차 샷 직후: 노카운트 판정으로 인해 P1은 0점이고 P2(YELLOW)에게 턴이 넘어간 상태
+        self.assertFalse(res_1.scored)
+        self.assertEqual(fsm.assigned_cue_ball, BallColor.YELLOW)
+        self.assertEqual(mm.active_player_id, "P2")
+        self.assertEqual(mm.players["P1"].score, 0)
+
+        # 2차 샷: 실제로는 1차 샷이 득점이어서 선공(P1)이 자신의 흰공(WHITE)을 연속 타구하여 3쿠션 득점!
+        score_waypoints = [
+            (1500.0, 1000.0),
+            (800.0, 500.0),    # 제1목적구(RED: 800, 450) 접촉
+            (1500.0, 32.0),    # 1쿠션: TOP
+            (2808.0, 650.0),   # 2쿠션: RIGHT
+            (1900.0, 1388.0),  # 3쿠션: BOTTOM
+            (1200.0, 650.0),   # 제2목적구(YELLOW: 1200, 600) 접촉
+            (1100.0, 600.0),   # 정지
+        ]
+        cue_path_2 = _interpolate_waypoints_60fps(score_waypoints, frames_per_segment=8)
+        red_path_2 = [(800.0, 450.0)] * len(cue_path_2)
+        yellow_path_2 = [(1200.0, 600.0)] * len(cue_path_2)
+
+        res_2 = _run_60fps_simulation(fsm, cue_path_2, red_path_2, yellow_path_2)
+        self.assertIsNotNone(res_2)
+        assert res_2 is not None
+        pub_2 = bridge.publish_shot_result(res_2)
+
+        print(
+            f"[Scenario 5 - Cue Ball Color Auto-Compensation] "
+            f"retroactive_compensated={res_2.retroactive_previous_score_compensated}, "
+            f"P1_score={mm.players['P1'].score}, P2_score={mm.players['P2'].score}, "
+            f"active_player={mm.active_player_id}, inning={mm.current_inning}"
+        )
+
+        # 검증:
+        # 1) 선수가 친 흰공(WHITE)을 감지하여 직전 미인지 득점(+1점)이 소급 보정되었고,
+        # 2) 이번 2차 샷 득점(+1점)까지 더해져 P1의 점수는 정확히 2점(1이닝 2득점, 연속 2점)이 되어야 함!
+        self.assertTrue(res_2.retroactive_previous_score_compensated)
+        self.assertTrue(res_2.scored)
+        self.assertEqual(res_2.cue_ball, BallColor.WHITE)
+        self.assertEqual(mm.players["P1"].score, 2)
+        self.assertEqual(mm.players["P1"].inning_scores.get(1), 2)
+        self.assertEqual(mm.players["P1"].current_run, 2)
+        self.assertEqual(mm.players["P2"].score, 0)
+        self.assertEqual(mm.active_player_id, "P1")
+        self.assertEqual(mm.current_inning, 1)
+        self.assertTrue(pub_2["reconcile_info"]["compensated"])
+
+    def test_scenario_6_demo_visualizer_pip_and_overlay_rendering(self) -> None:
+        """
+        [시나리오 6: demo_visualizer.py 실시간 2D 미니맵(PIP), 쿠션 카운트, 궤적 라인, 판정 배너 렌더링 검증]
+        """
+        from three_cushion_vision.demo_visualizer import run_video_demo
+
+        summary = run_video_demo(
+            video_path="__non_existent_synthetic_demo__.mp4",
+            output_path=None,
+            max_frames=90,
+            display=False,
+        )
+        print(
+            f"[Scenario 6 - DemoVisualizer] processed_frames={summary['processed_frames']}, "
+            f"shots={len(summary['shot_results'])}, backend={summary['detector_backend']}"
+        )
+        self.assertGreaterEqual(summary["processed_frames"], 70)
+        self.assertEqual(len(summary["shot_results"]), 1)
+        self.assertTrue(summary["shot_results"][0].scored)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

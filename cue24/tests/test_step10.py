@@ -89,10 +89,10 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
             mm.tick_timer(3.0)
             self.assertEqual(mm.remaining_timer_sec, 37.0)
 
-            # 1) 처음 움직이는 공(ID 2: YELLOW)을 감지 -> YELLOW를 수구로 자동 인식 & 샷 클락 즉시 정지
+            # 1) 처음 움직이는 공(ID 2: WHITE, 1번 선수 선공 수구)을 감지 -> 수구 자동 인식 & 샷 클락 즉시 정지
             await reader.process_coordinate_step(
                 detected_points=[(710.0, 710.0), (760.0, 355.0), (2130.0, 710.0)],
-                detected_colors={1: "WHITE", 2: "YELLOW", 3: "RED"},
+                detected_colors={1: "YELLOW", 2: "WHITE", 3: "RED"},
             )
             self.assertEqual(reader.tracker.cue_ball_id, 2)
             self.assertEqual(mm.fsm_state, MatchState.SHOT_IN_PROGRESS)
@@ -539,6 +539,136 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
         self.assertFalse(bool(eval_res["is_scored"]))
         self.assertEqual(eval_res["fsm_state"], ShotFSMState.NO_SCORE_LOCKED.value)
         self.assertEqual(eval_res["failure_reason"], FailureReason.EARLY_SECOND_BALL_CONTACT.value)
+
+    def test_cue_ball_color_100pct_player_match_and_retroactive_score_recovery(self) -> None:
+        """
+        [사용자 핵심 확인 항목 2대 시나리오 자동 검증]
+        1. 직전 득점 미인지 시 다음 타구에서 자동 +1점 복구:
+           - 직전 샷 득점이 누락되어(MISS 오판) 턴이 상대방으로 넘어갔더라도,
+           - 선수가 자기 공(흰공 WHITE 또는 노란공 YELLOW)을 계속 치는 순간(타구 출발 즉시!)
+             누락된 점수(+1점)와 공격권(active_player_id), 이닝 기록표가 즉시 제자리로 복구되는지 확인.
+        2. 흰공 타구 = 1번 선수(선공 P1), 노란공 타구 = 2번 선수(후공 P2) 100% 일치:
+           - 선수가 치는 공의 색깔에 따라 해당 선수의 점수판과 이닝 기록표에 정확히 점수가 올라가는지 확인.
+        """
+        import asyncio
+        from cue24.api.server import ConnectionManager, LiveStreamReader
+        from cue24.services.match_manager import MatchManager, MatchState
+
+        async def _run_verification() -> None:
+            mm = MatchManager(p1_name="1번 선수(선공)", p2_name="2번 선수(후공)")
+            ws = ConnectionManager()
+            reader = LiveStreamReader(match_manager=mm, ws_manager=ws)
+
+            # 초기 트랙: 1=(710.0, 710.0)[WHITE], 2=(710.0, 355.0)[YELLOW], 3=(2130.0, 710.0)[RED]
+            # ------------------------------------------------------------------
+            # 검증 1: 1번 선수(흰공 WHITE, ID 1)가 1이닝 첫 샷을 쳤으나 비전이 득점을 놓쳐(MISS)
+            #         2번 선수(P2)로 턴이 넘어간 직후, 1번 선수가 자기 공(흰공 WHITE, ID 1)을 계속 치는 순간!
+            # ------------------------------------------------------------------
+            # 1-A) 1번 선수(ID 1 = WHITE: (710,710)->(800,710)) 첫 타구 출발 및 정지(비전 미인지 공타 시뮬레이션)
+            await reader.process_coordinate_step(
+                detected_points=[(800.0, 710.0), (710.0, 355.0), (2130.0, 710.0)],
+                detected_colors={1: "WHITE", 2: "YELLOW", 3: "RED"},
+            )
+            self.assertEqual(reader.tracker.cue_ball_id, 1)
+            self.assertEqual(mm.active_player_id, "P1")
+            for _ in range(15):
+                await reader.process_coordinate_step(
+                    detected_points=[(800.0, 710.0), (710.0, 355.0), (2130.0, 710.0)]
+                )
+            # 미인지 공타로 인해 현재 P1=0점, 공격권은 P2로 넘어간 상태
+            self.assertEqual(mm.players["P1"].score, 0)
+            self.assertEqual(mm.active_player_id, "P2")
+            self.assertEqual(mm.current_inning, 1)
+
+            # 1-B) 1번 선수가 자기 공(ID 1 = WHITE: (800,710)->(920,710))을 계속 치는 순간! (정지 전 타구 출발 즉시 확인)
+            await reader.process_coordinate_step(
+                detected_points=[(920.0, 710.0), (710.0, 355.0), (2130.0, 710.0)],
+                detected_colors={1: "WHITE", 2: "YELLOW", 3: "RED"},
+            )
+            # 타구 출발 즉시 누락된 직전 점수(+1점)와 공격권(P1)이 제자리로 복구되어야 함!
+            self.assertEqual(reader.tracker.cue_ball_id, 1)
+            self.assertEqual(mm.fsm_state, MatchState.SHOT_IN_PROGRESS)
+            self.assertEqual(mm.active_player_id, "P1")
+            self.assertEqual(mm.players["P1"].score, 1)
+            self.assertEqual(mm.players["P1"].inning_scores.get(1), 1)
+            self.assertEqual(
+                mm.last_shot_result.get("reason_code"),
+                "RETROACTIVE_SCORE_COMPENSATED",
+            )
+
+            # 1-C) 이 두 번째 샷이 진짜 공타로 멈추면 P1은 복구된 1점을 유지한 채 P2에게 턴이 넘어감
+            for _ in range(15):
+                await reader.process_coordinate_step(
+                    detected_points=[(920.0, 710.0), (710.0, 355.0), (2130.0, 710.0)]
+                )
+            self.assertEqual(mm.players["P1"].score, 1)
+            self.assertEqual(mm.active_player_id, "P2")
+            self.assertEqual(mm.current_inning, 1)
+
+            # ------------------------------------------------------------------
+            # 검증 2: 노란공(YELLOW, ID 2) 타구 = 2번 선수(후공 P2) 100% 일치 및
+            #         2번 선수 직전 득점 미인지 시 노란공 연속 타구로 즉시 복구 확인!
+            # ------------------------------------------------------------------
+            # 2-A) 심지어 누군가 실수로 턴을 P1으로 바꿔놓았더라도,
+            #      실제 당구대에서 노란공(ID 2 = YELLOW: (710,355)->(820,355))이 타구되면 100% 2번 선수(P2)로 공격권이 일치되어야 함!
+            mm.active_player_id = "P1"
+            await reader.process_coordinate_step(
+                detected_points=[(920.0, 710.0), (820.0, 355.0), (2130.0, 710.0)],
+                detected_colors={1: "WHITE", 2: "YELLOW", 3: "RED"},
+            )
+            self.assertEqual(reader.tracker.cue_ball_id, 2)
+            self.assertEqual(mm.active_player_id, "P2")
+            self.assertEqual(mm.active_cue_ball_color, "YELLOW")
+
+            # 이 샷에서 2번 선수(YELLOW, ID 2)가 3쿠션 득점 성공!
+            p2_3c_frames = [
+                [(920.0, 710.0), (920.0, 660.0), (2130.0, 710.0)],   # 제1적구(ID 1: 920,710) 접촉
+                [(920.0, 710.0), (1200.0, 30.0), (2130.0, 710.0)],   # TOP 쿠션 진입
+                [(920.0, 710.0), (1400.0, 120.0), (2130.0, 710.0)],  # TOP 반사 (1쿠션)
+                [(920.0, 710.0), (2810.0, 500.0), (2130.0, 710.0)],  # RIGHT 쿠션 진입
+                [(920.0, 710.0), (2650.0, 650.0), (2130.0, 710.0)],  # RIGHT 반사 (2쿠션)
+                [(920.0, 710.0), (2300.0, 1390.0), (2130.0, 710.0)], # BOTTOM 쿠션 진입
+                [(920.0, 710.0), (2130.0, 760.0), (2130.0, 710.0)],  # BOTTOM 반사(3쿠션) + 제2적구(ID 3) 접촉
+            ]
+            for pts in p2_3c_frames:
+                await reader.process_coordinate_step(detected_points=pts)
+            for _ in range(15):
+                await reader.process_coordinate_step(
+                    detected_points=[(920.0, 710.0), (2130.0, 760.0), (2130.0, 710.0)]
+                )
+
+            # 노란공(YELLOW) 득점 결과: 2번 선수(P2)의 점수와 1이닝 기록표에 정확히 +1점이 올라가고 공격권 유지!
+            self.assertEqual(mm.players["P2"].score, 1)
+            self.assertEqual(mm.players["P2"].inning_scores.get(1), 1)
+            self.assertEqual(mm.active_player_id, "P2")
+            self.assertEqual(mm.current_inning, 1)
+
+            # 2-B) 2번 선수(P2)의 다음 샷이 비전 미인지로 인해 공타(MISS) 처리되어 2이닝 P1으로 넘어간 상황
+            await reader.process_coordinate_step(
+                detected_points=[(920.0, 710.0), (1950.0, 700.0), (2130.0, 710.0)],
+                detected_colors={1: "WHITE", 2: "YELLOW", 3: "RED"},
+            )
+            for _ in range(15):
+                await reader.process_coordinate_step(
+                    detected_points=[(920.0, 710.0), (1950.0, 700.0), (2130.0, 710.0)]
+                )
+            self.assertEqual(mm.active_player_id, "P1")
+            self.assertEqual(mm.current_inning, 2)
+            self.assertEqual(mm.players["P2"].score, 1)
+
+            # 그러나 실제로는 득점이어서 2번 선수가 자기 공(노란공 YELLOW, ID 2: (1950,700)->(1750,620))을 계속 치는 순간!
+            await reader.process_coordinate_step(
+                detected_points=[(920.0, 710.0), (1750.0, 620.0), (2130.0, 710.0)],
+                detected_colors={1: "WHITE", 2: "YELLOW", 3: "RED"},
+            )
+            # 즉시 2번 선수(P2)의 누락된 점수(+1점 -> 총 2점), 1이닝 기록(2점), 공격권(P2), 이닝 번호(1이닝)가 복구됨!
+            self.assertEqual(mm.active_player_id, "P2")
+            self.assertEqual(mm.current_inning, 1)
+            self.assertEqual(mm.players["P2"].score, 2)
+            self.assertEqual(mm.players["P2"].inning_scores.get(1), 2)
+            self.assertEqual(mm.players["P2"].current_run, 2)
+
+        asyncio.run(_run_verification())
 
 
 if __name__ == "__main__":

@@ -88,9 +88,17 @@ class ScoreboardBridge:
         )
         self.replay_triggers.append(replay_trigger)
 
-        # CUE24 MatchManager가 연결된 경우 즉시 이닝/점수/턴 상태 동기화
+        # CUE24 MatchManager가 연결된 경우:
+        # 1) 선수가 실제로 친 수구 색깔(result.cue_ball.value)을 감지하여 직전 미인지 득점(+1점) 자동 보정 및 공격자 동기화 수행
+        # 2) 이어서 이번 샷의 최종 득점/공타 결과를 해당 선수의 점수판에 반영
         match_payload: Optional[Dict[str, Any]] = None
+        reconcile_info: Optional[Dict[str, Any]] = None
         if self.match_manager is not None:
+            if hasattr(self.match_manager, "reconcile_cue_ball_stroke"):
+                reconcile_info = self.match_manager.reconcile_cue_ball_stroke(
+                    stroked_cue_color=result.cue_ball.value,
+                    compensate_missed_score=True,
+                )
             if getattr(self.match_manager, "fsm_state", None) is not None:
                 from cue24.services.match_manager import MatchState
 
@@ -116,10 +124,12 @@ class ScoreboardBridge:
                 "total_cushions": result.total_cushions,
                 "is_bank_shot": result.is_bank_shot,
                 "fail_reason": result.fail_reason,
+                "retroactive_previous_score_compensated": result.retroactive_previous_score_compensated,
                 "inning_start_time": round(result.inning_start_time, 3),
                 "inning_end_time": round(result.inning_end_time, 3),
                 "events": result.events,
             },
+            "reconcile_info": reconcile_info,
             "replay_trigger": asdict(replay_trigger),
             "match_payload": match_payload,
         }

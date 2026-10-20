@@ -121,6 +121,12 @@ class MatchManager:
         self.is_timer_paused: bool = False
         self.match_elapsed_sec: float = 0.0
 
+        # 직전 완료 샷 기록 (수구 색상 감지 기반 미인지 득점 자동 소급 보정용)
+        self._last_shot_player_id: Optional[str] = None
+        self._last_shot_inning: int = 1
+        self._last_shot_was_miss: bool = False
+        self._last_shot_prev_run: int = 0
+
         # 직전 샷 판정 요약 메시지 및 코드
         self.last_shot_result: Dict[str, object] = {
             "is_scored": False,
@@ -273,6 +279,7 @@ class MatchManager:
         # [불변 규칙 강제] 1번 자리(선공) = 무조건 흰공(WHITE), 2번 자리(후공) = 무조건 노란공(YELLOW)
         p1.cue_ball_color = "WHITE"
         p2.cue_ball_color = "YELLOW"
+        self._last_shot_was_miss = False
 
         self.last_shot_result = {
             "is_scored": False,
@@ -314,6 +321,116 @@ class MatchManager:
             if self.current_inning not in p2.inning_scores:
                 p2.inning_scores[self.current_inning] = 0
 
+    def reconcile_cue_ball_stroke(
+        self,
+        stroked_cue_color: str,
+        compensate_missed_score: bool = True,
+        force_sync_player: bool = True,
+    ) -> Dict[str, object]:
+        """
+        [수구 색상 감지 기반 미인지 득점 자동 보정 및 공격자 100% 동기화]
+        선수가 실제로 치는 공(수구)의 색깔("WHITE"=1번 선공 P1, "YELLOW"=2번 후공 P2)을 감지하여:
+        1) 직전 샷에서 비전이 미세 득점을 놓쳐 공타(MISS)로 판정하고 턴을 넘겼으나,
+           실제로는 득점이어서 동일한 선수가 자신의 수구("WHITE"=P1, "YELLOW"=P2)를 계속 친 경우:
+           - 누락되었던 직전 이닝 득점(+1점)과 연속 득점(Run)을 즉시 소급 복구하고,
+           - 잘못 넘어갔던 이닝/턴을 해당 선수의 원래 이닝(공격 중)으로 완벽히 되돌립니다.
+        2) 흰공 타구 = 1번 선수(P1), 노란공 타구 = 2번 선수(P2) 100% 일치:
+           - 선수가 치는 공의 색깔에 따라 해당 선수의 점수판과 이닝 기록표에 정확히 점수가 올라가도록
+             공격권(active_player_id)과 이닝 슬롯을 즉시 동기화합니다.
+        """
+        self.players["P1"].cue_ball_color = "WHITE"
+        self.players["P2"].cue_ball_color = "YELLOW"
+
+        color_upper = str(stroked_cue_color or "").strip().upper()
+        if color_upper not in ("WHITE", "YELLOW"):
+            return {
+                "compensated": False,
+                "points_compensated": 0,
+                "active_player_id": self.active_player_id,
+                "stroked_cue_color": color_upper,
+                "payload": self.get_match_payload(),
+            }
+
+        stroked_player_id = "P1" if color_upper == "WHITE" else "P2"
+
+        # Case 1: 직전 샷이 공타(MISS)로 판정되어 상대방에게 턴이 넘어갔는데,
+        # 직전 샷을 쳤던 선수가 자기 공(흰공 또는 노란공)을 계속 치는 순간 -> 누락된 +1점과 공격권 즉시 복구!
+        if (
+            compensate_missed_score
+            and self._last_shot_was_miss
+            and self._last_shot_player_id == stroked_player_id
+            and self.active_player_id != stroked_player_id
+        ):
+            target_inn = max(1, self._last_shot_inning)
+            if stroked_player_id == "P1":
+                # P1 공타 판정으로 인해 같은 이닝(target_inn)의 P2 슬롯이 임시 0점으로 열렸던 상태 정리
+                p2 = self.players["P2"]
+                if p2.inning_scores.get(target_inn, 0) == 0 and p2.innings == target_inn:
+                    p2.inning_scores.pop(target_inn, None)
+                    p2.innings = max(0, target_inn - 1)
+            else:
+                # P2 공타 판정으로 인해 다음 이닝(target_inn + 1)의 P1 슬롯이 임시 0점으로 열렸던 상태 정리
+                p1 = self.players["P1"]
+                next_inn = target_inn + 1
+                if p1.inning_scores.get(next_inn, 0) == 0 and p1.innings == next_inn:
+                    p1.inning_scores.pop(next_inn, None)
+                    p1.innings = target_inn
+
+            self.current_inning = target_inn
+            self.active_player_id = stroked_player_id
+            player = self.players[stroked_player_id]
+            player.innings = target_inn
+            player.score += 1
+            player.inning_scores[target_inn] = (
+                player.inning_scores.get(target_inn, 0) + 1
+            )
+            player.current_run = max(1, self._last_shot_prev_run + 1)
+            if player.current_run > player.high_run:
+                player.high_run = player.current_run
+
+            self._last_shot_was_miss = False
+            cue_ko = "흰공" if color_upper == "WHITE" else "노란공"
+            self.last_shot_result = {
+                "is_scored": True,
+                "points_awarded": 1,
+                "shot_type": "RETROACTIVE_3C",
+                "reason_code": "RETROACTIVE_SCORE_COMPENSATED",
+                "message": (
+                    f"수구({cue_ko}) 연속 타구 감지: 직전 미인지 득점(+1점) 자동 보정 및 "
+                    f"{player.name} 공격 유지"
+                ),
+            }
+            return {
+                "compensated": True,
+                "points_compensated": 1,
+                "active_player_id": self.active_player_id,
+                "stroked_cue_color": color_upper,
+                "payload": self.get_match_payload(),
+            }
+
+        # Case 2: 흰공 타구 = 1번 선수(P1), 노란공 타구 = 2번 선수(P2) 100% 일치 동기화
+        if force_sync_player and self.active_player_id != stroked_player_id:
+            if self.active_player_id == "P2" and stroked_player_id == "P1":
+                # 후공(P2)이 이미 현재 이닝에 타구한 기록이 있다면 다음 이닝(current_inning + 1)의 P1 차례로 진행
+                if (
+                    self._last_shot_player_id == "P2"
+                    and self._last_shot_inning == self.current_inning
+                ):
+                    self.current_inning += 1
+            self.players[self.active_player_id].current_run = 0
+            self._last_shot_was_miss = False
+            self.sync_active_player_to_current_inning(stroked_player_id)
+        else:
+            self.sync_active_player_to_current_inning(self.active_player_id)
+
+        return {
+            "compensated": False,
+            "points_compensated": 0,
+            "active_player_id": self.active_player_id,
+            "stroked_cue_color": color_upper,
+            "payload": self.get_match_payload(),
+        }
+
     def cancel_phantom_shot(self) -> Dict[str, object]:
         """
         카메라 조명 반사나 선수 손/큐대 가림으로 인해 실제 타구가 아닌 미세 흔들림이 감지되었을 때,
@@ -339,6 +456,7 @@ class MatchManager:
         if self.current_inning not in current_player.inning_scores:
             current_player.inning_scores[self.current_inning] = 0
         current_player.current_run = 0
+        self._last_shot_was_miss = False
 
         if prev_player_id == "P1":
             # 선공(P1) 턴 종료 -> 같은 이닝(current_inning)의 후공(P2) 차례
@@ -412,9 +530,11 @@ class MatchManager:
         is_scored = bool(shot_eval.get("is_scored", False))
         shot_type = str(shot_eval.get("shot_type", "MISS"))
         prev_player_id = self.active_player_id
+        prev_inning = max(1, self.current_inning)
 
-        self.current_inning = max(1, self.current_inning)
+        self.current_inning = prev_inning
         current_player = self.players[prev_player_id]
+        prev_run_before_shot = current_player.current_run
         current_player.innings = self.current_inning
         if self.current_inning not in current_player.inning_scores:
             current_player.inning_scores[self.current_inning] = 0
@@ -463,6 +583,12 @@ class MatchManager:
                     p1.inning_scores[self.current_inning] = 0
 
             event_type = "TURN_CHANGED"
+
+        # 직전 완료 샷 정보 기록 (다음 샷에서 수구 색상 감지 시 미인지 득점 소급 보정용)
+        self._last_shot_player_id = prev_player_id
+        self._last_shot_inning = prev_inning
+        self._last_shot_was_miss = not is_scored
+        self._last_shot_prev_run = prev_run_before_shot
 
         self.remaining_timer_sec = float(self.default_shot_timer)
         self.is_timer_paused = False

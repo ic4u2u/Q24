@@ -866,11 +866,11 @@ class LiveStreamReader:
                     )
                     if disp < self.VISION_START_DISP_MM:
                         continue
-                # 현재 턴 플레이어의 고유 수구 색상이 움직였을 때 최우선 선택 (맞은 공을 수구로 오인하는 현상 방지)
-                if st.color == active_expected_color:
-                    color_bonus = 3000.0
-                elif st.color in ("WHITE", "YELLOW"):
-                    color_bonus = 1000.0
+                # WHITE와 YELLOW 수구 후보에 동등한 우선순위를 부여하여(적구 RED만 후순위),
+                # 현재 점수판 턴과 무관하게 선수가 실제로 친 공(흰공 또는 노란공)을 공정하게 인식합니다.
+                if st.color in ("WHITE", "YELLOW"):
+                    tie_breaker = 5.0 if st.color == active_expected_color else 0.0
+                    color_bonus = 2000.0 + tie_breaker
                 else:
                     color_bonus = 0.0
                 moving_candidates.append((color_bonus + st.speed, bid))
@@ -909,13 +909,24 @@ class LiveStreamReader:
                 self.color_locker.set_shot_lock(True)
                 self.bulletproof_tracker.is_shot_in_progress = True
 
-                # [절대 원칙] 선공(P1=WHITE)과 후공(P2=YELLOW)의 수구 색상은 절대로 바꾸지 않으며,
-                # 공격권(active_player_id) 역시 비전 조명 노이즈로 임의 변경하지 않고 공식 경기 규칙(득점 시 유지, 공타 시 전환)을 따릅니다.
+                # [절대 원칙]
+                # 1) 흰공(WHITE) 타구 = 1번 선수(선공 P1), 노란공(YELLOW) 타구 = 2번 선수(후공 P2) 100% 일치!
+                # 2) 직전 샷에서 비전이 미세 득점을 놓쳐 턴이 넘어갔더라도, 선수가 자기 공(흰공 또는 노란공)을
+                #    계속 치는 순간 누락된 직전 점수(+1점)와 공격권이 즉시 제자리로 복구됩니다!
                 self.match_manager.players["P1"].cue_ball_color = "WHITE"
                 self.match_manager.players["P2"].cue_ball_color = "YELLOW"
-                self.match_manager.sync_active_player_to_current_inning(
-                    self.match_manager.active_player_id
-                )
+                compensated_prev_shot = False
+                if cue_state.color in ("WHITE", "YELLOW"):
+                    rec_info = self.match_manager.reconcile_cue_ball_stroke(
+                        stroked_cue_color=cue_state.color,
+                        compensate_missed_score=True,
+                        force_sync_player=True,
+                    )
+                    compensated_prev_shot = bool(rec_info.get("compensated", False))
+                else:
+                    self.match_manager.sync_active_player_to_current_inning(
+                        self.match_manager.active_player_id
+                    )
 
                 # 수구가 움직였으므로 샷 클락(카운트) 작동을 즉시 멈추고 득점 알고리즘 가동
                 self.match_manager.on_shot_started()
@@ -954,14 +965,22 @@ class LiveStreamReader:
                 }
                 active_cue_color = self.match_manager.active_cue_ball_color
                 cue_ko = COLOR_KO_LABELS.get(active_cue_color, active_cue_color)
+                if compensated_prev_shot:
+                    start_msg = (
+                        f"수구({cue_ko}) 연속 타구 감지 -> 직전 미인지 득점(+1점) 자동 복구 및 "
+                        f"{self.match_manager.active_player.name} 공격 계속 진행 중"
+                    )
+                    start_reason = "RETROACTIVE_SCORE_COMPENSATED"
+                else:
+                    start_msg = f"수구({cue_ko}) 출발 감지 - 타이머 일시정지 및 5단계 초고속 궤적 추적 중"
+                    start_reason = "CUE_MOVING"
+
                 self.match_manager.last_shot_result = {
-                    "is_scored": False,
-                    "points_awarded": 0,
+                    "is_scored": compensated_prev_shot,
+                    "points_awarded": 1 if compensated_prev_shot else 0,
                     "shot_type": "IN_PROGRESS",
-                    "reason_code": "CUE_MOVING",
-                    "message": (
-                        f"수구({cue_ko}) 출발 감지 - 타이머 일시정지 및 5단계 초고속 궤적 추적 중"
-                    ),
+                    "reason_code": start_reason,
+                    "message": start_msg,
                     "cushions_before_second_hit": 0,
                     "total_cushions": 0,
                 }
@@ -1575,6 +1594,36 @@ async def call_mcp_tool_endpoint(req: MCPToolCallRequest) -> Dict[str, Any]:
     return billiard_mcp_server.call_tool(req.name, req.arguments)
 
 
+class ReconcileCueBallRequest(BaseModel):
+    """선수가 친 수구 색상 감지 기반 미인지 득점 자동 보정 및 공격자 동기화 요청 스키마"""
+
+    stroked_cue_color: str = Field(
+        default="WHITE",
+        description="선수가 실제로 타구한 수구의 색상: WHITE | YELLOW",
+    )
+    compensate_missed_score: bool = Field(
+        default=True,
+        description="직전 샷이 공타로 판정된 후 동일 선수가 연속 타구한 경우 미인지 득점(+1점) 자동 복구 여부",
+    )
+
+
+@app.post("/api/match/reconcile-cue-ball")
+async def reconcile_cue_ball_endpoint(req: ReconcileCueBallRequest) -> Dict[str, Any]:
+    """
+    선수가 치는 공의 색깔(WHITE=P1, YELLOW=P2)을 감지하여
+    직전 미인지 득점(+1점)을 자동 소급 보정하고 현재 공격 선수를 수구 색깔에 맞게 동기화합니다.
+    """
+    res = match_manager.reconcile_cue_ball_stroke(
+        stroked_cue_color=req.stroked_cue_color,
+        compensate_missed_score=req.compensate_missed_score,
+        force_sync_player=True,
+    )
+    await ws_manager.broadcast_event(
+        "SCORE_UPDATED", dict(res["payload"])  # type: ignore[arg-type]
+    )
+    return res
+
+
 @app.post("/api/match/switch-turn")
 async def switch_player_turn() -> Dict[str, Any]:
     """선공(P1=흰공)/후공(P2=노란공)의 수구 색상은 절대 바꾸지 않고 공격권(턴)만 교대합니다."""
@@ -1634,6 +1683,17 @@ async def websocket_scoreboard_endpoint(websocket: WebSocket) -> None:
             elif action == "SWAP_PLAYERS":
                 payload = match_manager.swap_player_seats()
                 await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "RECONCILE_CUE_BALL":
+                cue_col = str(msg.get("stroked_cue_color", "WHITE"))
+                comp = bool(msg.get("compensate_missed_score", True))
+                res = match_manager.reconcile_cue_ball_stroke(
+                    stroked_cue_color=cue_col,
+                    compensate_missed_score=comp,
+                    force_sync_player=True,
+                )
+                await ws_manager.broadcast_event(
+                    "SCORE_UPDATED", dict(res["payload"])  # type: ignore[arg-type]
+                )
             elif action == "SWITCH_TURN":
                 match_manager.players["P1"].cue_ball_color = "WHITE"
                 match_manager.players["P2"].cue_ball_color = "YELLOW"

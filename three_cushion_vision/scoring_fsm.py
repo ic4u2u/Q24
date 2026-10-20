@@ -49,6 +49,7 @@ class ShotResult:
     inning_end_time: float = 0.0
     first_target_ball: Optional[BallColor] = None
     second_target_ball: Optional[BallColor] = None
+    retroactive_previous_score_compensated: bool = False
 
 
 class ThreeCushionScoringFSM:
@@ -62,10 +63,15 @@ class ThreeCushionScoringFSM:
         initial_cue_ball: BallColor = BallColor.WHITE,
         config: VisionConfig = DEFAULT_CONFIG,
         kinematics: Optional[KinematicsDetector] = None,
+        auto_compensate_missed_score: bool = True,
     ) -> None:
         self.config: VisionConfig = config
         self.assigned_cue_ball: BallColor = initial_cue_ball
         self.kinematics: KinematicsDetector = kinematics or KinematicsDetector(config=config)
+        self.auto_compensate_missed_score: bool = auto_compensate_missed_score
+        self._last_completed_cue_ball: Optional[BallColor] = None
+        self._last_completed_was_miss: bool = False
+        self.total_retroactive_compensations: int = 0
         self._reset_inning_state()
 
     def _reset_inning_state(self) -> None:
@@ -81,6 +87,7 @@ class ThreeCushionScoringFSM:
         self.events: List[str] = []
         self.inning_start_time: float = 0.0
         self.all_stopped_since: Optional[float] = None
+        self.retroactive_compensated_in_shot: bool = False
         self.kinematics.reset()
 
     def _check_balls_in_bounds(self, balls: Dict[BallColor, TrackedBall]) -> bool:
@@ -177,7 +184,8 @@ class ThreeCushionScoringFSM:
         other_balls = [b for c, b in balls.items() if c != self.assigned_cue_ball]
 
         # ------------------------------------------------------------------
-        # 1. IDLE 상태: 지정 수구의 스트로크 출발(>= 180.0 mm/s) 또는 파울 출발 감시
+        # 1. IDLE 상태: 지정 수구의 스트로크 출발(>= 180.0 mm/s) 또는
+        #    수구 색상 감지 기반 미인지 득점 자동 보정 / 파울 출발 감시
         # ------------------------------------------------------------------
         if self.state == ShotState.IDLE:
             if cue.speed >= self.config.STROKE_START_SPEED_MM_S:
@@ -190,13 +198,41 @@ class ThreeCushionScoringFSM:
             else:
                 for ob in other_balls:
                     if ob.speed >= self.config.STROKE_START_SPEED_MM_S:
-                        self.state = ShotState.NO_SCORE_LOCKED
-                        self.inning_start_time = timestamp
-                        self.fail_reason = FailReason.WRONG_CUE_BALL_FOUL.value
-                        self.events.append(
-                            f"[{timestamp:.3f}s] WRONG_CUE_BALL_FOUL (moved={ob.color.value}, "
-                            f"expected={self.assigned_cue_ball.value})"
-                        )
+                        # [핵심] 선수가 치는 공의 색깔(WHITE 또는 YELLOW)을 감지하여
+                        # 직전 샷에서 득점 인지를 못해 턴이 넘어갔던 경우 미인지 득점(+1점)을 자동 보정하고 수구를 복원!
+                        if (
+                            self.auto_compensate_missed_score
+                            and ob.color in (BallColor.WHITE, BallColor.YELLOW)
+                        ):
+                            if (
+                                self._last_completed_was_miss
+                                and self._last_completed_cue_ball == ob.color
+                            ):
+                                self.retroactive_compensated_in_shot = True
+                                self.total_retroactive_compensations += 1
+                                self.assigned_cue_ball = ob.color
+                                self.state = ShotState.IN_PLAY
+                                self.inning_start_time = timestamp
+                                self.events.append(
+                                    f"[{timestamp:.3f}s] RETROACTIVE_SCORE_COMPENSATED "
+                                    f"(cue={ob.color.value}, speed={ob.speed:.1f}mm/s)"
+                                )
+                            else:
+                                self.assigned_cue_ball = ob.color
+                                self.state = ShotState.IN_PLAY
+                                self.inning_start_time = timestamp
+                                self.events.append(
+                                    f"[{timestamp:.3f}s] CUE_COLOR_SYNCED_STROKE_START "
+                                    f"(cue={ob.color.value}, speed={ob.speed:.1f}mm/s)"
+                                )
+                        else:
+                            self.state = ShotState.NO_SCORE_LOCKED
+                            self.inning_start_time = timestamp
+                            self.fail_reason = FailReason.WRONG_CUE_BALL_FOUL.value
+                            self.events.append(
+                                f"[{timestamp:.3f}s] WRONG_CUE_BALL_FOUL (moved={ob.color.value}, "
+                                f"expected={self.assigned_cue_ball.value})"
+                            )
                         break
 
             # 만약 출발 직후 같은 프레임에서 쿠션/접촉 검사를 위한 초기 위치를 KinematicsDetector에 동기화
@@ -256,6 +292,7 @@ class ThreeCushionScoringFSM:
         노카운트(scored == False)인 경우 다음 이닝의 assigned_cue_ball을 상대방 수구로 자동 교대합니다.
         """
         scored = self.state == ShotState.VALID_SCORE_PENDING
+        completed_cue_ball = self.assigned_cue_ball
 
         if not scored and self.fail_reason == FailReason.NONE.value:
             if self.first_target_ball is None:
@@ -270,7 +307,7 @@ class ThreeCushionScoringFSM:
 
         result = ShotResult(
             scored=scored,
-            cue_ball=self.assigned_cue_ball,
+            cue_ball=completed_cue_ball,
             cushions_before_second_ball=self.cushions_at_second_ball,
             total_cushions=self.cushion_count,
             is_bank_shot=self.is_bank_shot if scored else False,
@@ -280,7 +317,11 @@ class ThreeCushionScoringFSM:
             inning_end_time=end_timestamp,
             first_target_ball=self.first_target_ball,
             second_target_ball=self.second_target_ball,
+            retroactive_previous_score_compensated=self.retroactive_compensated_in_shot,
         )
+
+        self._last_completed_cue_ball = completed_cue_ball
+        self._last_completed_was_miss = not scored
 
         # 노카운트 시 다음 이닝의 수구(assigned_cue_ball)를 상대방 수구(WHITE <-> YELLOW)로 자동 교대
         if not scored:
