@@ -203,6 +203,109 @@ def test_7_gpt_occlusion_cushion_bounce_and_blob_merge():
     )
 
 
+def test_8_immediate_score_on_second_ball_hit_without_duplicate():
+    """
+    8. [신규 검증] 3쿠션 이상 충족 상태에서 제2적구(YELLOW) 충돌 시점(t=1.50s)에
+    공이 아직 멈추기 전(speed > 0)임에도 즉시 득점 콜백(on_immediate_score) 및 update() 반환이 발생하여
+    점수판에 +1점이 즉시 반영되고, 이후 공이 완전히 멈춘 시점(t>=2.00s)에는
+    already_dispatched=True로 구분되어 중복으로 점수가 추가되지 않는지 검증합니다.
+    """
+    scoreboard = {"score": 0, "callback_times": [], "callback_speeds": []}
+    fsm_ref: List[CausalKissSafeFSM] = []
+
+    def on_immediate_score_cb(res: ShotResult) -> None:
+        if res.scored and not res.already_dispatched:
+            scoreboard["score"] += 1
+            cur_fsm = fsm_ref[0]
+            last_snap = cur_fsm.history[-1]
+            cue_speed = float(
+                (last_snap.vel[BallColor.WHITE][0] ** 2 + last_snap.vel[BallColor.WHITE][1] ** 2) ** 0.5
+            )
+            scoreboard["callback_times"].append(round(last_snap.t, 3))
+            scoreboard["callback_speeds"].append(round(cue_speed, 1))
+
+    fsm = CausalKissSafeFSM(
+        fps=60.0,
+        assigned_cue_ball=BallColor.WHITE,
+        on_immediate_score=on_immediate_score_cb,
+    )
+    fsm_ref.append(fsm)
+
+    kf = [
+        (0.00, (400, 700),   (1800, 500), (800, 700)),
+        (0.20, (740, 700),   (1800, 500), (800, 700)),   # 제1적구(RED) 타격
+        (0.45, (1200, 35),   (1800, 500), (1742, 500)),  # 1쿠션(TOP)
+        (0.80, (2805, 500),  (2100, 500), (1700, 520)),  # 2쿠션(RIGHT)
+        (1.15, (2300, 1385), (2100, 500), (1700, 520)),  # 3쿠션(BOTTOM)
+        (1.50, (2100, 558),  (2100, 500), (1700, 520)),  # t=1.50s: 제2적구(YELLOW) 충돌! (공은 계속 주행 중)
+        (2.00, (1950, 320),  (2100, 360), (1700, 520)),  # t=2.00s까지 계속 굴러간 뒤 정지
+    ]
+
+    dt = 1.0 / 60.0
+    immediate_update_return: Optional[ShotResult] = None
+    immediate_update_time: Optional[float] = None
+
+    for i in range(len(kf) - 1):
+        t0, w0, y0, r0 = kf[i]
+        t1, w1, y1, r1 = kf[i + 1]
+        steps = max(int(round((t1 - t0) / dt)), 1)
+        for s in range(steps):
+            a = s / steps
+            t = t0 + (t1 - t0) * a
+            coords = {
+                BallColor.WHITE: (w0[0] + (w1[0] - w0[0]) * a, w0[1] + (w1[1] - w0[1]) * a),
+                BallColor.YELLOW: (y0[0] + (y1[0] - y0[0]) * a, y0[1] + (y1[1] - y0[1]) * a),
+                BallColor.RED: (r0[0] + (r1[0] - r0[0]) * a, r0[1] + (r1[1] - r0[1]) * a),
+            }
+            step_res = fsm.update(t, coords)
+            if step_res is not None and not step_res.already_dispatched:
+                immediate_update_return = step_res
+                immediate_update_time = round(t, 3)
+
+    # 1) 공이 멈추기 전(t=1.50s 부근, 주행 중 speed > 0)에 이미 즉시 득점 콜백과 update() 반환이 완료되었는지 검증
+    assert len(scoreboard["callback_times"]) == 1, f"즉시 득점 콜백이 정확히 1회 호출되어야 합니다: {scoreboard}"
+    assert scoreboard["score"] == 1, "제2적구 충돌 즉시 점수판 점수가 +1 되어야 합니다."
+    assert scoreboard["callback_speeds"][0] > 100.0, (
+        f"공이 아직 멈추기 전(speed > 0)에 즉시 득점이 호출되어야 합니다: speed={scoreboard['callback_speeds'][0]}"
+    )
+    assert 1.45 <= scoreboard["callback_times"][0] <= 1.60, (
+        f"제2적구 충돌 시점(t≈1.50s)에 즉시 호출되어야 합니다: t={scoreboard['callback_times'][0]}"
+    )
+    assert immediate_update_return is not None and immediate_update_return.scored is True
+    assert immediate_update_return.already_dispatched is False
+    assert fsm.score_dispatched is True
+
+    # 2) 이후 t=2.00s 이후 공들이 완전히 멈출 때까지 진행했을 때 중복으로 +1점이 더 올라가지 않는지 검증
+    last_t, w_end, y_end, r_end = kf[-1]
+    final_stop_res: Optional[ShotResult] = None
+    for s in range(1, 35):
+        res = fsm.update(
+            last_t + s * dt,
+            {
+                BallColor.WHITE: w_end,
+                BallColor.YELLOW: y_end,
+                BallColor.RED: r_end,
+            },
+        )
+        if res is not None:
+            final_stop_res = res
+            # 상위 브릿지/UI는 already_dispatched == False일 때만 점수를 올림
+            if res.scored and not res.already_dispatched:
+                scoreboard["score"] += 1
+            break
+
+    assert final_stop_res is not None, "공 정지 시점에 _finalize_shot 결과가 반환되어야 합니다."
+    assert final_stop_res.scored is True
+    assert final_stop_res.already_dispatched is True, "공 정지 시점에는 already_dispatched=True여야 합니다."
+    assert scoreboard["score"] == 1, f"공이 완전히 멈춘 후 중복 득점이 발생하면 안 됩니다: score={scoreboard['score']}"
+    assert len(scoreboard["callback_times"]) == 1, "공 정지 시점에 on_immediate_score가 중복 호출되면 안 됩니다."
+    print(
+        f"[PASS] Test 8: 제2적구 충돌 시점(t={scoreboard['callback_times'][0]}s, "
+        f"주행속도={scoreboard['callback_speeds'][0]}mm/s > 0, update반환 t={immediate_update_time}s) "
+        f"즉시 +1점 반영 및 정지 시점(t>=2.00s) 중복 가산 차단 완료 (최종 점수={scoreboard['score']}점)"
+    )
+
+
 if __name__ == "__main__":
     test_1_object_ball_kiss_then_near_miss()
     test_2_cluster_rehit_first_target()
@@ -211,4 +314,5 @@ if __name__ == "__main__":
     test_5_double_hit_push_foul()
     test_6_blob_merging_centroid_shift_immunity()
     test_7_gpt_occlusion_cushion_bounce_and_blob_merge()
-    print("\n=== 7대 핵심 시나리오 테스트 전체 PASS 완료! ===")
+    test_8_immediate_score_on_second_ball_hit_without_duplicate()
+    print("\n=== 8대 핵심 시나리오 테스트 전체 PASS 완료! ===")

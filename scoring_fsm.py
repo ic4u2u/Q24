@@ -18,12 +18,15 @@ from three_cushion_vision.causal_kiss_fsm import (
 )
 from three_cushion_vision.scoring_fsm import ThreeCushionScoringFSM
 
+BallID = BallColor
+
 __all__ = [
     "BALL_DIAM",
     "BALL_R",
     "TABLE_H",
     "TABLE_W",
     "BallColor",
+    "BallID",
     "CausalKissSafeFSM",
     "FrameSnapshot",
     "Rail",

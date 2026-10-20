@@ -231,7 +231,7 @@ class LocalPhysics3CushionAI:
     ) -> List[Tuple[int, str]]:
         """
         단일 공의 시계열 궤적 리스트(traj)에서 max_step_idx 이전에 발생한
-        유효 쿠션 반사(레일 마진 진입 + 법선 속도 부호 반전) 목록을 추출합니다.
+        유효 쿠션 반사(슈미트 트리거 히스테리시스 + 법선 속도 부호 반전 + 코너 핑퐁 방지) 목록을 추출합니다.
         """
         cushions: List[Tuple[int, str]] = []
         if len(traj) < 3 or max_step_idx <= 1:
@@ -239,14 +239,39 @@ class LocalPhysics3CushionAI:
 
         limit = min(len(traj) - 1, max_step_idx)
         approaching = {"LEFT": False, "RIGHT": False, "TOP": False, "BOTTOM": False}
+        rail_armed = {"LEFT": True, "RIGHT": True, "TOP": True, "BOTTOM": True}
         last_rail: Optional[str] = None
+        last_hit_pos: Optional[Point2D] = None
         last_frame_by_rail = {"LEFT": -999, "RIGHT": -999, "TOP": -999, "BOTTOM": -999}
 
-        # 모션 블러 시 레일 근처에서 프레임이 샘플링될 때를 대비한 유효 반사 경계 (165mm / 135mm)
-        eff_left = max(left_bound, 165.0)
-        eff_right = min(right_bound, settings.TABLE_WIDTH_MM - 165.0)
-        eff_top = max(top_bound, 135.0)
-        eff_bottom = min(bottom_bound, settings.TABLE_HEIGHT_MM - 135.0)
+        # 모션 블러 시 레일 근처에서 프레임이 샘플링될 때를 대비한 유효 반사 경계 (145mm / 115mm)
+        eff_left = max(left_bound, 145.0)
+        eff_right = min(right_bound, settings.TABLE_WIDTH_MM - 145.0)
+        eff_top = max(top_bound, 115.0)
+        eff_bottom = min(bottom_bound, settings.TABLE_HEIGHT_MM - 115.0)
+        exit_hysteresis = 92.0
+        min_same_rail_travel = 80.0
+        min_corner_travel = 22.0
+        per_rail_cooldown = 9
+
+        def _try_register(rail_name: str, idx: int, pt: Point2D, prev_vel: Point2D, curr_vel: Point2D) -> None:
+            nonlocal last_rail, last_hit_pos
+            if not rail_armed[rail_name]:
+                return
+            if last_frame_by_rail[rail_name] >= 0 and (idx - last_frame_by_rail[rail_name]) < per_rail_cooldown:
+                return
+            if last_hit_pos is not None:
+                travel_d = math.hypot(pt[0] - last_hit_pos[0], pt[1] - last_hit_pos[1])
+                if last_rail == rail_name and travel_d < min_same_rail_travel:
+                    return
+                if last_rail != rail_name and travel_d < min_corner_travel:
+                    return
+            if self.verify_cushion_impulse(rail_name, pt, prev_vel, curr_vel):
+                cushions.append((idx, rail_name))
+                last_rail = rail_name
+                last_hit_pos = pt
+                last_frame_by_rail[rail_name] = idx
+                rail_armed[rail_name] = False
 
         for idx in range(1, limit + 1):
             x_prev, y_prev = traj[idx - 1]
@@ -258,24 +283,39 @@ class LocalPhysics3CushionAI:
             prev_vel = (prev_vx, prev_vy)
             curr_vel = (vx, vy)
 
+            # 비물리적 순간이동(Teleportation Outlier > 350mm/frame) 시 쿠션 판정 배제
+            if math.hypot(vx, vy) > 350.0 or math.hypot(prev_vx, prev_vy) > 350.0:
+                for rk in approaching:
+                    approaching[rk] = False
+                continue
+
+            # 슈미트 트리거 히스테리시스 재무장(Re-arm) 검사
+            travel_from_last = (
+                math.hypot(x - last_hit_pos[0], y - last_hit_pos[1])
+                if last_hit_pos is not None
+                else 9999.0
+            )
+            rail_dists = {
+                "LEFT": x,
+                "RIGHT": settings.TABLE_WIDTH_MM - x,
+                "TOP": y,
+                "BOTTOM": settings.TABLE_HEIGHT_MM - y,
+            }
+            for r_name, d_r in rail_dists.items():
+                if not rail_armed[r_name]:
+                    if d_r >= exit_hysteresis or travel_from_last >= min_same_rail_travel:
+                        rail_armed[r_name] = True
+
             # LEFT
             if x <= eff_left:
                 if vx < -0.5 or prev_vx < -0.5:
                     approaching["LEFT"] = True
                 if approaching["LEFT"] and vx > 0.5:
-                    if last_rail != "LEFT" and (idx - last_frame_by_rail["LEFT"]) > 2:
-                        if self.verify_cushion_impulse("LEFT", (x, y), prev_vel, curr_vel):
-                            cushions.append((idx, "LEFT"))
-                            last_rail = "LEFT"
-                            last_frame_by_rail["LEFT"] = idx
+                    _try_register("LEFT", idx, (x, y), prev_vel, curr_vel)
                     approaching["LEFT"] = False
             else:
-                if approaching["LEFT"] and vx > 0.5:
-                    if last_rail != "LEFT" and (idx - last_frame_by_rail["LEFT"]) > 2:
-                        if self.verify_cushion_impulse("LEFT", (x, y), prev_vel, curr_vel):
-                            cushions.append((idx, "LEFT"))
-                            last_rail = "LEFT"
-                            last_frame_by_rail["LEFT"] = idx
+                if approaching["LEFT"] and vx > 0.5 and x <= eff_left + 25.0:
+                    _try_register("LEFT", idx, (x, y), prev_vel, curr_vel)
                 approaching["LEFT"] = False
 
             # RIGHT
@@ -283,19 +323,11 @@ class LocalPhysics3CushionAI:
                 if vx > 0.5 or prev_vx > 0.5:
                     approaching["RIGHT"] = True
                 if approaching["RIGHT"] and vx < -0.5:
-                    if last_rail != "RIGHT" and (idx - last_frame_by_rail["RIGHT"]) > 2:
-                        if self.verify_cushion_impulse("RIGHT", (x, y), prev_vel, curr_vel):
-                            cushions.append((idx, "RIGHT"))
-                            last_rail = "RIGHT"
-                            last_frame_by_rail["RIGHT"] = idx
+                    _try_register("RIGHT", idx, (x, y), prev_vel, curr_vel)
                     approaching["RIGHT"] = False
             else:
-                if approaching["RIGHT"] and vx < -0.5:
-                    if last_rail != "RIGHT" and (idx - last_frame_by_rail["RIGHT"]) > 2:
-                        if self.verify_cushion_impulse("RIGHT", (x, y), prev_vel, curr_vel):
-                            cushions.append((idx, "RIGHT"))
-                            last_rail = "RIGHT"
-                            last_frame_by_rail["RIGHT"] = idx
+                if approaching["RIGHT"] and vx < -0.5 and x >= eff_right - 25.0:
+                    _try_register("RIGHT", idx, (x, y), prev_vel, curr_vel)
                 approaching["RIGHT"] = False
 
             # TOP
@@ -303,19 +335,11 @@ class LocalPhysics3CushionAI:
                 if vy < -0.5 or prev_vy < -0.5:
                     approaching["TOP"] = True
                 if approaching["TOP"] and vy > 0.5:
-                    if last_rail != "TOP" and (idx - last_frame_by_rail["TOP"]) > 2:
-                        if self.verify_cushion_impulse("TOP", (x, y), prev_vel, curr_vel):
-                            cushions.append((idx, "TOP"))
-                            last_rail = "TOP"
-                            last_frame_by_rail["TOP"] = idx
+                    _try_register("TOP", idx, (x, y), prev_vel, curr_vel)
                     approaching["TOP"] = False
             else:
-                if approaching["TOP"] and vy > 0.5:
-                    if last_rail != "TOP" and (idx - last_frame_by_rail["TOP"]) > 2:
-                        if self.verify_cushion_impulse("TOP", (x, y), prev_vel, curr_vel):
-                            cushions.append((idx, "TOP"))
-                            last_rail = "TOP"
-                            last_frame_by_rail["TOP"] = idx
+                if approaching["TOP"] and vy > 0.5 and y <= eff_top + 25.0:
+                    _try_register("TOP", idx, (x, y), prev_vel, curr_vel)
                 approaching["TOP"] = False
 
             # BOTTOM
@@ -323,19 +347,11 @@ class LocalPhysics3CushionAI:
                 if vy > 0.5 or prev_vy > 0.5:
                     approaching["BOTTOM"] = True
                 if approaching["BOTTOM"] and vy < -0.5:
-                    if last_rail != "BOTTOM" and (idx - last_frame_by_rail["BOTTOM"]) > 2:
-                        if self.verify_cushion_impulse("BOTTOM", (x, y), prev_vel, curr_vel):
-                            cushions.append((idx, "BOTTOM"))
-                            last_rail = "BOTTOM"
-                            last_frame_by_rail["BOTTOM"] = idx
+                    _try_register("BOTTOM", idx, (x, y), prev_vel, curr_vel)
                     approaching["BOTTOM"] = False
             else:
-                if approaching["BOTTOM"] and vy < -0.5:
-                    if last_rail != "BOTTOM" and (idx - last_frame_by_rail["BOTTOM"]) > 2:
-                        if self.verify_cushion_impulse("BOTTOM", (x, y), prev_vel, curr_vel):
-                            cushions.append((idx, "BOTTOM"))
-                            last_rail = "BOTTOM"
-                            last_frame_by_rail["BOTTOM"] = idx
+                if approaching["BOTTOM"] and vy < -0.5 and y >= eff_bottom - 25.0:
+                    _try_register("BOTTOM", idx, (x, y), prev_vel, curr_vel)
                 approaching["BOTTOM"] = False
 
         return cushions
@@ -355,19 +371,14 @@ class LocalPhysics3CushionAI:
         top_bound: float = 115.0,
         bottom_bound: float = 1305.0,
         failed_early: bool = False,
+        realtime_mode: bool = False,
     ) -> Dict[str, Any]:
         """
-        [물리/AI 시계열 궤적 텐서 역추적 복원기 (Post-Shot Trajectory Re-Verifier)]
+        [물리/AI 시계열 궤적 텐서 역추적 복원기 (Real-time & Post-Shot Trajectory Re-Verifier)]
         초고속 타구 시 모션 블러나 수구-제1적구 충돌 직후의 트랙 스왑으로 인해
         실시간 프레임에서 제1적구 타격 시점이 늦게 잡혔거나 제2적구 타격이 누락된 경우,
-        샷 전체의 3구 시계열 궤적 텐서(ball_trajectories)를 분석하여 실제 물리적 3쿠션 득점을 복원합니다.
-
-        복원 불변 조건 (가짜 득점 0% 보장):
-        1. 공 3개가 모두 초기 정지 위치(initial_positions) 대비 유의미하게 이동(최종 변위 >= 15.0mm 또는 최대 변위 >= 20.0mm)했어야 합니다.
-           만약 3번째 공이 전혀 움직이지 않았다면(예: < 12.0mm) 절대로 복원하지 않고 즉시 공타를 유지합니다.
-        2. 3개의 공 중 시간순으로 가장 마지막에 정지 위치를 이탈한 공(t2_step)을 제2적구로 특정하고,
-           그 최초 이탈 시점(t2_step) 이전에 주행 공(수구 또는 스왑된 수구 트랙)이 3회 이상의 유효 쿠션 반사를 기록했을 때만 복원합니다.
-           만약 3쿠션 전에 제2적구가 먼저 움직인 조기 키스(NO_SCORE_LOCKED)라면 그 뒤 3쿠션을 채워도 절대 복원하지 않습니다.
+        샷의 3구 시계열 궤적 텐서(ball_trajectories)를 분석하여 실제 물리적 3쿠션 득점을 복원합니다.
+        - realtime_mode=True 인 경우 제2적구가 충돌 직후 움직이기 시작하는 바로 그 프레임에 즉시 복원합니다.
         """
         result = {
             "first_object_ball_id": first_object_ball_id,
@@ -380,6 +391,10 @@ class LocalPhysics3CushionAI:
 
         if len(initial_positions) < 3 or len(ball_trajectories) < 3:
             return result
+
+        min_streak_req = 1 if realtime_mode else 2
+        min_sustained_req = 1 if realtime_mode else 5
+        min_disp_req = 13.5 if realtime_mode else 15.0
 
         # 각 공의 최종 순이동 변위(final_disp), 지속 이탈 프레임 수(sustained_frames), 최초 연속 이탈 스텝(first_move_step) 계산
         final_disp: Dict[int, float] = {}
@@ -399,21 +414,22 @@ class LocalPhysics3CushionAI:
             streak = 0
             for step_i, pt in enumerate(traj):
                 d = math.hypot(pt[0] - init_pt[0], pt[1] - init_pt[1])
-                if d >= 16.0:
+                if d >= (13.5 if realtime_mode else 16.0):
                     s_cnt += 1
                     streak += 1
-                    if f_step < 0 and streak >= 2:
-                        f_step = step_i - 1
+                    if f_step < 0 and streak >= min_streak_req:
+                        f_step = max(0, step_i - (min_streak_req - 1))
                 else:
                     streak = 0
             sustained_frames[bid] = s_cnt
             if f_step >= 0:
                 first_move_step[bid] = f_step
 
-        # 실제 비디오 시퀀스(traj_len > 30)에서 만약 제2적구로 지목된 공이 실제로는 제자리(final_disp < 12.0mm)에 멈춰 있고
+        # 실제 비디오 시퀀스(traj_len > 30, 정지 후 최종 판독 시점)에서 만약 제2적구로 지목된 공이 실제로는 제자리(final_disp < 12.0mm)에 멈춰 있고
         # 지속 이탈 프레임도 5프레임 미만이라면, 1~2프레임 그림자 가림 스파이크이므로 제2적구 오탐을 취소!
         if (
-            traj_len > 30
+            not realtime_mode
+            and traj_len > 30
             and second_object_ball_id is not None
             and final_disp.get(second_object_ball_id, 0.0) < 12.0
             and sustained_frames.get(second_object_ball_id, 0) < 5
@@ -431,11 +447,12 @@ class LocalPhysics3CushionAI:
         ):
             return result
 
-        # [철통 방어] 3개의 공 모두가 실제로 유의미하게 이동(최종 변위 >= 15.0mm 및 지속 이탈 >= 5프레임)하지 않았다면 절대 복원하지 않음!
+        # [철통 방어] 3개의 공 모두가 실제로 유의미하게 이동하지 않았다면 절대 복원하지 않음!
         moved_balls = [
             bid
             for bid in initial_positions.keys()
-            if final_disp.get(bid, 0.0) >= 15.0 and sustained_frames.get(bid, 0) >= 5
+            if final_disp.get(bid, 0.0) >= min_disp_req
+            and sustained_frames.get(bid, 0) >= min_sustained_req
         ]
         if len(moved_balls) < 3 or len(first_move_step) < 3:
             return result
@@ -519,7 +536,8 @@ class LocalPhysics3CushionAI:
         result["cushions_before_second_hit"] = max(
             cushions_before_second_hit, reconstructed_c_before_2nd
         )
-        result["total_cushions"] = max(total_cushions, result["cushions_before_second_hit"])
+        # 득점 확정 시 사후 쿠션을 합산하지 않고 제2적구 충돌 시점의 쿠션 수로 동결
+        result["total_cushions"] = result["cushions_before_second_hit"]
         result["reconstructed"] = True
         return result
 

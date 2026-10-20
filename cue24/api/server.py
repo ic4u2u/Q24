@@ -384,6 +384,10 @@ class LiveStreamReader:
         self._last_missing_wait_id = None
         for restorer in self.trajectory_restorers.values():
             restorer.reset()
+        self.causal_kiss_fsm = CausalKissSafeFSM(fps=max(15.0, self.video_fps))
+        self._last_causal_shot_result = None
+        self._cue_trajectory.clear()
+        self._target_trajectories.clear()
         self.vision_kinematics.reset()
         self._reset_wall_clock_sync()
 
@@ -456,9 +460,9 @@ class LiveStreamReader:
                     self._rest_positions = init_pts.copy()
                     self._vision_tracks_synced = True
 
-        # 만약 샷 도중 리플레시/초기화되었더라도 즉시 WAIT_SHOT(샷 클락 작동 및 수구 감시)으로 복귀
+        # 만약 샷 도중 리플레시/초기화되었더라도 즉시 WAIT_SHOT으로 복귀하되, 선수가 수동 일시정지를 눌러둔 상태면 그대로 유지
         self.match_manager.fsm_state = MatchState.WAIT_SHOT
-        self.match_manager.is_timer_paused = False
+        self.match_manager.is_timer_paused = self.match_manager.is_match_paused
         active_cue_ko = COLOR_KO_LABELS.get(
             self.match_manager.active_cue_ball_color, "흰공"
         )
@@ -477,12 +481,12 @@ class LiveStreamReader:
         }
         return self.match_manager.get_match_payload()
 
-    def reset_match_and_vision(self) -> Dict[str, Any]:
+    def reset_match_and_vision(self, full_factory_reset: bool = True) -> Dict[str, Any]:
         """
-        경기 초기화 버튼 클릭 또는 /api/match/reset 호출 시:
-        점수판 전체 초기화와 동시에 비전 추적 엔진 및 3구 색상 잠금을 즉시 재가동합니다.
+        [경기시작 / 경기 초기화] 클릭 또는 /api/match/reset 호출 시:
+        점수판 전체(점수, 이닝, 타이머, 선수 진영) 초기화와 동시에 비전 추적 엔진 및 3구 색상 잠금을 즉시 재가동합니다.
         """
-        self.match_manager.reset_match()
+        self.match_manager.reset_match(full_factory_reset=full_factory_reset)
         return self.sync_vision_and_lock_balls_now(seek_to_active_shot=True)
 
     @staticmethod
@@ -1177,6 +1181,7 @@ class LiveStreamReader:
             cur_vpos, cur_kdpos = self._build_vision_color_positions(
                 ball_states, use_prev=False
             )
+            maybe_causal = None
             if len(cur_vpos) == 3:
                 t_curr = self.frame_counter / fps_scale
                 maybe_causal = self.causal_kiss_fsm.update(
@@ -1201,8 +1206,67 @@ class LiveStreamReader:
                 if bid in positions_map:
                     tr_list.append(positions_map[bid])
 
-            # 주행 중 쿠션 횟수나 목적구 타격이 새로 감지되면 점수판 UI에 실시간 반영
+            # [제2적구 충돌 즉시 실시간 득점(+1) 점수판 반영]
+            # 3쿠션 이상 충족 상태에서 제2적구와 충돌한 바로 그 프레임에 공이 멈추기를 기다리지 않고 즉시 점수판에 +1점을 반영합니다!
+            causal_instant_scored = bool(
+                (
+                    maybe_causal is not None
+                    and maybe_causal.scored
+                    and not maybe_causal.already_dispatched
+                )
+                or self.causal_kiss_fsm.score_dispatched
+            )
+            engine_instant_scored = bool(
+                self.scoring_engine.fsm_state.value == "VALID_SCORE_PENDING"
+                and not self.causal_kiss_fsm.double_hit_foul
+                and (
+                    not self.causal_kiss_fsm.object_ball_kiss_occurred
+                    or self.causal_kiss_fsm.score_dispatched
+                    or self.scoring_engine.second_object_ball_id is not None
+                )
+            )
+            kinematics_instant_scored = bool(
+                getattr(self.vision_kinematics, "second_ball_hit", False)
+                and int(getattr(self.vision_kinematics, "cushions_before_second_ball", 0)) >= 3
+                and not self.causal_kiss_fsm.double_hit_foul
+                and not self.causal_kiss_fsm.object_ball_kiss_occurred
+            )
             if (
+                not self.match_manager.score_dispatched_for_current_shot
+                and not has_double_touch_foul
+                and (causal_instant_scored or engine_instant_scored or kinematics_instant_scored)
+            ):
+                is_bank = bool(
+                    (maybe_causal is not None and maybe_causal.is_bank_shot)
+                    or (
+                        self.scoring_engine.first_object_ball_id is not None
+                        and len(self.scoring_engine.events) > 0
+                        and str(self.scoring_engine.events[0].event_type) == "CUSHION_HIT"
+                    )
+                )
+                cush_at_2nd = max(
+                    int(self.scoring_engine.cushion_count_before_second_hit),
+                    int(maybe_causal.cushions_at_second_hit) if maybe_causal is not None else 3,
+                )
+                tot_cush = cush_at_2nd
+                immediate_eval = {
+                    "is_scored": True,
+                    "shot_type": "BANK_SHOT" if is_bank else "REGULAR_3C",
+                    "reason_code": "IMMEDIATE_SECOND_BALL_HIT",
+                    "message": (
+                        f"⚡ 제2적구 충돌 즉시 득점! ({cush_at_2nd}쿠션 충족 실시간 +1 반영)"
+                    ),
+                    "cushions_before_second_hit": cush_at_2nd,
+                    "total_cushions": tot_cush,
+                }
+                imm_transition = self.match_manager.on_immediate_second_ball_hit(
+                    immediate_eval
+                )
+                await self.ws_manager.broadcast_event(
+                    "SCORE_UPDATED", imm_transition["payload"]
+                )
+            # 주행 중 쿠션 횟수나 목적구 타격이 새로 감지되면 점수판 UI에 실시간 반영
+            elif (
                 self.scoring_engine.total_cushion_count != prev_cushions
                 or len(self.scoring_engine.events) != prev_events_count
             ):
@@ -1210,25 +1274,26 @@ class LiveStreamReader:
                 hit2 = "접촉완료" if self.scoring_engine.second_object_ball_id is not None else "대기"
                 fsm_val = self.scoring_engine.fsm_state.value
                 if fsm_val == "VALID_SCORE_PENDING":
-                    fsm_ko = "득점대기(3쿠션완료)"
+                    fsm_ko = "즉시득점완료(3쿠션충족)"
                 elif fsm_val == "NO_SCORE_LOCKED":
                     fsm_ko = "노카운트잠금(조기키스)"
                 else:
                     fsm_ko = "진행중"
 
-                self.match_manager.last_shot_result = {
-                    "is_scored": False,
-                    "points_awarded": 0,
-                    "shot_type": "IN_PROGRESS",
-                    "reason_code": "TRACKING",
-                    "fsm_state": fsm_val,
-                    "message": (
-                        f"실시간 추적 중[{fsm_ko}]: {self.scoring_engine.total_cushion_count}쿠션 "
-                        f"| 제1적구({hit1}) / 제2적구({hit2})"
-                    ),
-                    "cushions_before_second_hit": self.scoring_engine.cushion_count_before_second_hit,
-                    "total_cushions": self.scoring_engine.total_cushion_count,
-                }
+                if not self.match_manager.score_dispatched_for_current_shot:
+                    self.match_manager.last_shot_result = {
+                        "is_scored": False,
+                        "points_awarded": 0,
+                        "shot_type": "IN_PROGRESS",
+                        "reason_code": "TRACKING",
+                        "fsm_state": fsm_val,
+                        "message": (
+                            f"실시간 추적 중[{fsm_ko}]: {self.scoring_engine.total_cushion_count}쿠션 "
+                            f"| 제1적구({hit1}) / 제2적구({hit2})"
+                        ),
+                        "cushions_before_second_hit": self.scoring_engine.cushion_count_before_second_hit,
+                        "total_cushions": self.scoring_engine.total_cushion_count,
+                    }
                 await self.ws_manager.broadcast_event(
                     "SCORE_UPDATED", self.match_manager.get_match_payload()
                 )
@@ -1259,10 +1324,19 @@ class LiveStreamReader:
                 )
 
                 # [3체 인과 키스 분리(CausalKissSafeFSM) & Autoresearch 100% 초미세 판독 결합]
-                causal_res = self._last_causal_shot_result or self.causal_kiss_fsm._finalize_shot(
-                    self.frame_counter / fps_scale
-                )
+                if self.causal_kiss_fsm.state != CausalShotState.IDLE:
+                    causal_res = self.causal_kiss_fsm._finalize_shot(
+                        self.frame_counter / fps_scale
+                    )
+                else:
+                    causal_res = self._last_causal_shot_result or self.causal_kiss_fsm._finalize_shot(
+                        self.frame_counter / fps_scale
+                    )
                 self._last_causal_shot_result = None
+                shot_eval["already_dispatched"] = bool(
+                    causal_res.already_dispatched
+                    or self.match_manager.score_dispatched_for_current_shot
+                )
                 ob_kiss = bool(
                     causal_res.object_ball_kiss_occurred
                     or self.vision_kinematics.object_ball_kiss_occurred
@@ -1277,7 +1351,30 @@ class LiveStreamReader:
                 )
                 shot_eval["causal_event_log"] = list(causal_res.event_log)
 
-                if causal_res.double_hit_foul and not has_double_touch_foul:
+                # [원칙 1] 제2적구 충돌 순간 이미 점수판에 +1점이 올라간 샷(already_dispatched=True)이나
+                # ScoringEngine이 유효 3쿠션 득점으로 판정한 샷은 사후 '3체 인과 판독'이 절대 노득점으로 뒤집지 않음!
+                if bool(shot_eval.get("already_dispatched", False)):
+                    shot_eval["is_scored"] = True
+                    if str(shot_eval.get("shot_type", "")) not in ("REGULAR_3C", "BANK_SHOT"):
+                        shot_eval["shot_type"] = "REGULAR_3C"
+                    if not str(shot_eval.get("reason_code", "")).startswith("VALID_"):
+                        shot_eval["reason_code"] = (
+                            "VALID_BANK_SHOT"
+                            if shot_eval["shot_type"] == "BANK_SHOT"
+                            else "VALID_REGULAR_3C"
+                        )
+                    c_b2 = max(3, int(shot_eval.get("cushions_before_second_hit", 3)))
+                    shot_eval["cushions_before_second_hit"] = c_b2
+                    shot_eval["total_cushions"] = c_b2
+                    if "득점" not in str(shot_eval.get("message", "")):
+                        shot_eval["message"] = (
+                            f"득점 인정 (일반 3쿠션): 총 {c_b2}쿠션 후 제2적구 충돌 성공!"
+                        )
+                elif (
+                    not bool(shot_eval.get("is_scored", False))
+                    and causal_res.double_hit_foul
+                    and not has_double_touch_foul
+                ):
                     shot_eval["is_scored"] = False
                     shot_eval["shot_type"] = "FOUL"
                     shot_eval["reason_code"] = "DOUBLE_HIT_FOUL"
@@ -1285,7 +1382,7 @@ class LiveStreamReader:
                         "파울 (투터치/밀어치기 감지): 근접 충돌 직후 수구 재가속·비정상 추격 차단"
                     )
 
-                # 1) 0.3mm 초미세 스침 / 시속 35km 고속 코너 반사 등 기존 엔진 미탐지 득점을 정밀 구출
+                # 0.3mm 초미세 스침 / 시속 35km 고속 코너 반사 등 기존 엔진 미탐지 득점을 정밀 구출
                 if (
                     not bool(shot_eval.get("is_scored", False))
                     and not has_double_touch_foul
@@ -1304,34 +1401,10 @@ class LiveStreamReader:
                         int(shot_eval.get("cushions_before_second_hit", 0)),
                         int(causal_res.cushions_at_second_hit),
                     )
-                    shot_eval["total_cushions"] = max(
-                        int(shot_eval.get("total_cushions", 0)),
-                        int(causal_res.total_cushions),
-                    )
+                    shot_eval["total_cushions"] = int(shot_eval["cushions_before_second_hit"])
                     shot_eval["message"] = (
-                        f"득점 인정 (초미세 인과 판독): "
+                        f"득점 인정 (초미세 판독): "
                         f"{shot_eval['cushions_before_second_hit']}쿠션 후 제2적구 충돌 성공!"
-                    )
-                # 2) 1적구-2적구 간 키스가 발생했으나 수구가 제2적구를 맞히지 않고 스쳐 지나간 착시(오류 1~3)를 원천 차단
-                elif (
-                    bool(shot_eval.get("is_scored", False))
-                    and causal_res.object_ball_kiss_occurred
-                    and not causal_res.scored
-                ):
-                    shot_eval["is_scored"] = False
-                    shot_eval["shot_type"] = "MISS"
-                    shot_eval["reason_code"] = "CAUSAL_KISS_ILLUSION_BLOCKED"
-                    shot_eval["message"] = (
-                        "노카운트 (3체 인과 판독): 1적구-2적구 키스 후 수구 제2적구 미접촉 착시 차단"
-                    )
-
-                if (
-                    bool(shot_eval.get("is_scored", False))
-                    and causal_res.object_ball_kiss_occurred
-                    and "적구 간 키스" not in str(shot_eval.get("message", ""))
-                ):
-                    shot_eval["message"] = (
-                        f"{shot_eval.get('message', '')} [3체 인과 판독: 적구 간 키스 분리 정상 득점]"
                     )
 
                 # [유령 샷(Phantom Trigger) 필터]
@@ -1414,6 +1487,7 @@ class LiveStreamReader:
             if (
                 self.match_manager.fsm_state == MatchState.WAIT_SHOT
                 and not self.match_manager.is_timer_paused
+                and not self.match_manager.is_match_paused
             ):
                 self.match_manager.tick_timer(1.0)
                 if self.match_manager.remaining_timer_sec <= 0.0:
@@ -1434,8 +1508,8 @@ class LiveStreamReader:
                     await self.ws_manager.broadcast_event(
                         "SCORE_UPDATED", self.match_manager.get_match_payload()
                     )
-            else:
-                # 샷 주행 중(SHOT_IN_PROGRESS)이거나 일시정지 중일 때도 누적 경기 시간은 1초씩 증가
+            elif not self.match_manager.is_match_paused:
+                # 샷 주행 중(SHOT_IN_PROGRESS)에는 누적 경기 시간만 1초씩 증가 (선수 수동 일시정지 중에는 멈춤!)
                 self.match_manager.tick_match_elapsed(1.0)
 
 
@@ -1456,10 +1530,11 @@ class AdjustScoreRequest(BaseModel):
 
 
 class PlayerNameRequest(BaseModel):
-    """선수 이름 변경 요청 스키마"""
+    """선수 이름 및 핸디 변경 요청 스키마"""
 
     player_id: str = Field(default="P1", description="P1 또는 P2")
     name: str = Field(default="1번 선수", description="변경할 선수 이름")
+    handicap: Optional[int] = Field(default=None, description="변경할 선수 핸디 점수")
 
 
 class RuleModeRequest(BaseModel):
@@ -1571,8 +1646,40 @@ async def adjust_player_score(req: AdjustScoreRequest) -> Dict[str, Any]:
 
 @app.post("/api/match/player-name")
 async def update_player_name(req: PlayerNameRequest) -> Dict[str, Any]:
-    """1번 선수(P1) 또는 2번 선수(P2)의 이름을 변경하고 모든 태블릿에 브로드캐스트합니다."""
-    payload = match_manager.set_player_name(req.player_id, req.name)
+    """1번 선수(P1) 또는 2번 선수(P2)의 이름(및 핸디)을 변경하고 모든 태블릿에 브로드캐스트합니다."""
+    payload = match_manager.set_player_name(req.player_id, req.name, req.handicap)
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return payload
+
+
+@app.post("/api/match/swap-player-names")
+async def swap_player_names_only_endpoint() -> Dict[str, Any]:
+    """[선수변경] 좌우 당구공 색상(흰공/노란공) 위치는 그대로 두고 좌우 선수의 이름(및 핸디)만 맞바꿉니다."""
+    payload = match_manager.swap_player_names_only()
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return payload
+
+
+@app.post("/api/match/swap-seats-full")
+async def swap_seats_and_balls_endpoint() -> Dict[str, Any]:
+    """[자리바꿈] 좌우 선수의 이름과 당구공 색깔(흰공/노란공 및 해당 진영의 점수·기록 상태)이 함께 통째로 좌우 위치가 바뀌도록 스왑합니다."""
+    payload = match_manager.swap_seats_with_balls()
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return payload
+
+
+@app.post("/api/match/pause")
+async def toggle_match_pause_endpoint() -> Dict[str, Any]:
+    """[일시정지] 경기 및 샷 클락 타이머 일시정지/재개 상태를 토글합니다."""
+    payload = match_manager.toggle_pause_match()
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return payload
+
+
+@app.post("/api/match/end")
+async def end_match_endpoint() -> Dict[str, Any]:
+    """[경기종료] 현재 경기를 종료 처리하고 결과를 브로드캐스트합니다."""
+    payload = match_manager.end_match()
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
     return payload
 
@@ -1810,7 +1917,14 @@ async def simulate_shot(req: SimulateShotRequest) -> Dict[str, Any]:
             "total_cushions": 2,
         }
 
-    # 2. 공 3개 완전 정지(BALL_STOPPED) 판정 반영 및 직전 샷 리플레이 클립 Lock
+    # 2. 득점 인정 시 제2적구 충돌 즉시(+1점) 점수판에 선반영 후, 공 정지 시점에는 중복 가산 없이 상태만 정리
+    if bool(shot_eval.get("is_scored", False)):
+        imm_transition = match_manager.on_immediate_second_ball_hit(shot_eval)
+        await ws_manager.broadcast_event(
+            "SCORE_UPDATED", dict(imm_transition["payload"])  # type: ignore[arg-type]
+        )
+        shot_eval["already_dispatched"] = True
+
     transition = match_manager.on_ball_stopped(shot_eval)
     replay_meta = stream_reader.replay_buffer.lock_last_shot(
         shot_type=str(shot_eval["shot_type"]),
@@ -1943,7 +2057,24 @@ async def websocket_scoreboard_endpoint(websocket: WebSocket) -> None:
             elif action == "SET_PLAYER_NAME":
                 pid = str(msg.get("player_id", "P1"))
                 new_name = str(msg.get("name", ""))
-                payload = match_manager.set_player_name(pid, new_name)
+                handicap_val = msg.get("handicap")
+                handicap_int = int(handicap_val) if handicap_val is not None else None
+                payload = match_manager.set_player_name(pid, new_name, handicap_int)
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "SWAP_PLAYER_NAMES":
+                payload = match_manager.swap_player_names_only()
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "SWAP_SEATS_FULL":
+                payload = match_manager.swap_seats_with_balls()
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "START_MATCH":
+                payload = stream_reader.reset_match_and_vision()
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "END_MATCH":
+                payload = match_manager.end_match()
+                await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+            elif action == "TOGGLE_PAUSE":
+                payload = match_manager.toggle_pause_match()
                 await ws_manager.broadcast_event("SCORE_UPDATED", payload)
             elif action == "SWAP_PLAYERS":
                 payload = match_manager.swap_player_seats()

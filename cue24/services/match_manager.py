@@ -119,6 +119,7 @@ class MatchManager:
         # 샷 타이머 관리 (초 단위) 및 경기 시작부터 누적 경과 타이머 (초 단위)
         self.remaining_timer_sec: float = float(self.default_shot_timer)
         self.is_timer_paused: bool = False
+        self.is_match_paused: bool = False
         self.match_elapsed_sec: float = 0.0
 
         # 직전 완료 샷 기록 (수구 색상 감지 기반 미인지 득점 자동 소급 보정용)
@@ -126,6 +127,7 @@ class MatchManager:
         self._last_shot_inning: int = 1
         self._last_shot_was_miss: bool = False
         self._last_shot_prev_run: int = 0
+        self.score_dispatched_for_current_shot: bool = False
 
         # 직전 샷 판정 요약 메시지 및 코드
         self.last_shot_result: Dict[str, object] = {
@@ -160,11 +162,22 @@ class MatchManager:
         p1_name: Optional[str] = None,
         p2_name: Optional[str] = None,
         rule_mode: Optional[str] = None,
+        full_factory_reset: bool = False,
     ) -> Dict[str, object]:
         """경기 전체 기록 및 타이머를 초기 상태로 리셋합니다."""
-        name1 = p1_name or self.players["P1"].name
-        name2 = p2_name or self.players["P2"].name
-        mode = rule_mode or self.rule_mode
+        if full_factory_reset:
+            name1 = "PLAYER 1"
+            name2 = "PLAYER 2"
+            mode = "STANDARD"
+            p1_handicap = self.target_score
+            p2_handicap = self.target_score
+        else:
+            name1 = p1_name or self.players["P1"].name
+            name2 = p2_name or self.players["P2"].name
+            mode = rule_mode or self.rule_mode
+            p1_handicap = self.players["P1"].target_score
+            p2_handicap = self.players["P2"].target_score
+
         self.__init__(
             p1_name=name1,
             p2_name=name2,
@@ -172,6 +185,8 @@ class MatchManager:
             target_score=self.target_score,
             rule_mode=mode,
         )
+        self.players["P1"].target_score = p1_handicap
+        self.players["P2"].target_score = p2_handicap
         return self.get_match_payload()
 
     def set_rule_mode(self, rule_mode: str) -> Dict[str, object]:
@@ -210,10 +225,11 @@ class MatchManager:
         player.inning_scores[inning_idx] = max(0, prev_inning_pts + actual_delta)
         return self.get_match_payload()
 
-    def set_player_name(self, player_id: str, new_name: str) -> Dict[str, object]:
+    def set_player_name(
+        self, player_id: str, new_name: str, handicap: Optional[int] = None
+    ) -> Dict[str, object]:
         """
-        1번 선수(P1) 또는 2번 선수(P2)의 이름을 변경합니다.
-        선공(P1)=WHITE, 후공(P2)=YELLOW 수구 색상 불변 규칙은 그대로 유지합니다.
+        1번 선수(P1) 또는 2번 선수(P2)의 이름(및 핸디)을 변경합니다.
         """
         pid = player_id.upper()
         if pid not in self.players:
@@ -222,14 +238,114 @@ class MatchManager:
         if not cleaned:
             cleaned = "1번 선수" if pid == "P1" else "2번 선수"
         self.players[pid].name = cleaned
-        self.players["P1"].cue_ball_color = "WHITE"
-        self.players["P2"].cue_ball_color = "YELLOW"
+        if handicap is not None and int(handicap) > 0:
+            self.players[pid].target_score = int(handicap)
         self.last_shot_result = {
             "is_scored": False,
             "points_awarded": 0,
             "shot_type": "READY",
             "reason_code": "PLAYER_NAME_CHANGED",
-            "message": f"선수 이름이 '{cleaned}'(으)로 변경되었습니다.",
+            "message": f"선수 정보가 '{cleaned}' (핸디 {self.players[pid].target_score})로 변경되었습니다.",
+        }
+        return self.get_match_payload()
+
+    def swap_player_names_only(self) -> Dict[str, object]:
+        """
+        [선수변경 버튼 동작]
+        좌·우측에 배치된 당구공 색상(흰공 / 노란공) 및 현재 위치의 점수/기록은 그대로 두고,
+        좌우 선수의 이름(및 핸디)만 서로 좌우로 맞바꿉니다.
+        """
+        p1, p2 = self.players["P1"], self.players["P2"]
+        n1 = "1번 선수" if p1.name.strip().upper() in ("PLAYER 1", "P1") else p1.name
+        n2 = "2번 선수" if p2.name.strip().upper() in ("PLAYER 2", "P2") else p2.name
+        p1.name, p2.name = n2, n1
+        p1.target_score, p2.target_score = p2.target_score, p1.target_score
+
+        self.last_shot_result = {
+            "is_scored": False,
+            "points_awarded": 0,
+            "shot_type": "READY",
+            "reason_code": "PLAYER_NAMES_SWAPPED",
+            "message": f"선수변경 완료: 좌측({p1.name}) ↔ 우측({p2.name}) (당구공 색상 위치 유지)",
+        }
+        return self.get_match_payload()
+
+    def swap_seats_with_balls(self) -> Dict[str, object]:
+        """
+        [자리바꿈 버튼 동작]
+        좌우 선수의 이름(및 핸디)과 당구공 색깔(흰공/노란공 및 해당 진영의 점수·기록 상태)이
+        함께 통째로 좌우 위치가 바뀌도록 스왑합니다.
+        """
+        p1, p2 = self.players["P1"], self.players["P2"]
+        n1 = "1번 선수" if p1.name.strip().upper() in ("PLAYER 1", "P1") else p1.name
+        n2 = "2번 선수" if p2.name.strip().upper() in ("PLAYER 2", "P2") else p2.name
+        p1.name, p2.name = n2, n1
+        p1.target_score, p2.target_score = p2.target_score, p1.target_score
+        p1.cue_ball_color, p2.cue_ball_color = p2.cue_ball_color, p1.cue_ball_color
+        p1.score, p2.score = p2.score, p1.score
+        p1.innings, p2.innings = p2.innings, p1.innings
+        p1.current_run, p2.current_run = p2.current_run, p1.current_run
+        p1.high_run, p2.high_run = p2.high_run, p1.high_run
+        p1.timeouts_remaining, p2.timeouts_remaining = (
+            p2.timeouts_remaining,
+            p1.timeouts_remaining,
+        )
+        p1.bank_shots, p2.bank_shots = p2.bank_shots, p1.bank_shots
+        p1.inning_scores, p2.inning_scores = (
+            dict(p2.inning_scores),
+            dict(p1.inning_scores),
+        )
+        self.active_player_id = "P2" if self.active_player_id == "P1" else "P1"
+        self._last_shot_was_miss = False
+
+        c1_ko = "흰공" if p1.cue_ball_color == "WHITE" else "노란공"
+        c2_ko = "흰공" if p2.cue_ball_color == "WHITE" else "노란공"
+        self.last_shot_result = {
+            "is_scored": False,
+            "points_awarded": 0,
+            "shot_type": "READY",
+            "reason_code": "SEATS_AND_BALLS_SWAPPED",
+            "message": f"자리바꿈 완료: 좌측({p1.name}·{c1_ko}) ↔ 우측({p2.name}·{c2_ko})",
+        }
+        return self.get_match_payload()
+
+    def toggle_pause_match(self) -> Dict[str, object]:
+        """
+        선수가 [일시정지] / [다시시작] 버튼을 클릭했을 때
+        경기시간(match_elapsed_sec)과 40초 샷 타이머의 일시정지 / 다시시작 상태를 토글합니다.
+        선수가 직접 [다시시작]을 클릭하기 전까지는 공이 움직여도 일시정지 상태가 유지됩니다.
+        """
+        self.is_match_paused = not self.is_match_paused
+        self.is_timer_paused = self.is_match_paused or (
+            self.fsm_state == MatchState.SHOT_IN_PROGRESS
+        )
+        state_txt = "일시정지됨 (다시시작 클릭 시 시간 재개)" if self.is_match_paused else "다시시작됨"
+        self.last_shot_result = {
+            "is_scored": False,
+            "points_awarded": 0,
+            "shot_type": "READY",
+            "reason_code": "MATCH_PAUSED" if self.is_match_paused else "MATCH_RESUMED",
+            "message": f"경기가 {state_txt} 상태입니다.",
+        }
+        return self.get_match_payload()
+
+    def end_match(self) -> Dict[str, object]:
+        """현재 경기를 종료 처리하고 경기시간 및 샷 타이머를 정지합니다."""
+        self.is_match_paused = True
+        self.is_timer_paused = True
+        p1, p2 = self.players["P1"], self.players["P2"]
+        if p1.score > p2.score:
+            winner_msg = f"{p1.name} 승리! ({p1.score} : {p2.score})"
+        elif p2.score > p1.score:
+            winner_msg = f"{p2.name} 승리! ({p2.score} : {p1.score})"
+        else:
+            winner_msg = f"무승부 ({p1.score} : {p2.score})"
+        self.last_shot_result = {
+            "is_scored": False,
+            "points_awarded": 0,
+            "shot_type": "READY",
+            "reason_code": "MATCH_ENDED",
+            "message": f"[경기 종료] {winner_msg}",
         }
         return self.get_match_payload()
 
@@ -437,7 +553,7 @@ class MatchManager:
         공격권(active_player_id)이나 이닝 번호를 절대 변경하지 않고 기존 공격 선수의 '공격 중' 상태를 그대로 복원합니다.
         """
         self.fsm_state = MatchState.WAIT_SHOT
-        self.is_timer_paused = False
+        self.is_timer_paused = self.is_match_paused
         self.players["P1"].cue_ball_color = "WHITE"
         self.players["P2"].cue_ball_color = "YELLOW"
         self.sync_active_player_to_current_inning(self.active_player_id)
@@ -477,7 +593,7 @@ class MatchManager:
                 p1.inning_scores[self.current_inning] = 0
 
         self.remaining_timer_sec = float(self.default_shot_timer)
-        self.is_timer_paused = False
+        self.is_timer_paused = self.is_match_paused
         self.fsm_state = MatchState.WAIT_SHOT
         return self.get_match_payload()
 
@@ -490,21 +606,121 @@ class MatchManager:
         self.sync_active_player_to_current_inning(self.active_player_id)
         self.fsm_state = MatchState.SHOT_IN_PROGRESS
         self.is_timer_paused = True
+        self.score_dispatched_for_current_shot = False
         return self.get_match_payload()
 
+    def on_immediate_second_ball_hit(
+        self, shot_eval: Dict[str, object]
+    ) -> Dict[str, object]:
+        """
+        [3쿠션 이상 충족 후 제2적구 충돌 즉시 실시간 득점(+1) 반영]
+        공이 완전히 멈추기를 기다리지 않고, 제2적구와 충돌하는 해당 프레임에 즉시:
+        - 공격 선수의 메인 점수 +1 (PBA 뱅크샷은 +2)
+        - 하이런(연속득점) 갱신
+        - 이닝별득점 테이블의 현재 이닝 셀 +1
+        - 메인 점수 아래 그라데이션 타이머 바를 40초(100%, 에메랄드 그린)로 즉시 리셋
+        을 수행하고 중복 가산 방지 플래그(score_dispatched_for_current_shot = True)를 설정합니다.
+        """
+        if self.score_dispatched_for_current_shot:
+            payload = self.get_match_payload()
+            return {
+                "event_type": "SCORE_UPDATED",
+                "previous_player": self.active_player_id,
+                "active_player": self.active_player_id,
+                "active_cue_ball_color": self.active_cue_ball_color,
+                "is_scored": True,
+                "already_dispatched": True,
+                "points_awarded": 0,
+                "payload": payload,
+            }
+
+        self.score_dispatched_for_current_shot = True
+        shot_type = str(shot_eval.get("shot_type", "REGULAR_3C"))
+        if shot_type not in ("REGULAR_3C", "BANK_SHOT"):
+            shot_type = "REGULAR_3C"
+
+        prev_player_id = self.active_player_id
+        prev_inning = max(1, self.current_inning)
+        self.current_inning = prev_inning
+        current_player = self.players[prev_player_id]
+        current_player.innings = self.current_inning
+        if self.current_inning not in current_player.inning_scores:
+            current_player.inning_scores[self.current_inning] = 0
+
+        if self.rule_mode == "PBA" and shot_type == "BANK_SHOT":
+            points_awarded = 2
+        else:
+            points_awarded = 1
+
+        if shot_type == "BANK_SHOT":
+            current_player.bank_shots += 1
+
+        current_player.score += points_awarded
+        current_player.current_run += points_awarded
+        current_player.inning_scores[self.current_inning] = (
+            current_player.inning_scores.get(self.current_inning, 0) + points_awarded
+        )
+        if current_player.current_run > current_player.high_run:
+            current_player.high_run = current_player.current_run
+
+        # 제2적구 타격 즉시 타이머 바를 40초(100%, 에메랄드 그린)로 리셋 (단, 선수 수동 일시정지 중이면 정지 유지)
+        self.remaining_timer_sec = float(self.default_shot_timer)
+        self.is_timer_paused = self.is_match_paused
+
+        self.last_shot_result = {
+            "is_scored": True,
+            "immediate_score": True,
+            "already_dispatched": False,
+            "points_awarded": points_awarded,
+            "shot_type": shot_type,
+            "reason_code": shot_eval.get("reason_code", "IMMEDIATE_SECOND_BALL_HIT"),
+            "message": shot_eval.get(
+                "message",
+                f"⚡ 제2적구 충돌 즉시 득점! (+{points_awarded}점 실시간 반영)",
+            ),
+            "cushions_before_second_hit": shot_eval.get(
+                "cushions_before_second_hit", 3
+            ),
+            "total_cushions": shot_eval.get("total_cushions", 3),
+        }
+
+        payload = self.get_match_payload()
+        return {
+            "event_type": "SCORE_UPDATED",
+            "previous_player": prev_player_id,
+            "active_player": self.active_player_id,
+            "active_cue_ball_color": self.active_cue_ball_color,
+            "is_scored": True,
+            "immediate_score": True,
+            "already_dispatched": False,
+            "points_awarded": points_awarded,
+            "payload": payload,
+        }
+
     def tick_match_elapsed(self, elapsed_sec: float = 1.0) -> None:
-        """경기 시작부터 누적된 총 경기 시간을 증가시킵니다."""
+        """
+        경기 시작부터 누적된 총 경기 시간을 증가시킵니다.
+        선수가 [일시정지] 버튼을 클릭한 상태(is_match_paused == True)에서는
+        [다시시작]을 클릭하기 전까지 경기시간이 멈춥니다.
+        """
+        if self.is_match_paused:
+            return
         self.match_elapsed_sec = round(
             self.match_elapsed_sec + max(0.0, elapsed_sec), 2
         )
 
     def tick_timer(self, elapsed_sec: float = 1.0) -> Dict[str, object]:
         """
-        WAIT_SHOT 상태에서 타이머가 일시 정지되지 않았을 때 남은 시간을 차감하고,
-        경기 누적 경과 시간도 함께 갱신합니다.
+        선수가 [일시정지]를 누르지 않은 상태(not is_match_paused)에서만 경기 누적 경과 시간을 갱신하고,
+        WAIT_SHOT 상태에서 타이머가 일시 정지되지 않았을 때 남은 샷 시간을 차감합니다.
         """
-        self.tick_match_elapsed(elapsed_sec)
-        if self.fsm_state == MatchState.WAIT_SHOT and not self.is_timer_paused:
+        if not self.is_match_paused:
+            self.tick_match_elapsed(elapsed_sec)
+        if (
+            self.fsm_state == MatchState.WAIT_SHOT
+            and not self.is_timer_paused
+            and not self.is_match_paused
+        ):
             self.remaining_timer_sec = max(
                 0.0, round(self.remaining_timer_sec - elapsed_sec, 2)
             )
@@ -527,8 +743,16 @@ class MatchManager:
           * 후공(P2)이 실패한 경우: 해당 이닝이 종료되므로 다음 이닝(self.current_inning + 1)으로 증가하며 선공(P1)으로 턴 전환!
         """
         self.fsm_state = MatchState.BALL_STOPPED
-        is_scored = bool(shot_eval.get("is_scored", False))
-        shot_type = str(shot_eval.get("shot_type", "MISS"))
+        already_dispatched = self.score_dispatched_for_current_shot or bool(
+            shot_eval.get("already_dispatched", False)
+        )
+        # [불변 원칙] 제2적구 충돌 즉시 한 번 올라간 점수(+1)는 절대 롤백(차감)하지 않으며,
+        # 공이 멈췄을 때도 해당 선수의 득점 인정과 공격권을 100% 그대로 유지합니다!
+        is_scored = True if already_dispatched else bool(shot_eval.get("is_scored", False))
+        self.score_dispatched_for_current_shot = False
+        shot_type = str(shot_eval.get("shot_type", "REGULAR_3C" if is_scored else "MISS"))
+        if is_scored and shot_type not in ("REGULAR_3C", "BANK_SHOT"):
+            shot_type = "REGULAR_3C"
         prev_player_id = self.active_player_id
         prev_inning = max(1, self.current_inning)
 
@@ -541,27 +765,33 @@ class MatchManager:
 
         points_awarded = 0
         if is_scored:
-            # PBA 모드이고 뱅크샷인 경우 2점, 그 외에는 1점 부여
-            if self.rule_mode == "PBA" and shot_type == "BANK_SHOT":
-                points_awarded = 2
+            if already_dispatched:
+                # 이미 제2적구 충돌 순간에 즉시 득점(+1)이 반영되었으므로 중복 가산 및 롤백을 모두 차단하고 턴을 유지!
+                points_awarded = 0
+                self.active_player_id = prev_player_id
+                event_type = "SCORE_UPDATED"
             else:
-                points_awarded = 1
+                # PBA 모드이고 뱅크샷인 경우 2점, 그 외에는 1점 부여
+                if self.rule_mode == "PBA" and shot_type == "BANK_SHOT":
+                    points_awarded = 2
+                else:
+                    points_awarded = 1
 
-            if shot_type == "BANK_SHOT":
-                current_player.bank_shots += 1
+                if shot_type == "BANK_SHOT":
+                    current_player.bank_shots += 1
 
-            current_player.score += points_awarded
-            current_player.current_run += points_awarded
-            current_player.inning_scores[self.current_inning] = (
-                current_player.inning_scores.get(self.current_inning, 0)
-                + points_awarded
-            )
-            if current_player.current_run > current_player.high_run:
-                current_player.high_run = current_player.current_run
+                current_player.score += points_awarded
+                current_player.current_run += points_awarded
+                current_player.inning_scores[self.current_inning] = (
+                    current_player.inning_scores.get(self.current_inning, 0)
+                    + points_awarded
+                )
+                if current_player.current_run > current_player.high_run:
+                    current_player.high_run = current_player.current_run
 
-            # 득점 성공 시 반드시 현재 공격 선수의 턴과 '공격 중' 상태를 유지!
-            self.active_player_id = prev_player_id
-            event_type = "SCORE_UPDATED"
+                # 득점 성공 시 반드시 현재 공격 선수의 턴과 '공격 중' 상태를 유지!
+                self.active_player_id = prev_player_id
+                event_type = "SCORE_UPDATED"
         else:
             current_player.current_run = 0
             if prev_player_id == "P1":
@@ -591,11 +821,12 @@ class MatchManager:
         self._last_shot_prev_run = prev_run_before_shot
 
         self.remaining_timer_sec = float(self.default_shot_timer)
-        self.is_timer_paused = False
+        self.is_timer_paused = self.is_match_paused
         self.fsm_state = MatchState.WAIT_SHOT
 
         self.last_shot_result = {
             "is_scored": is_scored,
+            "already_dispatched": already_dispatched,
             "points_awarded": points_awarded,
             "shot_type": shot_type,
             "reason_code": shot_eval.get("reason_code", ""),
@@ -613,6 +844,7 @@ class MatchManager:
             "active_player": self.active_player_id,
             "active_cue_ball_color": self.active_cue_ball_color,
             "is_scored": is_scored,
+            "already_dispatched": already_dispatched,
             "points_awarded": points_awarded,
             "payload": payload,
         }
@@ -648,14 +880,16 @@ class MatchManager:
             "active_player_id": self.active_player_id,
             "active_cue_ball_color": self.active_cue_ball_color,
             "current_inning": self.current_inning,
+            "is_match_paused": self.is_match_paused,
             "match_timer": {
                 "elapsed_sec": int(round(self.match_elapsed_sec)),
                 "formatted": self.formatted_match_time,
+                "is_paused": self.is_match_paused,
             },
             "shot_timer": {
                 "remaining_sec": int(round(self.remaining_timer_sec)),
                 "default_sec": self.default_shot_timer,
-                "is_paused": self.is_timer_paused,
+                "is_paused": self.is_timer_paused or self.is_match_paused,
             },
             "players": {
                 "P1": self.players["P1"].to_dict(),

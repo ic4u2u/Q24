@@ -670,6 +670,145 @@ class TestStep10TouchFullscreenAndZoomPan(unittest.TestCase):
 
         asyncio.run(_run_verification())
 
+    def test_kiosk_ui_ux_7_overhaul_requirements(self) -> None:
+        """
+        [당구 디지털 스코어보드 키오스크 UI/UX 7대 개편 검증]
+        1. [선수변경] / [자리바꿈] 버튼 나란히 배치 및 동작 분리 검증
+           - [선수변경] (/api/match/swap-player-names): 당구공 색상은 고정하고 좌우 선수 이름(및 핸디)만 교체
+           - [자리바꿈] (/api/match/swap-seats-full): 좌우 선수 이름 + 당구공 색깔(흰공/노란공) + 점수/기록 통째로 교체
+        2. '하이런' 단독 표기 & 메인 점수 바로 아래 긴장감 그라데이션 타이머 바(from-emerald-400 to-cyan-500,
+           from-yellow-400 via-amber-500 to-orange-500, from-orange-600 via-red-600 to-rose-500 + animate-pulse)
+        3. '이닝별득점' 간소화 및 현재 이닝 하이라이트(current-inning-col ring-2 ring-amber-400 border-cyan-400)
+        4. 하단 시뮬레이터 & 키오스크 제어 바(⚡ 실시간 판독 시뮬레이터 & 키오스크 제어) 완전 제거
+        5. 기본 화면 전용 4대 버튼([경기시작], [경기종료], [일시정지], [전체화면]) 및 전체화면 전용 배속/줌 컨트롤 분리
+        6. 선수 이름 바로 옆에 [현재 이닝] 배지(p1NameInningBadge, p2NameInningBadge) 표기
+        7. '목표점수' 제거 -> '핸디' 및 상대방과의 실시간 '점수차'(+N / -N / 0) 표기
+        """
+        from fastapi.testclient import TestClient
+        from cue24.api.server import STATIC_DIR, app
+
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+        # 1. [선수변경] / [자리바꿈] 나란히 배치 확인
+        self.assertIn("swapPlayerNamesOnly()", html)
+        self.assertIn("swapPlayerSeats()", html)
+        self.assertIn("선수변경", html)
+        self.assertIn("자리바꿈", html)
+
+        # 2. '하이런' 단독 표기 & 점수 바로 아래 그라데이션 타이머 바 클래스 확인
+        self.assertIn('<div class="stat-label">하이런</div>', html)
+        self.assertIn('id="p1ShotTimerBar"', html)
+        self.assertIn('id="p2ShotTimerBar"', html)
+        self.assertIn("from-emerald-400 to-cyan-500", html)
+        self.assertIn("from-yellow-400 via-amber-500 to-orange-500", html)
+        self.assertIn("from-orange-600 via-red-600 to-rose-500 animate-pulse", html)
+
+        # 3. '이닝별득점' 단독 타이틀 및 현재 이닝 하이라이트 클래스 확인
+        self.assertIn('<div class="sheet-title">이닝별득점</div>', html)
+        self.assertNotIn("1 ~ 30 이닝 표시 중", html)
+        self.assertIn("current-inning-col ring-2 ring-amber-400 border-cyan-400", html)
+
+        # 4. 하단 시뮬레이터 및 키오스크 제어 바 완전 삭제 확인
+        self.assertNotIn("실시간 판독 시뮬레이터", html)
+        self.assertNotIn("triggerSimulation(", html)
+        self.assertNotIn('<footer class="control-bar">', html)
+
+        # 5. 기본 화면 4대 버튼([경기시작], [경기종료], [일시정지], [전체화면]) 및 전체화면 전용 컨트롤 분리 확인
+        self.assertIn('id="btnMatchStart"', html)
+        self.assertIn('id="btnMatchEnd"', html)
+        self.assertIn('id="btnMatchPause"', html)
+        self.assertIn('id="btnFullscreenToggle"', html)
+        self.assertIn('class="fullscreen-only-controls"', html)
+        self.assertNotIn("👆 화면 터치: 전체화면 전환", html)
+
+        # 6. 선수 이름 옆 '현재 이닝' 배지 확인
+        self.assertIn('id="p1NameInningBadge"', html)
+        self.assertIn('id="p2NameInningBadge"', html)
+
+        # 7. '목표점수' 제거 -> '핸디' 및 '점수차' 표기 확인
+        self.assertNotIn("목표 점수:", html)
+        self.assertIn('id="p1HandicapVal"', html)
+        self.assertIn('id="p2HandicapVal"', html)
+        self.assertIn('id="p1ScoreDiffBadge"', html)
+        self.assertIn('id="p2ScoreDiffBadge"', html)
+        self.assertIn("updateScoreDiffBadge", html)
+
+        # API 동작 검증: [선수변경] vs [자리바꿈]
+        client = TestClient(app)
+        client.post("/api/match/reset")
+        client.post("/api/match/player-name", json={"player_id": "P1", "name": "김철수", "handicap": 28})
+        client.post("/api/match/player-name", json={"player_id": "P2", "name": "박영희", "handicap": 22})
+        client.post("/api/match/adjust-score", json={"player_id": "P1", "delta": 5})
+
+        # [선수변경] 호출: 당구공 색상(P1=WHITE, P2=YELLOW) 및 진영 점수(P1=5, P2=0)는 그대로 두고 이름/핸디만 스왑
+        r_names = client.post("/api/match/swap-player-names").json()
+        self.assertEqual(r_names["players"]["P1"]["name"], "박영희")
+        self.assertEqual(r_names["players"]["P1"]["target_score"], 22)
+        self.assertEqual(r_names["players"]["P1"]["cue_ball_color"], "WHITE")
+        self.assertEqual(r_names["players"]["P1"]["score"], 5)
+        self.assertEqual(r_names["players"]["P2"]["name"], "김철수")
+        self.assertEqual(r_names["players"]["P2"]["target_score"], 28)
+        self.assertEqual(r_names["players"]["P2"]["cue_ball_color"], "YELLOW")
+        self.assertEqual(r_names["players"]["P2"]["score"], 0)
+
+        # [자리바꿈] 호출: 좌우 선수 이름, 핸디, 당구공 색깔(WHITE/YELLOW), 점수가 통째로 좌우 맞바뀜
+        r_seats = client.post("/api/match/swap-seats-full").json()
+        self.assertEqual(r_seats["players"]["P1"]["name"], "김철수")
+        self.assertEqual(r_seats["players"]["P1"]["target_score"], 28)
+        self.assertEqual(r_seats["players"]["P1"]["cue_ball_color"], "YELLOW")
+        self.assertEqual(r_seats["players"]["P1"]["score"], 0)
+        self.assertEqual(r_seats["players"]["P2"]["name"], "박영희")
+        self.assertEqual(r_seats["players"]["P2"]["target_score"], 22)
+        self.assertEqual(r_seats["players"]["P2"]["cue_ball_color"], "WHITE")
+        self.assertEqual(r_seats["players"]["P2"]["score"], 5)
+
+        # [경기시작] 클릭 시 (/api/match/reset 호출) 모든 상태가 초기값으로 완벽 초기화되는지 검증
+        r_reset = client.post("/api/match/reset").json()
+        self.assertEqual(r_reset["players"]["P1"]["score"], 0)
+        self.assertEqual(r_reset["players"]["P2"]["score"], 0)
+        self.assertEqual(r_reset["players"]["P1"]["cue_ball_color"], "WHITE")
+        self.assertEqual(r_reset["players"]["P2"]["cue_ball_color"], "YELLOW")
+        self.assertEqual(r_reset["current_inning"], 1)
+        self.assertEqual(r_reset["shot_timer"]["remaining_sec"], 40)
+        self.assertFalse(r_reset["shot_timer"]["is_paused"])
+        self.assertEqual(r_reset["match_timer"]["elapsed_sec"], 0)
+
+        # [일시정지] -> 경기시간(match_timer.elapsed_sec) 및 40초 샷 타이머 정지 -> [다시시작] -> 멈춘 시간부터 이어서 측정 검증
+        from cue24.api.server import match_manager
+
+        self.assertIn("다시시작", html)
+        match_manager.tick_timer(5.0)
+        self.assertEqual(match_manager.match_elapsed_sec, 5.0)
+        self.assertEqual(match_manager.remaining_timer_sec, 35.0)
+
+        r_pause = client.post("/api/match/pause").json()
+        self.assertTrue(r_pause["is_match_paused"])
+        self.assertTrue(r_pause["match_timer"]["is_paused"])
+        self.assertTrue(r_pause["shot_timer"]["is_paused"])
+
+        # 일시정지 중에는 tick_timer / tick_match_elapsed가 호출되어도 경기시간(5.0초)과 샷 타이머(35.0초)가 절대 변하지 않아야 함
+        match_manager.tick_timer(10.0)
+        match_manager.tick_match_elapsed(10.0)
+        self.assertEqual(match_manager.match_elapsed_sec, 5.0)
+        self.assertEqual(match_manager.remaining_timer_sec, 35.0)
+
+        # 일시정지 중에 공이 움직이거나 멈추더라도 선수가 [다시시작]을 누르기 전까지는 일시정지(경기시간 멈춤) 유지
+        match_manager.on_shot_started()
+        match_manager.cancel_phantom_shot()
+        match_manager.tick_timer(5.0)
+        self.assertTrue(match_manager.is_match_paused)
+        self.assertEqual(match_manager.match_elapsed_sec, 5.0)
+
+        # [다시시작] 클릭 시 (/api/match/pause 재호출) 멈췄던 5.0초부터 다시 이어서 시간 체크
+        r_resume = client.post("/api/match/pause").json()
+        self.assertFalse(r_resume["is_match_paused"])
+        self.assertFalse(r_resume["match_timer"]["is_paused"])
+        self.assertFalse(r_resume["shot_timer"]["is_paused"])
+
+        match_manager.tick_timer(3.0)
+        self.assertEqual(match_manager.match_elapsed_sec, 8.0)
+        self.assertEqual(match_manager.remaining_timer_sec, 32.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
