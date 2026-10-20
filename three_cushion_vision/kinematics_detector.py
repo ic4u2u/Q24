@@ -191,16 +191,19 @@ class KinematicsDetector:
         self,
         cue_prev: TrackedBall,
         cue_curr: TrackedBall,
+        min_ball_dist_mm: float = 999.0,
     ) -> List[CushionImpactEvent]:
         """
-        [3. Normal-Velocity Flip Cushion Detection (법선 반전 및 active_rails 집합 쿠션 판정)]
-        - 수구가 4면 레일(LEFT, RIGHT, TOP, BOTTOM)의 마진 영역(R + 14.0mm = 44.75mm) 안에 진입하고,
-          레일 진입 상태가 새로 시작되거나 해당 레일의 법선 속도 성분이 레일 방향에서 테이블 안쪽으로 반전될 때 쿠션으로 인정합니다.
-        - active_rails 집합을 유지하여 같은 레일을 타고 미끄러지는 '쿠션 타기(Hugging)' 중복 카운트를 차단하고,
-          코너에서 다른 레일(예: TOP -> RIGHT)로 연속 진입할 때는 쿨다운 없이 즉시 별도 쿠션으로 카운트합니다.
+        [3. Normal-Velocity Flip & Sub-Frame Apex Cushion Detection]
+        - 일반 진입: 수구가 4면 레일 마진 영역(44.75mm) 안에 진입할 때 카운트.
+        - 서브프레임 고속 터널링 / 프레임 드랍 복원: 시속 35km 초고속 샷이나 정점 프레임 드랍으로 인해
+          이산 프레임 샘플이 마진(44.75mm) 바깥(<= 180mm)에 찍히더라도, 목적구와 비접촉 상태에서
+          레일 법선 속도가 고속 접근(>= 300mm/s) 후 이탈(>= 150mm/s)로 반전되면 서브프레임 쿠션 반사로 복원합니다.
+        - active_rails 집합을 유지하여 같은 레일을 타고 미끄러지는 '쿠션 타기(Hugging)' 중복 카운트를 차단합니다.
         """
         events: List[CushionImpactEvent] = []
         margin = self.config.RAIL_ZONE_MARGIN_MM
+        subframe_margin = 180.0
         w = self.config.TABLE_WIDTH_MM
         h = self.config.TABLE_HEIGHT_MM
 
@@ -209,28 +212,62 @@ class KinematicsDetector:
         vx0, vy0 = cue_prev.vx, cue_prev.vy
         vx1, vy1 = cue_curr.vx, cue_curr.vy
 
-        # 현재 프레임(또는 서브프레임 변곡점)에서 마진 영역 내에 위치한 레일 집합 계산
+        # 1) 물리적 마진 영역(44.75mm) 내 체류 레일 집합
         current_rails: Set[Rail] = set()
-        if x1 <= margin or (x0 <= margin and vx1 > 0.0):
-            if x1 <= margin:
-                current_rails.add(Rail.LEFT)
-        if x1 >= (w - margin) or (x0 >= (w - margin) and vx1 < 0.0):
-            if x1 >= (w - margin):
-                current_rails.add(Rail.RIGHT)
-        if y1 <= margin or (y0 <= margin and vy1 > 0.0):
-            if y1 <= margin:
-                current_rails.add(Rail.TOP)
-        if y1 >= (h - margin) or (y0 >= (h - margin) and vy1 < 0.0):
-            if y1 >= (h - margin):
-                current_rails.add(Rail.BOTTOM)
+        if x1 <= margin:
+            current_rails.add(Rail.LEFT)
+        if x1 >= (w - margin):
+            current_rails.add(Rail.RIGHT)
+        if y1 <= margin:
+            current_rails.add(Rail.TOP)
+        if y1 >= (h - margin):
+            current_rails.add(Rail.BOTTOM)
+
+        # 2) 서브프레임 고속 터널링 / 프레임 드랍 정점 반사 검사 (목적구 충돌이 아닌 순수 레일 반사일 때)
+        allow_subframe_apex = min_ball_dist_mm > 80.0
+        fast_in = 300.0
+        fast_out = 150.0
+
+        subframe_bounced_rails: Set[Rail] = set()
+        if allow_subframe_apex:
+            if (
+                min(x0, x1) <= subframe_margin
+                and vx0 < -fast_in
+                and vx1 > fast_out
+                and Rail.LEFT not in self._counted_in_active_rail
+            ):
+                subframe_bounced_rails.add(Rail.LEFT)
+            if (
+                max(x0, x1) >= (w - subframe_margin)
+                and vx0 > fast_in
+                and vx1 < -fast_out
+                and Rail.RIGHT not in self._counted_in_active_rail
+            ):
+                subframe_bounced_rails.add(Rail.RIGHT)
+            if (
+                min(y0, y1) <= subframe_margin
+                and vy0 < -fast_in
+                and vy1 > fast_out
+                and Rail.TOP not in self._counted_in_active_rail
+            ):
+                subframe_bounced_rails.add(Rail.TOP)
+            if (
+                max(y0, y1) >= (h - subframe_margin)
+                and vy0 > fast_in
+                and vy1 < -fast_out
+                and Rail.BOTTOM not in self._counted_in_active_rail
+            ):
+                subframe_bounced_rails.add(Rail.BOTTOM)
+
+        effective_zone_rails = current_rails | subframe_bounced_rails
 
         # 레일 영역에서 완전히 벗어난 레일은 카운트 완료 집합에서 해제
-        self._counted_in_active_rail.intersection_update(current_rails)
+        self._counted_in_active_rail.intersection_update(effective_zone_rails)
 
         rail_checks = [
             (
                 Rail.LEFT,
-                x1 <= margin,
+                (x1 <= margin) or (Rail.LEFT in subframe_bounced_rails),
                 vx0 < -self.config.MIN_RAIL_APPROACH_SPEED_MM_S,
                 vx1 > 0.0,
                 vx0,
@@ -238,7 +275,7 @@ class KinematicsDetector:
             ),
             (
                 Rail.RIGHT,
-                x1 >= (w - margin),
+                (x1 >= (w - margin)) or (Rail.RIGHT in subframe_bounced_rails),
                 vx0 > self.config.MIN_RAIL_APPROACH_SPEED_MM_S,
                 vx1 < 0.0,
                 vx0,
@@ -246,7 +283,7 @@ class KinematicsDetector:
             ),
             (
                 Rail.TOP,
-                y1 <= margin,
+                (y1 <= margin) or (Rail.TOP in subframe_bounced_rails),
                 vy0 < -self.config.MIN_RAIL_APPROACH_SPEED_MM_S,
                 vy1 > 0.0,
                 vy0,
@@ -254,7 +291,7 @@ class KinematicsDetector:
             ),
             (
                 Rail.BOTTOM,
-                y1 >= (h - margin),
+                (y1 >= (h - margin)) or (Rail.BOTTOM in subframe_bounced_rails),
                 vy0 > self.config.MIN_RAIL_APPROACH_SPEED_MM_S,
                 vy1 < 0.0,
                 vy0,
@@ -284,7 +321,7 @@ class KinematicsDetector:
                     )
                 )
 
-        self.active_rails = current_rails
+        self.active_rails = effective_zone_rails
         return events
 
     def _evaluate_pending_micro_kiss(
@@ -423,8 +460,18 @@ class KinematicsDetector:
         t0 = self._prev_timestamp if self._prev_timestamp is not None else (timestamp - 1.0 / 60.0)
         t1 = timestamp
 
-        # 1. 법선 반전 기반 쿠션 접촉 판정
-        cushion_events = self.detect_cushion_contacts(cue_prev, cue_curr)
+        # 목적구들과의 현재 최소 중심거리 계산 (서브프레임 쿠션 판정 시 공 충돌 굴절 배제용)
+        min_ball_dist_mm = 999.0
+        for tc, tb in balls.items():
+            if tc != assigned_cue_ball:
+                d_curr = math.hypot(cue_curr.x - tb.x, cue_curr.y - tb.y)
+                if d_curr < min_ball_dist_mm:
+                    min_ball_dist_mm = d_curr
+
+        # 1. 법선 반전 및 서브프레임 정점 복원 기반 쿠션 접촉 판정
+        cushion_events = self.detect_cushion_contacts(
+            cue_prev, cue_curr, min_ball_dist_mm=min_ball_dist_mm
+        )
         effective_cushions = current_cushion_count + len(cushion_events)
 
         # 수구 이동 방향 벡터 계산
@@ -604,8 +651,11 @@ class KinematicsDetector:
                     np.array([target_curr.x, target_curr.y], dtype=np.float64)
                 )
 
-        # 굴절 후 후보 평가가 진행 중이 아닐 때만 직진 진행 벡터 히스토리 갱신
-        if not self._pending_micro_kiss and step_cue_norm >= 1.0:
+        # 최근접점 이후 굴절 평가 중(frames_waited > 0)이 아닐 때만 직진 진행 벡터 히스토리 갱신
+        is_post_apex_waiting = any(
+            c.frames_waited > 0 for c in self._pending_micro_kiss.values()
+        )
+        if not is_post_apex_waiting and step_cue_norm >= 1.0:
             self._cue_vel_history.append(step_cue_vec)
         self._cue_pos_history.append(
             np.array([cue_curr.x, cue_curr.y], dtype=np.float64)
