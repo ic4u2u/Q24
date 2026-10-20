@@ -589,10 +589,12 @@ class KinematicsDetector:
                         continue
                 else:
                     cand = self._pending_micro_kiss[target_color]
+                    was_already_overlap = cand.is_direct_overlap
                     if is_curr_direct_overlap:
                         cand.is_direct_overlap = True
                     # 수구가 목적구에 더 가깝게 접근한 프레임이면 최근접점(Apex) 갱신
-                    if ccd.d_min_mm < cand.d_min_mm - 0.05:
+                    # 단, 이미 강체 중첩(was_already_overlap)된 직후 굴절된 프레임은 즉시 평가로 진행
+                    if ccd.d_min_mm < cand.d_min_mm - 0.05 and not was_already_overlap:
                         cand.d_min_mm = ccd.d_min_mm
                         cand.t_impact = ccd.t_impact
                         cand.u_before = chosen_u_before.copy()
