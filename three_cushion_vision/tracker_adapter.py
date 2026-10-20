@@ -30,11 +30,12 @@ class TrackedBall:
     speed: float = 0.0       # mm/s 단위 속력
     raw_track_id: int = -1
     timestamp: float = 0.0
+    is_occluded_restored: bool = False  # BilliardNanoGPT로 복원된 가려짐 프레임 여부
 
 
 @dataclass
 class _InternalColorState:
-    """색상별 적응형 EMA 위치·속도 추적 내부 상태"""
+    """색상별 적응형 EMA 위치·속도 추적 내부 상태 및 15프레임 물리 시퀀스 버퍼"""
 
     x_ema: float
     y_ema: float
@@ -44,6 +45,7 @@ class _InternalColorState:
     raw_y: float = 0.0
     last_timestamp: float = 0.0
     last_track_id: int = -1
+    history_15: Optional[List[Tuple[float, float, float, float]]] = None
 
 
 class OCSortTrackerAdapter:
@@ -51,21 +53,26 @@ class OCSortTrackerAdapter:
     YOLO/RF-DETR + OC-SORT 검출 결과를 입력받아:
     1) 원형 ROI의 HSV 색공간 히스토그램 분석으로 BallColor(WHITE, YELLOW, RED)를 식별하여 ID 스위칭을 원천 차단하고,
     2) TableHomography의 대각선 시차(Parallax) 보정을 거쳐 2840x1420mm 물리 좌표로 변환하며,
-    3) 적응형 EMA(정지 구간 alpha=0.25, 고속 구간 alpha=0.75)로 떨림을 억제하는 트래커 어댑터입니다.
+    3) 적응형 EMA(정지 구간 alpha=0.25, 고속 구간 alpha=0.75)로 떨림을 억제하고,
+    4) 선수 몸 가려짐(Occlusion) 발생 시 BilliardNanoGPT로 비선형 쿠션 반사 궤적을 복원하는 트래커 어댑터입니다.
     """
 
     def __init__(
         self,
         homography: Optional[TableHomography] = None,
         config: VisionConfig = DEFAULT_CONFIG,
+        enable_occlusion_restorer: bool = True,
     ) -> None:
         self.config: VisionConfig = config
         self.homography: TableHomography = homography or TableHomography(config=config)
         self._states: Dict[BallColor, _InternalColorState] = {}
+        self.enable_occlusion_restorer: bool = enable_occlusion_restorer
+        self._restorers: Dict[BallColor, Any] = {}
 
     def reset(self) -> None:
-        """트래커 어댑터의 누적 EMA 상태를 초기화합니다."""
+        """트래커 어댑터의 누적 EMA 상태 및 가려짐 복원 버퍼를 초기화합니다."""
         self._states.clear()
+        self._restorers.clear()
 
     @staticmethod
     def classify_roi_hsv_histogram(
@@ -244,6 +251,7 @@ class OCSortTrackerAdapter:
                     raw_y=raw_y,
                     last_timestamp=timestamp,
                     last_track_id=track_id,
+                    history_15=[(raw_x, raw_y, 0.0, 0.0)],
                 )
                 output[color] = TrackedBall(
                     color=color,
@@ -254,6 +262,7 @@ class OCSortTrackerAdapter:
                     speed=0.0,
                     raw_track_id=track_id,
                     timestamp=timestamp,
+                    is_occluded_restored=False,
                 )
                 continue
 
@@ -297,16 +306,71 @@ class OCSortTrackerAdapter:
             st.last_timestamp = timestamp
             st.last_track_id = track_id
 
+            final_x = st.x_ema if enable_ema else raw_x
+            final_y = st.y_ema if enable_ema else raw_y
+            if st.history_15 is None:
+                st.history_15 = []
+            st.history_15.append((final_x, final_y, st.vx_ema, st.vy_ema))
+            if len(st.history_15) > 15:
+                st.history_15.pop(0)
+            if color in self._restorers:
+                self._restorers[color].buffer = list(st.history_15)
+
             speed_final = math.hypot(st.vx_ema, st.vy_ema)
             output[color] = TrackedBall(
                 color=color,
-                x=st.x_ema if enable_ema else raw_x,
-                y=st.y_ema if enable_ema else raw_y,
+                x=final_x,
+                y=final_y,
                 vx=st.vx_ema,
                 vy=st.vy_ema,
                 speed=speed_final,
                 raw_track_id=track_id,
                 timestamp=timestamp,
+                is_occluded_restored=False,
             )
+
+        # [Step 2 핵심] 선수 몸/큐대 가려짐(Occlusion)으로 인해 이번 프레임에 누락된 공 복원
+        if self.enable_occlusion_restorer and len(output) < 3:
+            for color in (BallColor.WHITE, BallColor.YELLOW, BallColor.RED):
+                if color in output or color not in self._states:
+                    continue
+                st = self._states[color]
+                if not st.history_15:
+                    continue
+
+                if color not in self._restorers:
+                    from three_cushion_vision.billiard_nanogpt import (
+                        OcclusionTrajectoryRestorer,
+                        get_or_train_billiard_nanogpt,
+                    )
+
+                    gpt_model = get_or_train_billiard_nanogpt()
+                    restorer = OcclusionTrajectoryRestorer(gpt_model)
+                    restorer.buffer = list(st.history_15)
+                    self._restorers[color] = restorer
+
+                rx, ry, rvx, rvy = self._restorers[color].step(None)
+                st.x_ema = rx
+                st.y_ema = ry
+                st.vx_ema = rvx
+                st.vy_ema = rvy
+                st.raw_x = rx
+                st.raw_y = ry
+                st.last_timestamp = timestamp
+                st.history_15.append((rx, ry, rvx, rvy))
+                if len(st.history_15) > 15:
+                    st.history_15.pop(0)
+
+                output[color] = TrackedBall(
+                    color=color,
+                    x=rx,
+                    y=ry,
+                    vx=rvx,
+                    vy=rvy,
+                    speed=math.hypot(rvx, rvy),
+                    raw_track_id=st.last_track_id,
+                    timestamp=timestamp,
+                    is_occluded_restored=True,
+                )
 
         return output

@@ -441,6 +441,78 @@ class TestThreeCushionVisionScenarios(unittest.TestCase):
         self.assertEqual(len(summary["shot_results"]), 1)
         self.assertTrue(summary["shot_results"][0].scored)
 
+    def test_scenario_7_billiard_nanogpt_occlusion_cushion_restoration(self) -> None:
+        """
+        [시나리오 7: BilliardNanoGPT 기반 선수 몸 가려짐(Occlusion) 구간 비선형 쿠션 반사 복원 검증]
+        - 수구(WHITE)가 제1목적구(RED)를 맞힌 뒤 상단 쿠션(TOP, y=30.75mm)에 입사하기 직전부터 반사 직후까지
+          총 6프레임(index 14 ~ 19) 동안 선수의 몸에 가려져 카메라 검출 리스트에서 완전히 사라진(None) 상황.
+        - OCSortTrackerAdapter가 BilliardNanoGPT(OcclusionTrajectoryRestorer)를 통해 가려진 6프레임 동안의
+          상단 쿠션 반사 궤적을 실시간 복원하여 1쿠션(TOP)을 놓치지 않고 최종 3쿠션 득점(scored == True)을 성공시키는지 검증!
+        """
+        fsm = ThreeCushionScoringFSM(initial_cue_ball=BallColor.WHITE)
+        adapter = OCSortTrackerAdapter(enable_occlusion_restorer=True)
+
+        cue_waypoints = [
+            (400.0, 700.0),    # 출발
+            (800.0, 500.0),    # 제1목적구(RED: 800, 450) 타격 (index 8)
+            (1500.0, 31.0),    # 1쿠션: TOP 레일 (index 16 -> 가려짐 구간 한복판!)
+            (2808.0, 650.0),   # 2쿠션: RIGHT 레일
+            (1900.0, 1388.0),  # 3쿠션: BOTTOM 레일
+            (1200.0, 900.0),   # 제2목적구(YELLOW: 1200, 850) 접촉
+            (1100.0, 820.0),   # 정지
+        ]
+        cue_path = _interpolate_waypoints_60fps(cue_waypoints, frames_per_segment=8)
+        red_path = [(800.0, 450.0)] * 9 + [(820.0, 380.0)] * (len(cue_path) - 9)
+        yellow_path = [(1200.0, 850.0)] * 41 + [(1160.0, 800.0)] * (len(cue_path) - 41)
+
+        # index 14 ~ 19 (TOP 쿠션 반사 전후 6프레임) 동안 선수 신체에 수구(WHITE)가 완전히 가려짐!
+        occluded_indices = {14, 15, 16, 17, 18, 19}
+        restored_count = 0
+        shot_result: Optional[ShotResult] = None
+        dt = 1.0 / 60.0
+        total_frames = len(cue_path) + 24
+
+        for f_idx in range(total_frames):
+            t_sec = f_idx * dt
+            c_pt = cue_path[min(f_idx, len(cue_path) - 1)]
+            r_pt = red_path[min(f_idx, len(red_path) - 1)]
+            y_pt = yellow_path[min(f_idx, len(yellow_path) - 1)]
+
+            detections = [
+                {"color": BallColor.RED, "x_mm": r_pt[0], "y_mm": r_pt[1], "track_id": 2},
+                {"color": BallColor.YELLOW, "x_mm": y_pt[0], "y_mm": y_pt[1], "track_id": 3},
+            ]
+            # 가려진 프레임(14~19)에서는 WHITE 수구 검출이 아예 누락됨!
+            if f_idx not in occluded_indices:
+                detections.insert(
+                    0,
+                    {"color": BallColor.WHITE, "x_mm": c_pt[0], "y_mm": c_pt[1], "track_id": 1},
+                )
+
+            tracked_balls = adapter.update_from_detections(
+                detections=detections,
+                timestamp=t_sec,
+                enable_ema=False,
+            )
+            if tracked_balls[BallColor.WHITE].is_occluded_restored:
+                restored_count += 1
+
+            res = fsm.update(balls=tracked_balls, timestamp=t_sec)
+            if res is not None:
+                shot_result = res
+                break
+
+        self.assertIsNotNone(shot_result)
+        assert shot_result is not None
+        print(
+            f"[Scenario 7 - BilliardNanoGPT Occlusion Restoration] "
+            f"restored_frames={restored_count}, scored={shot_result.scored}, "
+            f"cushions_before_2nd={shot_result.cushions_before_second_ball}"
+        )
+        self.assertEqual(restored_count, 6)
+        self.assertTrue(shot_result.scored)
+        self.assertGreaterEqual(shot_result.cushions_before_second_ball, 3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -7,6 +7,12 @@
 0.5mm 미세 스침(키스)과 뱅크샷(가락), 조기 키스 파울 잠금을 완벽히 판별합니다.
 """
 
+from three_cushion_vision.billiard_nanogpt import (
+    BilliardGPTConfig,
+    BilliardNanoGPT,
+    OcclusionTrajectoryRestorer,
+    get_or_train_billiard_nanogpt,
+)
 from three_cushion_vision.config import (
     BallColor,
     FailReason,
@@ -49,4 +55,8 @@ __all__ = [
     "UltralyticsOCSortDetector",
     "BilliardDemoVisualizer",
     "run_video_demo",
+    "BilliardGPTConfig",
+    "BilliardNanoGPT",
+    "OcclusionTrajectoryRestorer",
+    "get_or_train_billiard_nanogpt",
 ]
