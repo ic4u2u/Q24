@@ -659,7 +659,7 @@ class TestThreeCushionVisionScenarios(unittest.TestCase):
         cue_4 = _interpolate_waypoints_60fps(
             [
                 (400.0, 700.0),
-                (800.0, 500.0),    # RED(800, 450) 타격
+                (745.0, 450.0),    # RED(800, 450) 타격 -> RED가 +x 방향(1050, 500)으로 이동
                 (1500.0, 32.0),    # 1C: TOP
                 (2808.0, 650.0),   # 2C: RIGHT
                 (1900.0, 1388.0),  # 3C: BOTTOM

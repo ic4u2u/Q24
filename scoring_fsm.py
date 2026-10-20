@@ -1,7 +1,7 @@
 """
-루트 레벨 scoring_fsm.py 호환성 모듈
-CausalKissSafeFSM, BallColor, ShotResult, FrameSnapshot, Rail, ShotState 및
-ThreeCushionScoringFSM을 export합니다.
+scoring_fsm.py:
+Split-Window 미분 + 운동량 보존 차감 + 쌍방 작용·반작용 AND 게이트 + 키스 ID 역스왑 복원이 통합된
+CausalKissSafeFSM 및 ThreeCushionScoringFSM 모듈
 """
 
 from three_cushion_vision.causal_kiss_fsm import (
