@@ -71,6 +71,8 @@ class _PendingMicroKissCandidate:
     was_target_stationary: bool       # 근접 직전 목적구 정지 여부
     cushions_at_impact: int           # 최근접 시점의 누적 쿠션 수
     is_direct_overlap: bool = False   # d_min <= 2R + 0.15mm 강체 중첩 여부
+    cue_near_rail: bool = False       # 수구가 쿠션 반사 중인지 여부 (오류 3 차단)
+    deflected_off_other_ball: bool = False  # 제3의 공에 의해 굴절되었는지 여부 (오류 2 차단)
     frames_waited: int = 0
     post_cue_positions: List[np.ndarray] = field(default_factory=list)
     post_target_positions: List[np.ndarray] = field(default_factory=list)
@@ -102,6 +104,7 @@ class KinematicsDetector:
         self._last_contact_time: Dict[BallColor, float] = {}
         self.active_rails: Set[Rail] = set()
         self._counted_in_active_rail: Set[Rail] = set()
+        self.object_ball_kiss_occurred: bool = False
         self.near_miss_logs: List[Dict[str, object]] = []
 
     @staticmethod
@@ -406,7 +409,10 @@ class KinematicsDetector:
                     has_impulse_evidence = True
 
         has_deflection_evidence = (
-            is_repulsive_deflection and deflection_deg >= 1.15
+            not cand.cue_near_rail
+            and not cand.deflected_off_other_ball
+            and is_repulsive_deflection
+            and deflection_deg >= 1.15
         )
 
         if has_deflection_evidence or has_impulse_evidence:
@@ -475,6 +481,24 @@ class KinematicsDetector:
             cue_prev, cue_curr, min_ball_dist_mm=min_ball_dist_mm
         )
         effective_cushions = current_cushion_count + len(cushion_events)
+        is_cue_bouncing_on_rail = len(cushion_events) > 0
+
+        # [3체 인과 분리 - 오류 4] 제1적구와 제2적구 간의 상호 키스(Object-Ball Kiss) 감지
+        other_colors = [c for c in balls.keys() if c != assigned_cue_ball and c in self._prev_balls]
+        if len(other_colors) == 2:
+            ob1, ob2 = other_colors[0], other_colors[1]
+            b1_prev, b1_curr = self._prev_balls[ob1], balls[ob1]
+            b2_prev, b2_curr = self._prev_balls[ob2], balls[ob2]
+            ccd_ob = self.compute_subframe_ccd(
+                a0=(b1_prev.x, b1_prev.y),
+                a1=(b1_curr.x, b1_curr.y),
+                b0=(b2_prev.x, b2_prev.y),
+                b1=(b2_curr.x, b2_curr.y),
+                t0=t0,
+                t1=t1,
+            )
+            if ccd_ob.d_min_mm <= (2.0 * self.config.BALL_RADIUS_MM + 1.5):
+                self.object_ball_kiss_occurred = True
 
         # 수구 이동 방향 벡터 계산
         step_cue_vec = np.array(
@@ -528,7 +552,24 @@ class KinematicsDetector:
                 else:
                     rest_pos = np.array([target_prev.x, target_prev.y], dtype=np.float64)
 
-                is_curr_direct_overlap = ccd.d_min_mm <= direct_overlap_limit_mm
+                # [3체 인과 분리 - 오류 2] 제3의 공(other_ball)에 더 가깝게 충돌하여 굴절된 경우 판별
+                third_colors = [c for c in other_colors if c != target_color]
+                is_deflected_off_other = False
+                if third_colors:
+                    tc_other = third_colors[0]
+                    o_prev, o_curr = self._prev_balls[tc_other], balls[tc_other]
+                    ccd_other = self.compute_subframe_ccd(
+                        a0=(cue_prev.x, cue_prev.y),
+                        a1=(cue_curr.x, cue_curr.y),
+                        b0=(o_prev.x, o_prev.y),
+                        b1=(o_curr.x, o_curr.y),
+                        t0=t0,
+                        t1=t1,
+                    )
+                    if ccd_other.d_min_mm < (ccd.d_min_mm - 2.0) and ccd_other.d_min_mm <= direct_overlap_limit_mm:
+                        is_deflected_off_other = True
+
+                is_curr_direct_overlap = (ccd.d_min_mm <= direct_overlap_limit_mm) and (not is_deflected_off_other)
                 chosen_u_before = (
                     u_before_with_curr if ccd.tau_star >= 0.90 else u_before_prev_only
                 )
@@ -582,6 +623,8 @@ class KinematicsDetector:
                         was_target_stationary=(target_prev.speed < 80.0),
                         cushions_at_impact=effective_cushions,
                         is_direct_overlap=is_curr_direct_overlap,
+                        cue_near_rail=is_cue_bouncing_on_rail,
+                        deflected_off_other_ball=is_deflected_off_other,
                         frames_waited=0,
                     )
                     # 이번 스텝 끝점(tau_star >= 0.90)이 최근접점이면 다음 프레임부터 사후 궤적을 측정하도록 continue

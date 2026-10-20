@@ -13,6 +13,7 @@ from three_cushion_vision.billiard_nanogpt import (
     OcclusionTrajectoryRestorer,
     get_or_train_billiard_nanogpt,
 )
+from three_cushion_vision.causal_kiss_fsm import CausalKissSafeFSM, FrameSnapshot
 from three_cushion_vision.config import (
     BallColor,
     FailReason,
@@ -59,4 +60,6 @@ __all__ = [
     "BilliardNanoGPT",
     "OcclusionTrajectoryRestorer",
     "get_or_train_billiard_nanogpt",
+    "CausalKissSafeFSM",
+    "FrameSnapshot",
 ]

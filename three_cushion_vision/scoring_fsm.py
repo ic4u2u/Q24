@@ -50,6 +50,7 @@ class ShotResult:
     first_target_ball: Optional[BallColor] = None
     second_target_ball: Optional[BallColor] = None
     retroactive_previous_score_compensated: bool = False
+    object_ball_kiss_occurred: bool = False
 
 
 class ThreeCushionScoringFSM:
@@ -318,6 +319,7 @@ class ThreeCushionScoringFSM:
             first_target_ball=self.first_target_ball,
             second_target_ball=self.second_target_ball,
             retroactive_previous_score_compensated=self.retroactive_compensated_in_shot,
+            object_ball_kiss_occurred=self.kinematics.object_ball_kiss_occurred,
         )
 
         self._last_completed_cue_ball = completed_cue_ball

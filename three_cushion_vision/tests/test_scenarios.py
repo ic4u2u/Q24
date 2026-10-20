@@ -513,6 +513,187 @@ class TestThreeCushionVisionScenarios(unittest.TestCase):
         self.assertTrue(shot_result.scored)
         self.assertGreaterEqual(shot_result.cushions_before_second_ball, 3)
 
+    def test_scenario_8_causal_kiss_disambiguator_4_illusions(self) -> None:
+        """
+        [시나리오 8: 3체 인과 충돌 분리 엔진(CausalKissSafeFSM) 4대 키스 착시 차단 검증]
+        1) 오류 1: 1적구-2적구 키스로 2적구가 굴러갈 때 수구가 3쿠션 후 2적구 옆을 무굴절·무충격 근접 통과 -> 노카운트
+        2) 오류 2: 3구 밀집 구역에서 수구가 1적구만 재키스하여 꺾였을 때(x_deflected_Off_other_ball) -> 노카운트
+        3) 오류 3: 쿠션에 밀착된 2적구 옆에서 수구가 쿠션만 맞고 반사된 경우(x_near_rail) -> 노카운트
+        4) 오류 4: 3쿠션 전에 1적구-2적구 간 키스가 발생했으나 이후 수구가 3쿠션 후 2적구 정상 타격 -> 득점 성공
+        """
+        from three_cushion_vision.causal_kiss_fsm import (
+            BallColor as CausalBallColor,
+            CausalKissSafeFSM,
+            ShotResult as CausalShotResult,
+        )
+
+        def _run_causal_sim(
+            cue_pts: List[Point2D],
+            red_pts: List[Point2D],
+            yel_pts: List[Point2D],
+            hold_frames: int = 25,
+        ) -> CausalShotResult:
+            cfsm = CausalKissSafeFSM(fps=60.0, assigned_cue_ball=CausalBallColor.WHITE)
+            dt = 1.0 / 60.0
+            n_max = max(len(cue_pts), len(red_pts), len(yel_pts))
+            for idx in range(n_max + hold_frames):
+                t_sec = idx * dt
+                c = cue_pts[min(idx, len(cue_pts) - 1)]
+                r = red_pts[min(idx, len(red_pts) - 1)]
+                y = yel_pts[min(idx, len(yel_pts) - 1)]
+                res = cfsm.update(
+                    t_sec,
+                    {
+                        CausalBallColor.WHITE: c,
+                        CausalBallColor.RED: r,
+                        CausalBallColor.YELLOW: y,
+                    },
+                )
+                if res is not None:
+                    return res
+            raise AssertionError("CausalKissSafeFSM did not finalize shot")
+
+        # ------------------------------------------------------------------
+        # 1) 오류 1: 1적구(RED)가 2적구(YELLOW)를 쳐서 YELLOW가 등속으로 굴러갈 때,
+        #    수구(WHITE)가 3쿠션 후 굴러가는 YELLOW 옆을 그레이존(d_min=70mm)으로 비접촉 직진 통과
+        # ------------------------------------------------------------------
+        cue_1 = _interpolate_waypoints_60fps(
+            [
+                (400.0, 700.0),
+                (800.0, 500.0),    # RED(800, 450) 타격 (index 8)
+                (1500.0, 32.0),    # 1C: TOP
+                (2808.0, 600.0),   # 2C: RIGHT
+                (2000.0, 1388.0),  # 3C: BOTTOM
+                (1800.0, 700.0),   # 직선 진입 (index 40)
+                (1350.0, 700.0),   # 굴러가는 YELLOW 옆을 d_min=70mm로 무굴절 통과 (index 48)
+                (900.0, 700.0),
+            ],
+            frames_per_segment=8,
+        )
+        # RED가 index 12에서 YELLOW(1100, 560)를 타격하여 적구 간 키스 발생!
+        red_1 = _interpolate_waypoints_60fps(
+            [
+                (800.0, 450.0),
+                (800.0, 450.0),
+                (1100.0, 510.0),   # index 16에서 YELLOW와 적구 간 키스
+                (1150.0, 480.0),
+            ],
+            frames_per_segment=8,
+        )
+        # YELLOW는 index 16 이후 등속으로 굴러가며 index 48에서 (1350, 630)을 등속 통과 (delta_vy = 0)
+        yel_1: List[Point2D] = []
+        for i in range(len(cue_1)):
+            if i < 16:
+                yel_1.append((1100.0, 560.0))
+            elif i <= 54:
+                alpha = (i - 16) / 32.0
+                yel_1.append((1100.0 + 250.0 * alpha, 560.0 + 70.0 * alpha))
+            else:
+                yel_1.append((1100.0 + 250.0 * (38.0 / 32.0), 560.0 + 70.0 * (38.0 / 32.0)))
+
+        res_err1 = _run_causal_sim(cue_1, red_1, yel_1)
+        print(
+            f"[Causal Illusion 1 - Moving 2nd Ball Near-Miss] scored={res_err1.scored}, "
+            f"ob_kiss={res_err1.object_ball_kiss_occurred}, reason={res_err1.fail_reason}"
+        )
+        self.assertFalse(res_err1.scored)
+        self.assertTrue(res_err1.object_ball_kiss_occurred)
+
+        # ------------------------------------------------------------------
+        # 2) 오류 2: 3구 밀집 구역에서 수구가 1적구(RED, d=50mm)만 재키스하고 꺾였을 때
+        #    그레이존에 있던 2적구(YELLOW, d=71mm) 접촉으로 오판하지 않아야 함
+        # ------------------------------------------------------------------
+        cue_2 = _interpolate_waypoints_60fps(
+            [
+                (400.0, 700.0),
+                (800.0, 500.0),    # RED(800, 450) 최초 타격
+                (1500.0, 32.0),    # 1C: TOP
+                (2808.0, 600.0),   # 2C: RIGHT
+                (2000.0, 1388.0),  # 3C: BOTTOM
+                (1800.0, 700.0),
+                (1350.0, 700.0),   # 밀집 구역 진입: RED(1350, 750 -> d=50mm) 재키스! YELLOW(1350, 629 -> d=71mm) 비접촉!
+                (1000.0, 620.0),   # RED 재키스 반작용으로 -y 방향으로 꺾임
+            ],
+            frames_per_segment=8,
+        )
+        red_2 = [(800.0, 450.0)] * 9 + [(1350.0, 750.0)] * 39 + [(1350.0, 790.0)] * (len(cue_2) - 48)
+        yel_2 = [(1350.0, 629.0)] * len(cue_2)
+
+        res_err2 = _run_causal_sim(cue_2, red_2, yel_2)
+        print(
+            f"[Causal Illusion 2 - 1st Ball Re-Kiss in Cluster] scored={res_err2.scored}, "
+            f"reason={res_err2.fail_reason}"
+        )
+        self.assertFalse(res_err2.scored)
+
+        # ------------------------------------------------------------------
+        # 3) 오류 3: 쿠션에 밀착된 2적구(YELLOW: 1900, 1314 -> d_min=70.6mm 그레이존) 옆에서
+        #    수구가 YELLOW를 건드리지 않고 BOTTOM 쿠션(1900, 1388)만 맞고 반사된 경우 -> 노카운트
+        # ------------------------------------------------------------------
+        cue_3 = _interpolate_waypoints_60fps(
+            [
+                (400.0, 700.0),
+                (800.0, 500.0),    # RED(800, 450) 타격
+                (1500.0, 32.0),    # 1C: TOP
+                (2808.0, 900.0),   # 2C: RIGHT
+                (1920.0, 1386.0),  # 3C: BOTTOM 레일 진입 (y >= 1375.25mm)
+                (1880.0, 1388.0),  # BOTTOM 레일 정점 반사 (바로 위 (1900, 1314)에 YELLOW 정지, d_min=71mm 그레이존)
+                (1300.0, 1200.0),  # 쿠션 반사로 꺾여 나감 (YELLOW 미접촉)
+            ],
+            frames_per_segment=8,
+        )
+        red_3 = [(800.0, 450.0)] * len(cue_3)
+        yel_3 = [(1900.0, 1314.0)] * len(cue_3)  # 전혀 움직이지 않음 (delta_vy = 0)
+
+        res_err3 = _run_causal_sim(cue_3, red_3, yel_3)
+        print(
+            f"[Causal Illusion 3 - Rail Bounce Near Cushion Ball] scored={res_err3.scored}, "
+            f"reason={res_err3.fail_reason}"
+        )
+        self.assertFalse(res_err3.scored)
+
+        # ------------------------------------------------------------------
+        # 4) 오류 4: 수구가 3쿠션을 돌기 전에 1적구(RED)와 2적구(YELLOW)가 키스했으나,
+        #    이닝을 죽이지 않고 수구가 3쿠션 후 이동한 YELLOW를 정상 타격하여 득점 성공!
+        # ------------------------------------------------------------------
+        cue_4 = _interpolate_waypoints_60fps(
+            [
+                (400.0, 700.0),
+                (800.0, 500.0),    # RED(800, 450) 타격
+                (1500.0, 32.0),    # 1C: TOP
+                (2808.0, 650.0),   # 2C: RIGHT
+                (1900.0, 1388.0),  # 3C: BOTTOM
+                (1200.0, 900.0),   # 이동한 YELLOW(1200, 850) 정식 타격!
+                (1100.0, 820.0),
+            ],
+            frames_per_segment=8,
+        )
+        # RED가 타격 직후(1쿠션 전) YELLOW(1050, 550)와 부딪혀 YELLOW가 (1200, 850)으로 이동
+        red_4 = _interpolate_waypoints_60fps(
+            [
+                (800.0, 450.0),
+                (800.0, 450.0),
+                (1050.0, 500.0),   # index 16에서 YELLOW와 적구 간 키스
+                (1100.0, 460.0),
+            ],
+            frames_per_segment=8,
+        )
+        yel_4 = (
+            [(1050.0, 550.0)] * 16
+            + _interpolate_waypoints_60fps([(1050.0, 550.0), (1200.0, 850.0)], frames_per_segment=8)[1:]
+        )
+        yel_4.extend([(1200.0, 850.0)] * (len(cue_4) - len(yel_4)))
+
+        res_err4 = _run_causal_sim(cue_4, red_4, yel_4)
+        print(
+            f"[Causal Illusion 4 - Pre-3C Object Ball Kiss Then Valid Hit] "
+            f"scored={res_err4.scored}, ob_kiss={res_err4.object_ball_kiss_occurred}, "
+            f"cushions_at_2nd={res_err4.cushions_at_second_hit}"
+        )
+        self.assertTrue(res_err4.scored)
+        self.assertTrue(res_err4.object_ball_kiss_occurred)
+        self.assertGreaterEqual(res_err4.cushions_at_second_hit, 3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
