@@ -36,6 +36,19 @@ from cue24.core.table_calibrator import TableCalibrator
 from cue24.core.var_referee import VARReferee
 from cue24.mcp.billiard_physics_mcp import billiard_mcp_server, physics_ai_engine
 from cue24.services.match_manager import MatchManager, MatchState
+from three_cushion_vision.billiard_nanogpt import (
+    OcclusionTrajectoryRestorer,
+    get_or_train_billiard_nanogpt,
+)
+from three_cushion_vision.causal_kiss_fsm import (
+    BallColor as VisionBallColor,
+    CausalKissSafeFSM,
+    ShotResult as CausalShotResult,
+    ShotState as CausalShotState,
+)
+from three_cushion_vision.config import BallColor as KDColor
+from three_cushion_vision.kinematics_detector import KinematicsDetector
+from three_cushion_vision.tracker_adapter import TrackedBall
 
 Point2D = Tuple[float, float]
 
@@ -181,6 +194,17 @@ class LiveStreamReader:
 
         self._init_video_capture(self.video_path)
 
+        # [Autoresearch 100% + BilliardNanoGPT + 3체 인과 키스 분리 엔진 통합]
+        self.nanogpt_model = get_or_train_billiard_nanogpt()
+        self.trajectory_restorers: Dict[int, OcclusionTrajectoryRestorer] = {
+            1: OcclusionTrajectoryRestorer(self.nanogpt_model, device="cpu"),
+            2: OcclusionTrajectoryRestorer(self.nanogpt_model, device="cpu"),
+            3: OcclusionTrajectoryRestorer(self.nanogpt_model, device="cpu"),
+        }
+        self.causal_kiss_fsm = CausalKissSafeFSM(fps=max(15.0, self.video_fps))
+        self._last_causal_shot_result: Optional[CausalShotResult] = None
+        self.vision_kinematics = KinematicsDetector()
+
         self._cue_trajectory: List[Point2D] = []
         self._target_trajectories: Dict[int, List[Point2D]] = {}
 
@@ -195,6 +219,19 @@ class LiveStreamReader:
             ball_colors={1: "WHITE", 2: "YELLOW", 3: "RED"},
         )
         self.scoring_engine.reset_shot(cue_ball_id=1, object_ball_ids=[2, 3])
+
+    def _predict_occluded_ball_position(self, bid: int) -> Point2D:
+        """
+        트랙 ID(bid)가 큐대·신체·충돌로 가려졌을 때(Occlusion),
+        주행 중이고 BilliardNanoGPT 컨텍스트 버퍼가 3프레임 이상 존재하면
+        직선 칼만 필터 대신 비선형 쿠션 반사 궤적 복원기(OcclusionTrajectoryRestorer)로 좌표를 복원합니다.
+        """
+        st = self.tracker.balls[bid]
+        restorer = self.trajectory_restorers.get(bid)
+        if restorer is not None and len(restorer.buffer) >= 3 and st.speed >= 4.0:
+            pred_x, pred_y, _, _ = restorer.step(None)
+            return (float(pred_x), float(pred_y))
+        return st.predict_kalman_position()
 
     def _update_cached_half_homography(self) -> None:
         """0.5x(1420x710) 및 0.25x(710x355, 프레임당 2.4ms 초고속 워프)용 호모그래피 행렬을 사전 계산합니다."""
@@ -345,6 +382,9 @@ class LiveStreamReader:
         self.spin_detector.reset()
         self._missing_streak_by_id.clear()
         self._last_missing_wait_id = None
+        for restorer in self.trajectory_restorers.values():
+            restorer.reset()
+        self.vision_kinematics.reset()
         self._reset_wall_clock_sync()
 
         if self.is_real_video_loaded and self._video_cap is not None:
@@ -481,8 +521,8 @@ class LiveStreamReader:
         ]
         if not detected_pts:
             return [
-                st.predict_kalman_position()
-                for st in self.tracker.balls.values()
+                self._predict_occluded_ball_position(bid)
+                for bid in sorted(self.tracker.balls.keys())
             ]
 
         remaining_ids = set(self.tracker.balls.keys())
@@ -501,8 +541,7 @@ class LiveStreamReader:
             remaining_ids.remove(nearest_id)
 
         for missing_id in sorted(remaining_ids):
-            st = self.tracker.balls[missing_id]
-            completed_pts.append(st.predict_kalman_position())
+            completed_pts.append(self._predict_occluded_ball_position(missing_id))
 
         return completed_pts[:3]
 
@@ -623,7 +662,7 @@ class LiveStreamReader:
                 ):
                     self._last_missing_wait_id = missing_id
 
-                kalman_pt = st.predict_kalman_position()
+                kalman_pt = self._predict_occluded_ball_position(missing_id)
                 rescued_pt: Optional[Point2D] = None
                 if blur_candidates:
                     near_blurs = [
@@ -810,6 +849,82 @@ class LiveStreamReader:
 
         return self.read_live_frame_jpeg()
 
+    def _build_vision_color_positions(
+        self, ball_states: Dict[int, Any], use_prev: bool = False
+    ) -> Tuple[Dict[VisionBallColor, Point2D], Dict[KDColor, TrackedBall]]:
+        """
+        현재 트랙 상태(ball_states)를 CausalKissSafeFSM(VisionBallColor) 및
+        KinematicsDetector(KDColor -> TrackedBall) 입력용 딕셔너리로 변환합니다.
+        """
+        v_map: Dict[VisionBallColor, Point2D] = {}
+        kd_map: Dict[KDColor, TrackedBall] = {}
+        fps_scale = max(15.0, self.video_fps)
+        color_lookup = {
+            "WHITE": (VisionBallColor.WHITE, KDColor.WHITE),
+            "YELLOW": (VisionBallColor.YELLOW, KDColor.YELLOW),
+            "RED": (VisionBallColor.RED, KDColor.RED),
+        }
+        fallback_order = [
+            (VisionBallColor.WHITE, KDColor.WHITE),
+            (VisionBallColor.YELLOW, KDColor.YELLOW),
+            (VisionBallColor.RED, KDColor.RED),
+        ]
+
+        for bid in sorted(ball_states.keys()):
+            st = ball_states[bid]
+            if use_prev and bid in self._rest_positions:
+                pt = self._rest_positions[bid]
+                vx, vy, spd = 0.0, 0.0, 0.0
+            elif use_prev:
+                pt = (float(st.prev_position[0]), float(st.prev_position[1]))
+                vx, vy, spd = 0.0, 0.0, 0.0
+            else:
+                pt = (float(st.position[0]), float(st.position[1]))
+                vx = float(st.velocity[0]) * fps_scale
+                vy = float(st.velocity[1]) * fps_scale
+                spd = float(st.speed) * fps_scale
+
+            col_pair = color_lookup.get(str(st.color).upper())
+            if col_pair is not None and col_pair[0] not in v_map:
+                v_map[col_pair[0]] = pt
+                kd_map[col_pair[1]] = TrackedBall(
+                    raw_track_id=bid,
+                    color=col_pair[1],
+                    x=pt[0],
+                    y=pt[1],
+                    vx=vx,
+                    vy=vy,
+                    speed=spd,
+                )
+
+        # 혹시 색상 미할당 트랙이 있을 경우 남은 색상 슬롯에 순서대로 매핑 보장
+        for bid in sorted(ball_states.keys()):
+            if len(v_map) >= 3:
+                break
+            st = ball_states[bid]
+            pt = (
+                (float(st.prev_position[0]), float(st.prev_position[1]))
+                if use_prev
+                else (float(st.position[0]), float(st.position[1]))
+            )
+            if pt in v_map.values():
+                continue
+            for vc, kc in fallback_order:
+                if vc not in v_map:
+                    v_map[vc] = pt
+                    kd_map[kc] = TrackedBall(
+                        raw_track_id=bid,
+                        color=kc,
+                        x=pt[0],
+                        y=pt[1],
+                        vx=0.0 if use_prev else float(st.velocity[0]) * fps_scale,
+                        vy=0.0 if use_prev else float(st.velocity[1]) * fps_scale,
+                        speed=0.0 if use_prev else float(st.speed) * fps_scale,
+                    )
+                    break
+
+        return v_map, kd_map
+
     async def process_coordinate_step(
         self,
         detected_points: List[Point2D],
@@ -841,6 +956,21 @@ class LiveStreamReader:
             for bid, col in detected_colors.items():
                 if bid in ball_states:
                     ball_states[bid].color = col
+
+        # 가시 상태인 각 공의 시계열 궤적을 BilliardNanoGPT 복원기(OcclusionTrajectoryRestorer) 버퍼에 적재
+        fps_scale = max(15.0, self.video_fps)
+        for bid, st in ball_states.items():
+            if self._missing_streak_by_id.get(bid, 0) == 0:
+                restorer = self.trajectory_restorers.get(bid)
+                if restorer is not None:
+                    restorer.step(
+                        (
+                            float(st.position[0]),
+                            float(st.position[1]),
+                            float(st.velocity[0]) * fps_scale,
+                            float(st.velocity[1]) * fps_scale,
+                        )
+                    )
 
         # 2. WAIT_SHOT 상태에서 처음 움직이는 공을 수구(Cue Ball)로 인식 및 2단계(색상 감지기 OFF + 타이머 정지) 진입
         if self.match_manager.fsm_state == MatchState.WAIT_SHOT:
@@ -936,6 +1066,37 @@ class LiveStreamReader:
                 self.scoring_engine.reset_shot(
                     cue_ball_id=cue_id, object_ball_ids=obj_ids
                 )
+                # 3체 인과 키스 분리 엔진(CausalKissSafeFSM) 및 100% Autoresearch 물리 감지기 초기화
+                shooter_vcol = (
+                    VisionBallColor.YELLOW
+                    if str(cue_state.color).upper() == "YELLOW"
+                    else VisionBallColor.WHITE
+                )
+                self.causal_kiss_fsm._reset_shot()
+                self.causal_kiss_fsm.assigned_cue_ball = shooter_vcol
+                self.causal_kiss_fsm.active_cue_ball = shooter_vcol
+                self.causal_kiss_fsm.state = CausalShotState.IN_PLAY
+                self._last_causal_shot_result = None
+                self.vision_kinematics.reset()
+                init_vpos, init_kdpos = self._build_vision_color_positions(
+                    ball_states, use_prev=True
+                )
+                if len(init_vpos) == 3:
+                    t_init = max(0, self.frame_counter - 1) / fps_scale
+                    self.causal_kiss_fsm.update(
+                        t=t_init,
+                        coords_mm=init_vpos,
+                    )
+                    self.vision_kinematics.step(
+                        balls=init_kdpos,
+                        assigned_cue_ball=(
+                            KDColor.YELLOW
+                            if str(cue_state.color).upper() == "YELLOW"
+                            else KDColor.WHITE
+                        ),
+                        timestamp=t_init,
+                        current_cushion_count=0,
+                    )
                 # 샷 출발 전 정지 기준점(_rest_positions)이 존재하면 득점 엔진 초기 위치 및 시계열 궤적 시작점으로 보존
                 if self._rest_positions and len(self._rest_positions) == 3:
                     self.scoring_engine._initial_ball_positions = {
@@ -1007,6 +1168,29 @@ class LiveStreamReader:
                 cue_velocity=cue_vel,
             )
 
+            # 3체 인과 키스 분리 엔진 및 Autoresearch 100% 물리 감지기 실시간 동기화
+            cur_vpos, cur_kdpos = self._build_vision_color_positions(
+                ball_states, use_prev=False
+            )
+            if len(cur_vpos) == 3:
+                t_curr = self.frame_counter / fps_scale
+                maybe_causal = self.causal_kiss_fsm.update(
+                    t=t_curr,
+                    coords_mm=cur_vpos,
+                )
+                if maybe_causal is not None:
+                    self._last_causal_shot_result = maybe_causal
+                self.vision_kinematics.step(
+                    balls=cur_kdpos,
+                    assigned_cue_ball=(
+                        KDColor.YELLOW
+                        if str(cue_state.color).upper() == "YELLOW"
+                        else KDColor.WHITE
+                    ),
+                    timestamp=t_curr,
+                    current_cushion_count=self.scoring_engine.total_cushion_count,
+                )
+
             self._cue_trajectory.append(positions_map[cue_id])
             for bid, tr_list in self._target_trajectories.items():
                 if bid in positions_map:
@@ -1068,6 +1252,67 @@ class LiveStreamReader:
                 shot_eval = self.scoring_engine.evaluate_shot(
                     has_double_touch_foul=has_double_touch_foul
                 )
+
+                # [3체 인과 키스 분리(CausalKissSafeFSM) & Autoresearch 100% 초미세 판독 결합]
+                causal_res = self._last_causal_shot_result or self.causal_kiss_fsm._finalize_shot(
+                    self.frame_counter / fps_scale
+                )
+                self._last_causal_shot_result = None
+                ob_kiss = bool(
+                    causal_res.object_ball_kiss_occurred
+                    or self.vision_kinematics.object_ball_kiss_occurred
+                )
+                shot_eval["object_ball_kiss_occurred"] = ob_kiss
+                shot_eval["causal_event_log"] = list(causal_res.event_log)
+
+                # 1) 0.3mm 초미세 스침 / 시속 35km 고속 코너 반사 등 기존 엔진 미탐지 득점을 정밀 구출
+                if (
+                    not bool(shot_eval.get("is_scored", False))
+                    and not has_double_touch_foul
+                    and causal_res.scored
+                ):
+                    shot_eval["is_scored"] = True
+                    shot_eval["shot_type"] = (
+                        "BANK_SHOT" if causal_res.is_bank_shot else "REGULAR_3C"
+                    )
+                    shot_eval["reason_code"] = (
+                        "VALID_BANK_SHOT"
+                        if causal_res.is_bank_shot
+                        else "VALID_REGULAR_3C"
+                    )
+                    shot_eval["cushions_before_second_hit"] = max(
+                        int(shot_eval.get("cushions_before_second_hit", 0)),
+                        int(causal_res.cushions_at_second_hit),
+                    )
+                    shot_eval["total_cushions"] = max(
+                        int(shot_eval.get("total_cushions", 0)),
+                        int(causal_res.total_cushions),
+                    )
+                    shot_eval["message"] = (
+                        f"득점 인정 (초미세 인과 판독): "
+                        f"{shot_eval['cushions_before_second_hit']}쿠션 후 제2적구 충돌 성공!"
+                    )
+                # 2) 1적구-2적구 간 키스가 발생했으나 수구가 제2적구를 맞히지 않고 스쳐 지나간 착시(오류 1~3)를 원천 차단
+                elif (
+                    bool(shot_eval.get("is_scored", False))
+                    and causal_res.object_ball_kiss_occurred
+                    and not causal_res.scored
+                ):
+                    shot_eval["is_scored"] = False
+                    shot_eval["shot_type"] = "MISS"
+                    shot_eval["reason_code"] = "CAUSAL_KISS_ILLUSION_BLOCKED"
+                    shot_eval["message"] = (
+                        "노카운트 (3체 인과 판독): 1적구-2적구 키스 후 수구 제2적구 미접촉 착시 차단"
+                    )
+
+                if (
+                    bool(shot_eval.get("is_scored", False))
+                    and causal_res.object_ball_kiss_occurred
+                    and "적구 간 키스" not in str(shot_eval.get("message", ""))
+                ):
+                    shot_eval["message"] = (
+                        f"{shot_eval.get('message', '')} [3체 인과 판독: 적구 간 키스 분리 정상 득점]"
+                    )
 
                 # [유령 샷(Phantom Trigger) 필터]
                 # 실제 카메라/영상 스트림(require_rest_displacement=True)에서 선수가 당구대 옆을 지나가거나
