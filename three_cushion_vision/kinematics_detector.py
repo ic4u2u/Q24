@@ -43,6 +43,7 @@ class ConfirmedContactEvent:
     deflection_deg: float = 0.0
     target_impulse_disp_mm: float = 0.0
     cushions_at_impact: int = 0       # 충돌 발생 시점(t_impact) 당시의 누적 쿠션 수
+    impact_normal: Point2D = (1.0, 0.0)  # 최근접 시점 수구(A) -> 목적구(B) 단위 법선 벡터
 
 
 @dataclass
@@ -105,7 +106,132 @@ class KinematicsDetector:
         self.active_rails: Set[Rail] = set()
         self._counted_in_active_rail: Set[Rail] = set()
         self.object_ball_kiss_occurred: bool = False
+        self.centroid_shift_corrected_count: int = 0
+        self._missing_streak: Dict[BallColor, int] = {
+            BallColor.WHITE: 0,
+            BallColor.YELLOW: 0,
+            BallColor.RED: 0,
+        }
         self.near_miss_logs: List[Dict[str, object]] = []
+
+    def _stabilize_blob_merging(
+        self,
+        timestamp: float,
+        raw_balls: Dict[BallColor, Optional[TrackedBall]],
+    ) -> Optional[Dict[BallColor, TrackedBall]]:
+        """
+        [보정 포인트 2] 초근접 키스/충돌 구간에서 발생하는
+        1) 바운딩 박스 병합으로 인한 검출 누락(None 또는 키 누락, 1~6프레임)을 직전 위치·속도 기반 운동학 예측 좌표로 자동 보간하고,
+        2) 근접 구간(d <= 85.0mm)에서 바운딩 박스가 상대방 공 쪽으로 찌그러져 중심점이 급격히 끌려가는 현상
+           (잔차 > 14.0mm & 변위 방향이 상대 공 중심과 일치)이 감지되면 예측 좌표 가중치를 0.85로 높여 중심점 점프를 억제합니다.
+        """
+        predicted_pos: Dict[BallColor, np.ndarray] = {}
+        dt = (
+            max(timestamp - self._prev_timestamp, 1e-4)
+            if self._prev_timestamp is not None
+            else (1.0 / self.config.DEFAULT_FPS)
+        )
+        r_ball = self.config.BALL_RADIUS_MM
+        w_table = self.config.TABLE_WIDTH_MM
+        h_table = self.config.TABLE_HEIGHT_MM
+
+        stabilized: Dict[BallColor, TrackedBall] = {}
+        all_colors = (BallColor.WHITE, BallColor.YELLOW, BallColor.RED)
+
+        for color in all_colors:
+            obs = raw_balls.get(color, None)
+            if self._prev_balls is not None and color in self._prev_balls:
+                b_prev = self._prev_balls[color]
+                px_pred = min(max(b_prev.x + b_prev.vx * dt, r_ball), w_table - r_ball)
+                py_pred = min(max(b_prev.y + b_prev.vy * dt, r_ball), h_table - r_ball)
+                predicted_pos[color] = np.array([px_pred, py_pred], dtype=np.float64)
+            elif obs is not None:
+                predicted_pos[color] = np.array([obs.x, obs.y], dtype=np.float64)
+
+            if obs is None:
+                self._missing_streak[color] = self._missing_streak.get(color, 0) + 1
+                if (
+                    color in predicted_pos
+                    and self._prev_balls is not None
+                    and color in self._prev_balls
+                    and self._missing_streak[color] <= self.config.MAX_OCCLUSION_INTERP_FRAMES
+                ):
+                    b_prev = self._prev_balls[color]
+                    p_pred = predicted_pos[color]
+                    stabilized[color] = TrackedBall(
+                        color=color,
+                        x=float(p_pred[0]),
+                        y=float(p_pred[1]),
+                        vx=b_prev.vx,
+                        vy=b_prev.vy,
+                        speed=b_prev.speed,
+                        raw_track_id=b_prev.raw_track_id,
+                        timestamp=timestamp,
+                        is_occluded_restored=True,
+                    )
+                else:
+                    return None
+            else:
+                self._missing_streak[color] = 0
+                stabilized[color] = obs
+
+        # 근접 구간(d <= 85.0mm)에서 바운딩 박스 병합에 의한 중심점 끌림(Centroid Shift) 클램핑
+        if self._prev_balls is not None and len(self._prev_balls) == 3:
+            for i in range(len(all_colors)):
+                for j in range(i + 1, len(all_colors)):
+                    c1, c2 = all_colors[i], all_colors[j]
+                    if c1 not in predicted_pos or c2 not in predicted_pos:
+                        continue
+                    p1_pred, p2_pred = predicted_pos[c1], predicted_pos[c2]
+                    dist_pred = float(np.linalg.norm(p2_pred - p1_pred))
+
+                    if dist_pred <= self.config.BLOB_PROXIMITY_ZONE_MM:
+                        for target_c, neighbor_c in ((c1, c2), (c2, c1)):
+                            b_obs = stabilized[target_c]
+                            b_prev = self._prev_balls[target_c]
+                            p_obs = np.array([b_obs.x, b_obs.y], dtype=np.float64)
+                            p_prev = np.array([b_prev.x, b_prev.y], dtype=np.float64)
+                            p_prd = predicted_pos[target_c]
+                            shift_vec = p_obs - p_prd
+                            shift_mag = float(np.linalg.norm(shift_vec))
+
+                            to_neighbor = predicted_pos[neighbor_c] - p_prd
+                            to_neighbor_dist = float(np.linalg.norm(to_neighbor))
+                            to_neighbor_norm = to_neighbor / max(to_neighbor_dist, 1e-6)
+                            pull_alignment = float(
+                                np.dot(
+                                    shift_vec / max(shift_mag, 1e-6),
+                                    to_neighbor_norm,
+                                )
+                            )
+                            # 실제 관측 변위(p_obs - p_prev) 역시 상대 공 방향으로 끌려갔는지 확인 (단순 감속/정지 배제)
+                            actual_disp = p_obs - p_prev
+                            actual_pull_mm = float(np.dot(actual_disp, to_neighbor_norm))
+
+                            # 1프레임 잔차가 14.0mm 초과 ~ 38.0mm 이하(바운딩 박스 병합 물리 한계)이면서
+                            # 변위 방향이 상대 공 중심 방향(pull_alignment > 0.45)으로 실제 끌려간 경우
+                            if (
+                                self.config.MAX_CENTROID_JUMP_RESIDUAL_MM < shift_mag <= 38.0
+                                and pull_alignment > 0.45
+                                and actual_pull_mm > 8.0
+                            ):
+                                clamped_p = 0.85 * p_prd + 0.15 * p_obs
+                                new_vx = float(clamped_p[0] - b_prev.x) / dt
+                                new_vy = float(clamped_p[1] - b_prev.y) / dt
+                                stabilized[target_c] = TrackedBall(
+                                    color=target_c,
+                                    x=float(clamped_p[0]),
+                                    y=float(clamped_p[1]),
+                                    vx=new_vx,
+                                    vy=new_vy,
+                                    speed=math.hypot(new_vx, new_vy),
+                                    raw_track_id=b_obs.raw_track_id,
+                                    timestamp=b_obs.timestamp,
+                                    is_occluded_restored=b_obs.is_occluded_restored,
+                                )
+                                self.centroid_shift_corrected_count += 1
+
+        return stabilized
 
     @staticmethod
     def compute_subframe_ccd(
@@ -373,6 +499,7 @@ class KinematicsDetector:
                     deflection_deg=step_angle_deg,
                     target_impulse_disp_mm=target_disp_mm,
                     cushions_at_impact=cand.cushions_at_impact,
+                    impact_normal=(float(cand.impact_normal[0]), float(cand.impact_normal[1])),
                 )
             return None
 
@@ -429,24 +556,32 @@ class KinematicsDetector:
                 deflection_deg=deflection_deg,
                 target_impulse_disp_mm=max(0.0, normal_disp_mm),
                 cushions_at_impact=cand.cushions_at_impact,
+                impact_normal=(float(cand.impact_normal[0]), float(cand.impact_normal[1])),
             )
 
         return None
 
     def step(
         self,
-        balls: Dict[BallColor, TrackedBall],
+        balls: Dict[BallColor, Optional[TrackedBall]],
         assigned_cue_ball: BallColor,
         timestamp: float,
         current_cushion_count: int = 0,
+        already_stabilized: bool = False,
     ) -> Tuple[List[CushionImpactEvent], List[ConfirmedContactEvent]]:
         """
         매 프레임(60fps) 3개의 공 상태를 입력받아:
+        0) 바운딩 박스 병합(Blob Merging) 결측 복원 및 중심점 끌림 보정을 수행하고,
         1) 4면 쿠션 접촉 이벤트를 먼저 검출하여 쿠션 카운트를 갱신하고,
         2) 서브프레임 CCD 및 방향성 물리 증거 게이트로 목적구 접촉 이벤트를 판별합니다.
         """
-        if assigned_cue_ball not in balls:
+        if not already_stabilized:
+            stabilized_balls = self._stabilize_blob_merging(timestamp, balls)
+        else:
+            stabilized_balls = {c: b for c, b in balls.items() if b is not None} if balls else None
+        if stabilized_balls is None or assigned_cue_ball not in stabilized_balls:
             return [], []
+        balls = stabilized_balls
 
         cue_curr = balls[assigned_cue_ball]
         cushion_events: List[CushionImpactEvent] = []
@@ -607,6 +742,7 @@ class KinematicsDetector:
                                 deflection_deg=in_step_deflect_deg,
                                 target_impulse_disp_mm=curr_target_disp,
                                 cushions_at_impact=effective_cushions,
+                                impact_normal=(float(impact_normal[0]), float(impact_normal[1])),
                             )
                         )
                         continue

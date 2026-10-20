@@ -43,6 +43,7 @@ class FailReason(str, Enum):
     MISSING_FIRST_BALL = "MISSING_FIRST_BALL"                # 제1목적구 미접촉 (완전 공타)
     WRONG_CUE_BALL_FOUL = "WRONG_CUE_BALL_FOUL"              # 상대방 수구 또는 적구 선행 출발 파울
     BALL_OUT_OF_TABLE = "BALL_OUT_OF_TABLE"                  # 당구대 장외 이탈 파울
+    DOUBLE_HIT_FOUL = "DOUBLE_HIT_FOUL"                      # 큐대 투터치(밀어치기) 파울
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,15 @@ class VisionConfig:
     IDLE_CONFIRM_DURATION_SEC: float = 0.30  # 모든 공 정지 유지 확정 시간 (0.3초 = 60fps 기준 18프레임)
     STROKE_START_SPEED_MM_S: float = 180.0   # 수구 타구 출발 감지 속력 (>= 180.0 mm/s)
     OUT_OF_TABLE_TOLERANCE_MM: float = 35.0  # 당구대 이탈 허용 오차 마진 (mm)
+
+    # 7. 투터치(Double Hit) 파울 감지 및 바운딩 박스 병합(Blob Merging) 중심점 보정 임계값
+    DOUBLE_HIT_WINDOW_SEC: float = 0.15            # 스트로크 직후 0.15초(9프레임) 이내
+    DOUBLE_HIT_INIT_DIST_MAX_MM: float = 115.0     # 수구-제1적구 초기 근접 거리 임계값 (mm)
+    DOUBLE_HIT_REACCEL_THRESH_MM_S2: float = 1500.0  # 충돌 직후 재가속 임계값 (mm/s^2)
+    DOUBLE_HIT_FOLLOW_RATIO: float = 0.75          # 정면충돌 후 수구/제1적구 법선 속도 비율 한계
+    BLOB_PROXIMITY_ZONE_MM: float = 85.0           # 박스 병합 간섭이 일어나는 근접 반경 (mm)
+    MAX_CENTROID_JUMP_RESIDUAL_MM: float = 14.0    # 1프레임 내 비물리적 중심점 끌림 허용 한계 (mm)
+    MAX_OCCLUSION_INTERP_FRAMES: int = 6           # 결측 시 외삽 복원 최대 프레임 수
 
 
 DEFAULT_CONFIG = VisionConfig()

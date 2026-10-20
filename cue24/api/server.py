@@ -1083,6 +1083,11 @@ class LiveStreamReader:
                 )
                 if len(init_vpos) == 3:
                     t_init = max(0, self.frame_counter - 1) / fps_scale
+                    self.causal_kiss_fsm.stroke_start_time = t_init
+                    self.causal_kiss_fsm.initial_positions = {
+                        vc: np.array([float(pt[0]), float(pt[1])], dtype=np.float64)
+                        for vc, pt in init_vpos.items()
+                    }
                     self.causal_kiss_fsm.update(
                         t=t_init,
                         coords_mm=init_vpos,
@@ -1263,7 +1268,22 @@ class LiveStreamReader:
                     or self.vision_kinematics.object_ball_kiss_occurred
                 )
                 shot_eval["object_ball_kiss_occurred"] = ob_kiss
+                shot_eval["double_hit_foul"] = bool(
+                    causal_res.double_hit_foul or has_double_touch_foul
+                )
+                shot_eval["centroid_shift_corrected_count"] = int(
+                    causal_res.centroid_shift_corrected_count
+                    + self.vision_kinematics.centroid_shift_corrected_count
+                )
                 shot_eval["causal_event_log"] = list(causal_res.event_log)
+
+                if causal_res.double_hit_foul and not has_double_touch_foul:
+                    shot_eval["is_scored"] = False
+                    shot_eval["shot_type"] = "FOUL"
+                    shot_eval["reason_code"] = "DOUBLE_HIT_FOUL"
+                    shot_eval["message"] = (
+                        "파울 (투터치/밀어치기 감지): 근접 충돌 직후 수구 재가속·비정상 추격 차단"
+                    )
 
                 # 1) 0.3mm 초미세 스침 / 시속 35km 고속 코너 반사 등 기존 엔진 미탐지 득점을 정밀 구출
                 if (

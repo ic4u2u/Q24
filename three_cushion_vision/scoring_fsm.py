@@ -7,17 +7,29 @@ Module D: 쓰리쿠션 공식 규칙 결정론적 유한 상태 머신 (ThreeCus
    - IN_PLAY: 지정 수구(assigned_cue_ball)가 180.0 mm/s 이상으로 출발하여 이닝이 진행 중인 상태
               (적구 또는 상대방 수구가 먼저 출발 시 WRONG_CUE_BALL_FOUL로 즉시 NO_SCORE_LOCKED 전이)
    - VALID_SCORE_PENDING: 3쿠션 이상 득점 조건을 충족하고 모든 공이 정지하기를 기다리는 상태
-   - NO_SCORE_LOCKED: 조기 제2목적구 접촉(EARLY_SECOND_BALL_KISS) 또는 당구대 이탈 파울 등으로 무효가 영구 잠금된 상태
+   - NO_SCORE_LOCKED: 조기 제2목적구 접촉(EARLY_SECOND_BALL_KISS), 투터치 파울(DOUBLE_HIT_FOUL), 또는 당구대 이탈 파울 등으로 무효가 영구 잠금된 상태
 2. 제2목적구 최초 접촉 게이트:
    - 제2목적구 최초 접촉 순간 cushion_count >= 3이면 VALID_SCORE_PENDING(선행 3쿠션 이상 시 is_bank_shot=True),
      cushion_count < 3이면 즉시 NO_SCORE_LOCKED(fail_reason="EARLY_SECOND_BALL_KISS")로 영구 잠금합니다.
-3. 턴 종료 및 결과 반환:
+3. 투터치(Double Hit / 밀어치기 파울) 자동 감지 (_check_double_hit_foul):
+   - 스트로크 출발 시점 수구(A)와 제1적구(B)의 초기 거리가 115.0mm 이하이고,
+     스트로크 시작 후 0.15초 이내에 제1적구 충돌이 발생한 직후
+     (조건 A) 충돌 후 수구가 재가속(a_A · v_A > 0 및 a_A · n_AB > 1500 mm/s^2)되거나,
+     (조건 B) 정면충돌(cos theta > 0.85) 후 수구 법선 속도가 제1적구 법선 속도의 75% 이상을 유지하며 추격하면
+     즉시 ShotState.NO_SCORE_LOCKED (fail_reason="DOUBLE_HIT_FOUL")로 전환합니다.
+4. 초근접 바운딩 박스 병합(Blob Merging) 결측 복원 및 중심점 점프 보정 (_stabilize_blob_merging):
+   - 1~6프레임 검출 누락(None) 시 직전 위치·속도 벡터 기반 운동학 예측 좌표로 복원하고,
+     근접 구간(<= 85.0mm) 중심점 끌림(> 14.0mm) 발생 시 예측 좌표 가중치를 0.85로 높여 가짜 속도 변화를 억제합니다.
+5. 턴 종료 및 결과 반환:
    - 모든 공이 완전 정지하면 ShotResult를 반환하고, 노카운트 시 다음 이닝의 assigned_cue_ball을 상대방 수구로 자동 교대합니다.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+import numpy as np
 
+from three_cushion_vision.causal_kiss_fsm import CausalKissSafeFSM
 from three_cushion_vision.config import (
     BallColor,
     DEFAULT_CONFIG,
@@ -51,12 +63,15 @@ class ShotResult:
     second_target_ball: Optional[BallColor] = None
     retroactive_previous_score_compensated: bool = False
     object_ball_kiss_occurred: bool = False
+    double_hit_foul: bool = False
+    centroid_shift_corrected_count: int = 0
 
 
 class ThreeCushionScoringFSM:
     """
-    KinematicsDetector와 연동하여 60fps 프레임 스트림에서 쓰리쿠션 공식 규칙을
-    오차 없이 결정론적으로 판정하는 유한 상태 머신(FSM) 클래스입니다.
+    KinematicsDetector와 연동하여 60fps 프레임 스트림에서 쓰리쿠션 공식 규칙,
+    투터치(Double Hit) 파울 감지, 바운딩 박스 병합(Blob Merging) 중심점 보정을
+    결정론적으로 판정하는 유한 상태 머신(FSM) 클래스입니다.
     """
 
     def __init__(
@@ -73,6 +88,7 @@ class ThreeCushionScoringFSM:
         self._last_completed_cue_ball: Optional[BallColor] = None
         self._last_completed_was_miss: bool = False
         self.total_retroactive_compensations: int = 0
+        self._last_idle_positions: Dict[BallColor, np.ndarray] = {}
         self._reset_inning_state()
 
     def _reset_inning_state(self) -> None:
@@ -80,6 +96,15 @@ class ThreeCushionScoringFSM:
         self.state: ShotState = ShotState.IDLE
         self.first_target_ball: Optional[BallColor] = None
         self.second_target_ball: Optional[BallColor] = None
+        self.first_target_hit_time: Optional[float] = None
+        self.first_target_normal: Optional[np.ndarray] = None
+        self.cue_pre_first_hit_vel: Optional[np.ndarray] = None
+        self.initial_positions: Dict[BallColor, np.ndarray] = {}
+        self.initial_ball_distances: Dict[BallColor, float] = {}
+        self.double_hit_foul: bool = False
+        self.centroid_shift_corrected_count: int = 0
+        self._prev_cue_vel: Optional[np.ndarray] = None
+        self._prev_frame_time: Optional[float] = None
         self.cushion_count: int = 0
         self.cushions_before_first_ball: int = 0
         self.cushions_at_second_ball: int = 0
@@ -90,6 +115,136 @@ class ThreeCushionScoringFSM:
         self.all_stopped_since: Optional[float] = None
         self.retroactive_compensated_in_shot: bool = False
         self.kinematics.reset()
+
+    def _stabilize_blob_merging(
+        self,
+        timestamp: float,
+        balls: Dict[BallColor, Optional[TrackedBall]],
+    ) -> Optional[Dict[BallColor, TrackedBall]]:
+        """
+        초근접 키스 구간 바운딩 박스 병합(Blob Merging) 결측 복원 및 중심점 점프 보정을 수행합니다.
+        """
+        stabilized = self.kinematics._stabilize_blob_merging(timestamp, balls)
+        self.centroid_shift_corrected_count = self.kinematics.centroid_shift_corrected_count
+        return stabilized
+
+    def _record_initial_ball_distances(
+        self, balls: Dict[BallColor, TrackedBall]
+    ) -> None:
+        """
+        스트로크 출발 시점(IDLE -> IN_PLAY)에 수구(A)와 목적구(B, C) 간의 초기 위치 및 초기 거리를 기록합니다.
+        """
+        if self._last_idle_positions and len(self._last_idle_positions) == 3:
+            self.initial_positions = {
+                c: pos.copy() for c, pos in self._last_idle_positions.items()
+            }
+        else:
+            self.initial_positions = {
+                c: np.array([b.x, b.y], dtype=np.float64) for c, b in balls.items()
+            }
+
+        cue_pos = self.initial_positions.get(self.assigned_cue_ball)
+        self.initial_ball_distances = {}
+        if cue_pos is not None:
+            for c, pos in self.initial_positions.items():
+                if c != self.assigned_cue_ball:
+                    self.initial_ball_distances[c] = float(
+                        np.linalg.norm(pos - cue_pos)
+                    )
+
+    def _check_double_hit_foul(
+        self,
+        timestamp: float,
+        balls: Dict[BallColor, TrackedBall],
+        cue_vel_prev: Optional[np.ndarray],
+        dt: float,
+    ) -> None:
+        """
+        [추가 보정 1] 투터치(Double Hit / 밀어치기 파울) 자동 감지:
+        - 스트로크 출발 시점 수구(A)와 제1적구(B)의 초기 거리가 115.0mm 이하이고,
+        - 스트로크 시작 후 0.15초(약 9프레임) 이내에 제1적구 충돌이 발생했을 때,
+        - 충돌 직후 프레임에서 아래 두 조건 중 하나라도 만족하면 즉시 NO_SCORE_LOCKED ("DOUBLE_HIT_FOUL")로 전환합니다:
+          * 조건 A (충돌 후 재가속): a_A · v_A > 0 및 법선 가속도 a_A · n_AB > 1500 mm/s^2
+          * 조건 B (정면충돌 후 비정상 추격): cos(theta) > 0.85 이고 v_{A,post} · n_AB >= 0.75 * (v_{B,post} · n_AB)
+        """
+        if (
+            self.double_hit_foul
+            or self.first_target_ball is None
+            or self.first_target_hit_time is None
+            or self.first_target_normal is None
+        ):
+            return
+
+        if (
+            self.first_target_hit_time - self.inning_start_time
+        ) > self.config.DOUBLE_HIT_WINDOW_SEC:
+            return
+
+        elapsed_since_hit = timestamp - self.first_target_hit_time
+        if not (0.0 <= elapsed_since_hit <= 0.08):
+            return
+
+        target_color = self.first_target_ball
+        init_dist = self.initial_ball_distances.get(target_color, 999.0)
+        if init_dist > self.config.DOUBLE_HIT_INIT_DIST_MAX_MM:
+            return
+
+        if self.assigned_cue_ball not in balls or target_color not in balls:
+            return
+
+        cue = balls[self.assigned_cue_ball]
+        target = balls[target_color]
+        n_ab = self.first_target_normal
+
+        v_cue_post = np.array([cue.vx, cue.vy], dtype=np.float64)
+        v_target_post = np.array([target.vx, target.vy], dtype=np.float64)
+        speed_cue_post = float(np.linalg.norm(v_cue_post))
+        if speed_cue_post < 80.0:
+            return
+
+        # 조건 A: 충돌 직후 프레임에서 수구가 감속되지 않고 진행 방향 및 제1적구 법선 방향으로 재가속
+        is_reaccelerating = False
+        if cue_vel_prev is not None and elapsed_since_hit > 1e-4:
+            acc_cue = (v_cue_post - cue_vel_prev) / max(dt, 1e-4)
+            dot_av = float(np.dot(acc_cue, v_cue_post))
+            normal_reaccel = float(np.dot(acc_cue, n_ab))
+            if (
+                dot_av > 0.0
+                and normal_reaccel > self.config.DOUBLE_HIT_REACCEL_THRESH_MM_S2
+            ):
+                is_reaccelerating = True
+
+        # 조건 B: 두꺼운 정면충돌(cos theta > 0.85) 후 수구 법선 속도가 제1적구 법선 속도의 75% 이상 유지
+        v_cue_pre = (
+            self.cue_pre_first_hit_vel
+            if self.cue_pre_first_hit_vel is not None
+            else (cue_vel_prev if cue_vel_prev is not None else v_cue_post)
+        )
+        pre_speed = float(np.linalg.norm(v_cue_pre))
+        head_on_cos = (
+            float(np.dot(v_cue_pre / max(pre_speed, 1e-6), n_ab))
+            if pre_speed > 50.0
+            else 0.0
+        )
+        cue_normal_v_post = float(np.dot(v_cue_post, n_ab))
+        target_normal_v_post = float(np.dot(v_target_post, n_ab))
+
+        is_pushing_through = (
+            head_on_cos > 0.85
+            and target_normal_v_post > 150.0
+            and cue_normal_v_post
+            >= target_normal_v_post * self.config.DOUBLE_HIT_FOLLOW_RATIO
+        )
+
+        if is_reaccelerating or is_pushing_through:
+            self.double_hit_foul = True
+            self.state = ShotState.NO_SCORE_LOCKED
+            self.fail_reason = FailReason.DOUBLE_HIT_FOUL.value
+            self.events.append(
+                f"[{timestamp:.3f}s] DOUBLE_HIT_FOUL_LOCKED "
+                f"(cue={self.assigned_cue_ball.value}, target={target_color.value}, "
+                f"init_dist={init_dist:.1f}mm)"
+            )
 
     def _check_balls_in_bounds(self, balls: Dict[BallColor, TrackedBall]) -> bool:
         """3개의 공이 모두 당구대 내측 경계(허용 오차 포함) 안에 있는지 검사합니다."""
@@ -120,6 +275,11 @@ class ThreeCushionScoringFSM:
         # 1) 제1목적구 최초 접촉
         if self.first_target_ball is None:
             self.first_target_ball = target
+            self.first_target_hit_time = event.timestamp
+            self.first_target_normal = np.array(
+                [float(event.impact_normal[0]), float(event.impact_normal[1])],
+                dtype=np.float64,
+            )
             self.events.append(
                 f"[{event.timestamp:.3f}s] 1st_BALL_HIT ({target.value}, type={event.contact_type}, "
                 f"d_min={event.d_min_mm:.1f}mm, cushions={self.cushion_count})"
@@ -171,18 +331,28 @@ class ThreeCushionScoringFSM:
 
     def update(
         self,
-        balls: Dict[BallColor, TrackedBall],
+        balls: Dict[BallColor, Optional[TrackedBall]],
         timestamp: float,
     ) -> Optional[ShotResult]:
         """
         매 프레임(60fps) 추적된 3구 상태(balls)와 타임스탬프를 입력받아
-        타구 시작, 쿠션·목적구 접촉, 완전 정지 및 이닝 종료(ShotResult 반환)를 수행합니다.
+        바운딩 박스 병합 보정, 타구 시작, 쿠션·목적구 접촉, 투터치 파울 검사,
+        완전 정지 및 이닝 종료(ShotResult 반환)를 수행합니다.
         """
-        if len(balls) < 3 or self.assigned_cue_ball not in balls:
-            return None
+        if self.state == ShotState.IDLE:
+            if len(balls) < 3 or any(b is None for b in balls.values()) or self.assigned_cue_ball not in balls:
+                return None
+            valid_balls: Dict[BallColor, TrackedBall] = {
+                c: b for c, b in balls.items() if b is not None
+            }
+        else:
+            stabilized = self._stabilize_blob_merging(timestamp, balls)
+            if stabilized is None or len(stabilized) < 3 or self.assigned_cue_ball not in stabilized:
+                return None
+            valid_balls = stabilized
 
-        cue = balls[self.assigned_cue_ball]
-        other_balls = [b for c, b in balls.items() if c != self.assigned_cue_ball]
+        cue = valid_balls[self.assigned_cue_ball]
+        other_balls = [b for c, b in valid_balls.items() if c != self.assigned_cue_ball]
 
         # ------------------------------------------------------------------
         # 1. IDLE 상태: 지정 수구의 스트로크 출발(>= 180.0 mm/s) 또는
@@ -192,6 +362,10 @@ class ThreeCushionScoringFSM:
             if cue.speed >= self.config.STROKE_START_SPEED_MM_S:
                 self.state = ShotState.IN_PLAY
                 self.inning_start_time = timestamp
+                self._record_initial_ball_distances(valid_balls)
+                self._prev_cue_vel = np.array([cue.vx, cue.vy], dtype=np.float64)
+                self._prev_frame_time = timestamp
+                self.cue_pre_first_hit_vel = self._prev_cue_vel.copy()
                 self.events.append(
                     f"[{timestamp:.3f}s] STROKE_START (cue={self.assigned_cue_ball.value}, "
                     f"speed={cue.speed:.1f}mm/s)"
@@ -214,6 +388,10 @@ class ThreeCushionScoringFSM:
                                 self.assigned_cue_ball = ob.color
                                 self.state = ShotState.IN_PLAY
                                 self.inning_start_time = timestamp
+                                self._record_initial_ball_distances(valid_balls)
+                                self._prev_cue_vel = np.array([ob.vx, ob.vy], dtype=np.float64)
+                                self._prev_frame_time = timestamp
+                                self.cue_pre_first_hit_vel = self._prev_cue_vel.copy()
                                 self.events.append(
                                     f"[{timestamp:.3f}s] RETROACTIVE_SCORE_COMPENSATED "
                                     f"(cue={ob.color.value}, speed={ob.speed:.1f}mm/s)"
@@ -222,6 +400,10 @@ class ThreeCushionScoringFSM:
                                 self.assigned_cue_ball = ob.color
                                 self.state = ShotState.IN_PLAY
                                 self.inning_start_time = timestamp
+                                self._record_initial_ball_distances(valid_balls)
+                                self._prev_cue_vel = np.array([ob.vx, ob.vy], dtype=np.float64)
+                                self._prev_frame_time = timestamp
+                                self.cue_pre_first_hit_vel = self._prev_cue_vel.copy()
                                 self.events.append(
                                     f"[{timestamp:.3f}s] CUE_COLOR_SYNCED_STROKE_START "
                                     f"(cue={ob.color.value}, speed={ob.speed:.1f}mm/s)"
@@ -229,6 +411,7 @@ class ThreeCushionScoringFSM:
                         else:
                             self.state = ShotState.NO_SCORE_LOCKED
                             self.inning_start_time = timestamp
+                            self._record_initial_ball_distances(valid_balls)
                             self.fail_reason = FailReason.WRONG_CUE_BALL_FOUL.value
                             self.events.append(
                                 f"[{timestamp:.3f}s] WRONG_CUE_BALL_FOUL (moved={ob.color.value}, "
@@ -236,31 +419,48 @@ class ThreeCushionScoringFSM:
                             )
                         break
 
-            # 만약 출발 직후 같은 프레임에서 쿠션/접촉 검사를 위한 초기 위치를 KinematicsDetector에 동기화
-            if self.state != ShotState.IDLE:
+            if self.state == ShotState.IDLE:
+                self._last_idle_positions = {
+                    c: np.array([b.x, b.y], dtype=np.float64)
+                    for c, b in valid_balls.items()
+                }
+            else:
+                # 출발 직후 같은 프레임에서 쿠션/접촉 검사를 위한 초기 위치를 KinematicsDetector에 동기화
                 self.kinematics.step(
-                    balls=balls,
+                    balls=valid_balls,
                     assigned_cue_ball=self.assigned_cue_ball,
                     timestamp=timestamp,
                     current_cushion_count=self.cushion_count,
+                    already_stabilized=True,
                 )
             return None
 
         # ------------------------------------------------------------------
         # 2. IN_PLAY / VALID_SCORE_PENDING / NO_SCORE_LOCKED 주행 중 물리 판정
         # ------------------------------------------------------------------
-        if not self._check_balls_in_bounds(balls):
+        if not self._check_balls_in_bounds(valid_balls):
             if self.state != ShotState.NO_SCORE_LOCKED:
                 self.state = ShotState.NO_SCORE_LOCKED
                 self.fail_reason = FailReason.BALL_OUT_OF_TABLE.value
                 self.events.append(f"[{timestamp:.3f}s] BALL_OUT_OF_TABLE_FOUL")
 
+        dt = (
+            max(timestamp - self._prev_frame_time, 1e-4)
+            if self._prev_frame_time is not None
+            else (1.0 / self.config.DEFAULT_FPS)
+        )
+        cue_vel_prev = self._prev_cue_vel
+        if self.first_target_ball is None and cue.speed >= 50.0:
+            self.cue_pre_first_hit_vel = np.array([cue.vx, cue.vy], dtype=np.float64)
+
         cushion_events, contact_events = self.kinematics.step(
-            balls=balls,
+            balls=valid_balls,
             assigned_cue_ball=self.assigned_cue_ball,
             timestamp=timestamp,
             current_cushion_count=self.cushion_count,
+            already_stabilized=True,
         )
+        self.centroid_shift_corrected_count = self.kinematics.centroid_shift_corrected_count
 
         # 동일 프레임 내에서 쿠션과 목적구 접촉의 시간순 정렬 처리
         for c_ev in cushion_events:
@@ -269,11 +469,22 @@ class ThreeCushionScoringFSM:
         for hit_ev in contact_events:
             self.on_ball_contact(hit_ev)
 
+        # [추가 보정 1] 스트로크 초기 0.15초 내 투터치(Double Hit) 파울 감시
+        self._check_double_hit_foul(
+            timestamp=timestamp,
+            balls=valid_balls,
+            cue_vel_prev=cue_vel_prev,
+            dt=dt,
+        )
+
+        self._prev_cue_vel = np.array([cue.vx, cue.vy], dtype=np.float64)
+        self._prev_frame_time = timestamp
+
         # ------------------------------------------------------------------
         # 3. 모든 공(3개) 완전 정지 감지 (< 15.0 mm/s 상태가 0.3초 이상 지속)
         # ------------------------------------------------------------------
         all_stopped = all(
-            b.speed < self.config.IDLE_STOP_SPEED_MM_S for b in balls.values()
+            b.speed < self.config.IDLE_STOP_SPEED_MM_S for b in valid_balls.values()
         )
         if all_stopped:
             if self.all_stopped_since is None:
@@ -281,6 +492,10 @@ class ThreeCushionScoringFSM:
             elif (
                 timestamp - self.all_stopped_since
             ) >= self.config.IDLE_CONFIRM_DURATION_SEC:
+                self._last_idle_positions = {
+                    c: np.array([b.x, b.y], dtype=np.float64)
+                    for c, b in valid_balls.items()
+                }
                 return self._finalize_inning(timestamp)
         else:
             self.all_stopped_since = None
@@ -292,11 +507,15 @@ class ThreeCushionScoringFSM:
         모든 공이 정지했을 때 최종 ShotResult를 생성하고,
         노카운트(scored == False)인 경우 다음 이닝의 assigned_cue_ball을 상대방 수구로 자동 교대합니다.
         """
-        scored = self.state == ShotState.VALID_SCORE_PENDING
+        scored = (self.state == ShotState.VALID_SCORE_PENDING) and (
+            not self.double_hit_foul
+        )
         completed_cue_ball = self.assigned_cue_ball
 
         if not scored and self.fail_reason == FailReason.NONE.value:
-            if self.first_target_ball is None:
+            if self.double_hit_foul:
+                self.fail_reason = FailReason.DOUBLE_HIT_FOUL.value
+            elif self.first_target_ball is None:
                 self.fail_reason = FailReason.MISSING_FIRST_BALL.value
             elif self.second_target_ball is None:
                 if self.cushion_count < 3:
@@ -320,6 +539,8 @@ class ThreeCushionScoringFSM:
             second_target_ball=self.second_target_ball,
             retroactive_previous_score_compensated=self.retroactive_compensated_in_shot,
             object_ball_kiss_occurred=self.kinematics.object_ball_kiss_occurred,
+            double_hit_foul=self.double_hit_foul,
+            centroid_shift_corrected_count=self.centroid_shift_corrected_count,
         )
 
         self._last_completed_cue_ball = completed_cue_ball

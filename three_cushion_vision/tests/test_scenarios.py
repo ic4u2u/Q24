@@ -642,7 +642,7 @@ class TestThreeCushionVisionScenarios(unittest.TestCase):
             ],
             frames_per_segment=8,
         )
-        red_3 = [(800.0, 450.0)] * len(cue_3)
+        red_3 = [(800.0, 450.0)] * 9 + [(800.0, 380.0)] * (len(cue_3) - 9)
         yel_3 = [(1900.0, 1314.0)] * len(cue_3)  # 전혀 움직이지 않음 (delta_vy = 0)
 
         res_err3 = _run_causal_sim(cue_3, red_3, yel_3)
@@ -664,7 +664,7 @@ class TestThreeCushionVisionScenarios(unittest.TestCase):
                 (2808.0, 650.0),   # 2C: RIGHT
                 (1900.0, 1388.0),  # 3C: BOTTOM
                 (1200.0, 900.0),   # 이동한 YELLOW(1200, 850) 정식 타격!
-                (1100.0, 820.0),
+                (1100.0, 940.0),
             ],
             frames_per_segment=8,
         )
@@ -682,7 +682,11 @@ class TestThreeCushionVisionScenarios(unittest.TestCase):
             [(1050.0, 550.0)] * 16
             + _interpolate_waypoints_60fps([(1050.0, 550.0), (1200.0, 850.0)], frames_per_segment=8)[1:]
         )
-        yel_4.extend([(1200.0, 850.0)] * (len(cue_4) - len(yel_4)))
+        yel_4.extend([(1200.0, 850.0)] * (40 - len(yel_4)))
+        yel_4.extend(
+            _interpolate_waypoints_60fps([(1200.0, 850.0), (1140.0, 760.0)], frames_per_segment=8)[1:]
+        )
+        yel_4.extend([(1140.0, 760.0)] * (len(cue_4) - len(yel_4)))
 
         res_err4 = _run_causal_sim(cue_4, red_4, yel_4)
         print(
@@ -693,6 +697,248 @@ class TestThreeCushionVisionScenarios(unittest.TestCase):
         self.assertTrue(res_err4.scored)
         self.assertTrue(res_err4.object_ball_kiss_occurred)
         self.assertGreaterEqual(res_err4.cushions_at_second_hit, 3)
+
+    def test_scenario_9_double_hit_foul_and_blob_merging_stabilization(self) -> None:
+        """
+        [시나리오 9: 투터치(Double Hit) 파울 감지 및 바운딩 박스 병합(Blob Merging) 중심점 보정 검증]
+        1) 투터치 조건 A (충돌 후 재가속): 초기 거리 90mm(<= 115mm)에서 출발 후 0.15초 내 1적구 충돌 직후
+           수구가 감속되지 않고 1적구 방향으로 재가속(a_A · n_AB > 1500 mm/s^2) -> DOUBLE_HIT_FOUL 노카운트 잠금!
+        2) 투터치 조건 B (정면충돌 후 비정상 추격): 두꺼운 정면충돌(cos > 0.85) 후 수구 법선 속도가
+           1적구 법선 속도의 75% 이상으로 추격 -> DOUBLE_HIT_FOUL 노카운트 잠금!
+        3) 바운딩 박스 병합(Blob Merging) 결측(None, 2프레임) 복원 및 중심점 끌림(Centroid Shift, 20mm 점프)
+           0.85 가중 클램핑으로 가짜 속도 변화(Delta v) 오탐 차단 검증!
+        """
+        from three_cushion_vision.causal_kiss_fsm import (
+            BallColor as CausalBallColor,
+            CausalKissSafeFSM,
+        )
+
+        dt = 1.0 / 60.0
+
+        # ------------------------------------------------------------------
+        # 1) 투터치 파울 - 조건 B (두꺼운 정면충돌 후 75% 이상 법선 속도로 밀고 나가는 파울)
+        #    초기 수구(400, 700), 제1적구 RED(490, 700) -> 초기 거리 90.0mm <= 115.0mm
+        #    충돌 직후 RED가 +x 방향 1200 mm/s(프레임당 20mm)로 나가는데,
+        #    WHITE도 큐대에 한 번 더 밀려 +x 방향 1080 mm/s(프레임당 18mm, 비율 90% >= 75%)로 추격 후 3쿠션+제2적구 접촉
+        # ------------------------------------------------------------------
+        cfsm_dh_b = CausalKissSafeFSM(fps=60.0, assigned_cue_ball=CausalBallColor.WHITE)
+        cue_dh_b: List[Point2D] = [
+            (400.0, 700.0),   # f0: 정지 (RED(490, 700)와 초기 거리 90.0mm <= 115.0mm)
+            (415.0, 700.0),   # f1: 스트로크 출발 (900 mm/s)
+            (432.0, 700.0),   # f2: 정면 접근 (cos theta = 1.0 > 0.85)
+            (448.0, 700.0),   # f3: RED(490, 700)와 충돌 (거리 42mm <= 63mm, t = 0.05s <= 0.15s)
+            (468.0, 700.0),   # f4: 충돌 후에도 수구가 감속 없이 1200 mm/s로 추격!
+            (488.0, 700.0),   # f5: 수구 법선 속도(1200) >= RED 법선 속도(1320) * 0.75
+            (508.0, 700.0),   # f6: 계속 밀고 나감
+        ]
+        # 이후 3쿠션 돌고 YELLOW(1200, 850)까지 맞히더라도 이미 DOUBLE_HIT_FOUL로 NO_SCORE_LOCKED 상태여야 함!
+        post_3c = _interpolate_waypoints_60fps(
+            [
+                (508.0, 700.0),
+                (1500.0, 32.0),    # 1C: TOP
+                (2808.0, 650.0),   # 2C: RIGHT
+                (1900.0, 1388.0),  # 3C: BOTTOM
+                (1200.0, 900.0),   # YELLOW(1200, 850) 접촉
+                (1100.0, 820.0),
+            ],
+            frames_per_segment=8,
+        )[1:]
+        cue_dh_b.extend(post_3c)
+
+        red_dh_b: List[Point2D] = [
+            (490.0, 700.0),
+            (490.0, 700.0),
+            (490.0, 700.0),
+            (490.0, 700.0),
+            (512.0, 700.0),   # f4: RED 속도 1320 mm/s (+22mm/frame)
+            (534.0, 700.0),   # f5
+            (556.0, 700.0),   # f6
+        ]
+        red_dh_b.extend([(580.0, 700.0)] * (len(cue_dh_b) - len(red_dh_b)))
+        yel_dh_b: List[Point2D] = [(1200.0, 850.0)] * len(cue_dh_b)
+
+        res_dh_b = None
+        for idx in range(len(cue_dh_b) + 25):
+            t_sec = idx * dt
+            c = cue_dh_b[min(idx, len(cue_dh_b) - 1)]
+            r = red_dh_b[min(idx, len(red_dh_b) - 1)]
+            y = yel_dh_b[min(idx, len(yel_dh_b) - 1)]
+            res_dh_b = cfsm_dh_b.update(
+                t_sec,
+                {
+                    CausalBallColor.WHITE: c,
+                    CausalBallColor.RED: r,
+                    CausalBallColor.YELLOW: y,
+                },
+            )
+            if res_dh_b is not None:
+                break
+
+        self.assertIsNotNone(res_dh_b)
+        assert res_dh_b is not None
+        print(
+            f"[Scenario 9A - Double Hit Foul (Push-Through)] scored={res_dh_b.scored}, "
+            f"double_hit_foul={res_dh_b.double_hit_foul}, reason={res_dh_b.fail_reason}"
+        )
+        self.assertFalse(res_dh_b.scored)
+        self.assertTrue(res_dh_b.double_hit_foul)
+        self.assertIsNotNone(res_dh_b.fail_reason)
+        self.assertIn("DOUBLE_HIT_FOUL", str(res_dh_b.fail_reason))
+
+        # ------------------------------------------------------------------
+        # 2) 투터치 파울 - 조건 A (충돌 직후 큐대 2차 타격에 의한 수구 재가속: a_A · v_A > 0 & a_A · n_AB > 1500)
+        # ------------------------------------------------------------------
+        cfsm_dh_a = CausalKissSafeFSM(fps=60.0, assigned_cue_ball=CausalBallColor.WHITE)
+        cue_dh_a: List[Point2D] = [
+            (400.0, 700.0),   # f0: 정지 (RED(495, 715)와 초기 거리 96.2mm <= 115.0mm)
+            (412.0, 700.0),   # f1: 출발 (720 mm/s)
+            (425.0, 700.0),   # f2: 접근 (780 mm/s)
+            (436.0, 700.0),   # f3: RED와 1차 충돌로 순간 감속 (660 mm/s)
+            (452.0, 702.0),   # f4: 큐대 투터치로 재가속! (960 mm/s)
+            (478.0, 705.0),   # f5: 강한 재가속! (1560 mm/s -> a_A > 20000 mm/s^2 > 1500 mm/s^2)
+            (510.0, 708.0),   # f6
+        ]
+        red_dh_a: List[Point2D] = [
+            (495.0, 715.0),
+            (495.0, 715.0),
+            (495.0, 715.0),
+            (495.0, 715.0),
+            (535.0, 730.0),
+            (575.0, 745.0),
+            (615.0, 760.0),
+        ]
+        yel_dh_a: List[Point2D] = [(1200.0, 850.0)] * len(cue_dh_a)
+
+        res_dh_a = None
+        for idx in range(len(cue_dh_a) + 25):
+            t_sec = idx * dt
+            c = cue_dh_a[min(idx, len(cue_dh_a) - 1)]
+            r = red_dh_a[min(idx, len(red_dh_a) - 1)]
+            y = yel_dh_a[min(idx, len(yel_dh_a) - 1)]
+            res_dh_a = cfsm_dh_a.update(
+                t_sec,
+                {
+                    CausalBallColor.WHITE: c,
+                    CausalBallColor.RED: r,
+                    CausalBallColor.YELLOW: y,
+                },
+            )
+            if res_dh_a is not None:
+                break
+
+        self.assertIsNotNone(res_dh_a)
+        assert res_dh_a is not None
+        print(
+            f"[Scenario 9B - Double Hit Foul (Re-Acceleration)] scored={res_dh_a.scored}, "
+            f"double_hit_foul={res_dh_a.double_hit_foul}, reason={res_dh_a.fail_reason}"
+        )
+        self.assertFalse(res_dh_a.scored)
+        self.assertTrue(res_dh_a.double_hit_foul)
+        self.assertIn("DOUBLE_HIT_FOUL", str(res_dh_a.fail_reason))
+
+        # ------------------------------------------------------------------
+        # 3) 바운딩 박스 병합(Blob Merging) 결측 복원(None 2프레임) 및 중심점 끌림(Centroid Shift) 억제 검증
+        #    - 수구가 3쿠션 후 정지해 있는 제2적구 YELLOW(1350, 625) 옆을 중심거리 75mm(비접촉 Near-Miss)로 지나갈 때:
+        #      * index 47에서 바운딩 박스 병합으로 WHITE 좌표가 None(결측)으로 들어오고,
+        #      * index 48에서 YELLOW의 바운딩 박스가 WHITE 쪽(+y 방향)으로 찌그러져 YELLOW 관측 좌표가
+        #        (1350, 625) -> (1350, 647)로 +22.0mm(> 14.0mm) 급격히 끌려갔다가 index 49에서 (1350, 625)로 돌아옴!
+        #    - 보정이 없다면 YELLOW에 가짜 속도 변화량(Delta v)이 생겨 2적구 접촉(득점)으로 오판되지만,
+        #      _stabilize_blob_merging이 결측을 외삽 복원하고 중심점 끌림을 0.85 가중치로 클램핑하여
+        #      가짜 접촉 오탐을 막아내고 정확히 노카운트(scored == False)로 판정해야 함!
+        # ------------------------------------------------------------------
+        cfsm_blob = CausalKissSafeFSM(fps=60.0, assigned_cue_ball=CausalBallColor.WHITE)
+        cue_blob = _interpolate_waypoints_60fps(
+            [
+                (400.0, 700.0),
+                (800.0, 500.0),    # RED(800, 450) 타격
+                (1500.0, 32.0),    # 1C: TOP
+                (2808.0, 600.0),   # 2C: RIGHT
+                (2000.0, 1388.0),  # 3C: BOTTOM
+                (1800.0, 700.0),
+                (1350.0, 700.0),   # index 48: YELLOW(1350, 625) 옆을 거리 75.0mm(<= 85.0mm)로 무굴절 통과
+                (900.0, 700.0),
+            ],
+            frames_per_segment=8,
+        )
+        red_blob = [(800.0, 450.0)] * len(cue_blob)
+        yel_blob: List[Point2D] = [(1350.0, 625.0)] * len(cue_blob)
+        # index 48에서 바운딩 박스 병합으로 인해 정지해 있던 YELLOW가 지나가는 WHITE(1350, 700) 쪽으로 22mm 끌려감!
+        yel_blob[48] = (1350.0, 647.0)
+
+        res_blob = None
+        for idx in range(len(cue_blob) + 25):
+            t_sec = idx * dt
+            # index 46, 47(2프레임)에서 바운딩 박스 병합으로 WHITE 좌표가 None(결측) 발생!
+            c_obs: Optional[Point2D] = (
+                None
+                if idx in (46, 47)
+                else cue_blob[min(idx, len(cue_blob) - 1)]
+            )
+            r_obs = red_blob[min(idx, len(red_blob) - 1)]
+            y_obs = yel_blob[min(idx, len(yel_blob) - 1)]
+
+            res_blob = cfsm_blob.update(
+                t_sec,
+                {
+                    CausalBallColor.WHITE: c_obs,
+                    CausalBallColor.RED: r_obs,
+                    CausalBallColor.YELLOW: y_obs,
+                },
+            )
+            if res_blob is not None:
+                break
+
+        self.assertIsNotNone(res_blob)
+        assert res_blob is not None
+        print(
+            f"[Scenario 9C - Blob Merging Occlusion & Centroid Shift Clamping] "
+            f"scored={res_blob.scored}, centroid_corrected={res_blob.centroid_shift_corrected_count}, "
+            f"reason={res_blob.fail_reason}"
+        )
+        self.assertFalse(res_blob.scored)
+        self.assertGreaterEqual(res_blob.centroid_shift_corrected_count, 1)
+
+        # ------------------------------------------------------------------
+        # 4) ThreeCushionScoringFSM / KinematicsDetector 통합 검증:
+        #    근접 출발 후 투터치(Double Hit) 파울 감지 및 바운딩 박스 병합 결측(None) 복원 검증
+        # ------------------------------------------------------------------
+        from three_cushion_vision.tracker_adapter import TrackedBall
+
+        fsm_dh = ThreeCushionScoringFSM(initial_cue_ball=BallColor.WHITE)
+        for idx in range(len(cue_dh_b) + 25):
+            t_sec = idx * dt
+            i_curr = min(idx, len(cue_dh_b) - 1)
+            i_prev = max(0, min(idx - 1, len(cue_dh_b) - 1))
+            c0, c1 = cue_dh_b[i_prev], cue_dh_b[i_curr]
+            r0, r1 = red_dh_b[i_prev], red_dh_b[i_curr]
+            y0, y1 = yel_dh_b[i_prev], yel_dh_b[i_curr]
+
+            cvx, cvy = (c1[0] - c0[0]) / dt, (c1[1] - c0[1]) / dt
+            rvx, rvy = (r1[0] - r0[0]) / dt, (r1[1] - r0[1]) / dt
+            yvx, yvy = (y1[0] - y0[0]) / dt, (y1[1] - y0[1]) / dt
+
+            balls_step = {
+                BallColor.WHITE: TrackedBall(
+                    color=BallColor.WHITE, x=c1[0], y=c1[1],
+                    vx=cvx, vy=cvy, speed=math.hypot(cvx, cvy), timestamp=t_sec
+                ),
+                BallColor.RED: TrackedBall(
+                    color=BallColor.RED, x=r1[0], y=r1[1],
+                    vx=rvx, vy=rvy, speed=math.hypot(rvx, rvy), timestamp=t_sec
+                ),
+                BallColor.YELLOW: TrackedBall(
+                    color=BallColor.YELLOW, x=y1[0], y=y1[1],
+                    vx=yvx, vy=yvy, speed=math.hypot(yvx, yvy), timestamp=t_sec
+                ),
+            }
+            res_fsm_dh = fsm_dh.update(balls=balls_step, timestamp=t_sec)
+            if res_fsm_dh is not None:
+                self.assertFalse(res_fsm_dh.scored)
+                self.assertTrue(res_fsm_dh.double_hit_foul)
+                self.assertEqual(res_fsm_dh.fail_reason, FailReason.DOUBLE_HIT_FOUL.value)
+                break
+        else:
+            self.fail("ThreeCushionScoringFSM did not finalize double-hit foul shot")
 
 
 if __name__ == "__main__":

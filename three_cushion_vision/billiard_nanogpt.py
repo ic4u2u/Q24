@@ -38,8 +38,10 @@ class BilliardGPTConfig:
     n_layer: int = 4      # 트랜스포머 블록 레이어 수
     n_head: int = 4       # 멀티헤드 어텐션 헤드 수
     n_embd: int = 64      # 임베딩 차원 (약 20만 파라미터 -> 0.2ms 추론)
-    dropout: float = 0.05
+    dropout: float = 0.0
     bias: bool = False    # 카파시 nanoGPT 스타일: LayerNorm/Linear bias 제거로 속도 향상
+    restitution: float = 0.82
+    friction_decay: float = 0.992
 
 
 # =====================================================================
@@ -101,64 +103,74 @@ class Block(nn.Module):
 
 class BilliardNanoGPT(nn.Module):
     """
-    단어 임베딩(wte)을 연속 물리 벡터 인코더로 교체한 궤적 예측 트랜스포머
+    카파시 nanoGPT 아키텍처에 당구 쿠션 반사 물리 Prior를 결합한 하이브리드 궤적 복원 트랜스포머
     """
 
-    def __init__(self, config: BilliardGPTConfig):
+    def __init__(self, config: Optional[BilliardGPTConfig] = None):
         super().__init__()
-        self.config = config
+        self.config = config or BilliardGPTConfig()
 
         self.transformer = nn.ModuleDict(dict(
-            # [핵심 개조 1] 이산 토큰 Embedding 대신 8차원 물리 상태 선형 투영
             state_emb=nn.Sequential(
-                nn.Linear(config.state_dim, config.n_embd, bias=True),
+                nn.Linear(self.config.state_dim, self.config.n_embd, bias=True),
                 nn.GELU(),
-                nn.Linear(config.n_embd, config.n_embd, bias=config.bias),
+                nn.Linear(self.config.n_embd, self.config.n_embd, bias=self.config.bias),
             ),
-            wpe=nn.Embedding(config.block_size, config.n_embd),
-            drop=nn.Dropout(config.dropout),
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f=nn.LayerNorm(config.n_embd, bias=config.bias),
+            wpe=nn.Embedding(self.config.block_size, self.config.n_embd),
+            drop=nn.Dropout(self.config.dropout),
+            h=nn.ModuleList([Block(self.config) for _ in range(self.config.n_layer)]),
+            ln_f=nn.LayerNorm(self.config.n_embd, bias=self.config.bias),
         ))
-
-        # [핵심 개조 2] 어휘 로짓 대신 다음 프레임의 [dx, dy, next_vx, next_vy] 회귀 헤드
-        self.physics_head = nn.Linear(config.n_embd, config.out_dim, bias=True)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        self.physics_head = nn.Linear(self.config.n_embd, self.config.out_dim, bias=True)
+        # 초기 상태에서 물리 Prior를 해치지 않도록 출력 헤드를 미세 가중치로 초기화
+        torch.nn.init.zeros_(self.physics_head.bias)
+        torch.nn.init.normal_(self.physics_head.weight, mean=0.0, std=1e-4)
 
     @staticmethod
     def build_8d_features(state_4d: torch.Tensor) -> torch.Tensor:
-        """
-        원시 [x, y, vx, vy] (mm, mm/s) 텐서를 정규화된 8차원 물리 특징 벡터로 변환합니다.
-        :param state_4d: shape (..., 4) -> [x_mm, y_mm, vx_mm_s, vy_mm_s]
-        :return: shape (..., 8) -> [x_n, y_n, vx_n, vy_n, dL_n, dR_n, dT_n, dB_n]
-        """
-        x = state_4d[..., 0:1]
-        y = state_4d[..., 1:2]
-        vx = state_4d[..., 2:3]
-        vy = state_4d[..., 3:4]
-
-        # 1. 위치 및 속도 정규화
-        x_n = x / TABLE_W
-        y_n = y / TABLE_H
-        vx_n = vx / MAX_SPEED
-        vy_n = vy / MAX_SPEED
-
-        # 2. 4면 쿠션까지의 여유 거리 (0에 가까울수록 쿠션 반사 임박을 의미)
+        x, y, vx, vy = state_4d[..., 0:1], state_4d[..., 1:2], state_4d[..., 2:3], state_4d[..., 3:4]
+        x_n, y_n = x / TABLE_W, y / TABLE_H
+        vx_n, vy_n = vx / MAX_SPEED, vy / MAX_SPEED
         d_left = (x - BALL_R) / TABLE_W
         d_right = (TABLE_W - BALL_R - x) / TABLE_W
         d_top = (y - BALL_R) / TABLE_H
         d_bottom = (TABLE_H - BALL_R - y) / TABLE_H
-
         return torch.cat([x_n, y_n, vx_n, vy_n, d_left, d_right, d_top, d_bottom], dim=-1)
+
+    def _compute_physics_prior(self, states_4d: torch.Tensor) -> torch.Tensor:
+        """단일 스텝 쿠션 탄성 반사 및 마찰 감쇠 물리 Prior 계산"""
+        x = states_4d[..., 0:1]
+        y = states_4d[..., 1:2]
+        vx = states_4d[..., 2:3]
+        vy = states_4d[..., 3:4]
+
+        e = self.config.restitution
+        decay = self.config.friction_decay
+
+        nx = x + vx * DT
+        ny = y + vy * DT
+        nvx = vx * decay
+        nvy = vy * decay
+
+        # 좌/우 쿠션 반사
+        hit_left = nx < BALL_R
+        nx = torch.where(hit_left, BALL_R + (BALL_R - nx) * e, nx)
+        nvx = torch.where(hit_left, -nvx * e, nvx)
+
+        hit_right = nx > (TABLE_W - BALL_R)
+        nx = torch.where(hit_right, (TABLE_W - BALL_R) - (nx - (TABLE_W - BALL_R)) * e, nx)
+        nvx = torch.where(hit_right, -nvx * e, nvx)
+
+        # 상/하 쿠션 반사
+        hit_top = ny < BALL_R
+        ny = torch.where(hit_top, BALL_R + (BALL_R - ny) * e, ny)
+        nvy = torch.where(hit_top, -nvy * e, nvy)
+
+        hit_bottom = ny > (TABLE_H - BALL_R)
+        ny = torch.where(hit_bottom, (TABLE_H - BALL_R) - (ny - (TABLE_H - BALL_R)) * e, ny)
+        nvy = torch.where(hit_bottom, -nvy * e, nvy)
+
+        return torch.cat([nx, ny, nvx, nvy], dim=-1)
 
     @staticmethod
     def compute_physics_prior_step(
@@ -166,10 +178,6 @@ class BilliardNanoGPT(nn.Module):
         restitution: float = 0.82,
         friction_decay: float = 0.992,
     ) -> torch.Tensor:
-        """
-        마지막 프레임 상태(x, y, vx, vy)에 당구대 4면 쿠션 탄성 반발(e=0.82) 및 구름 마찰 감쇠(0.992)를
-        적용한 물리 법칙 기준 예측 상태(Physics Prior)를 계산합니다.
-        """
         x = state_4d[..., 0:1]
         y = state_4d[..., 1:2]
         vx = state_4d[..., 2:3]
@@ -180,27 +188,21 @@ class BilliardNanoGPT(nn.Module):
         nvx = vx * friction_decay
         nvy = vy * friction_decay
 
-        # 좌/우 단축 쿠션 반사
-        hit_left = nx <= BALL_R
-        hit_right = nx >= (TABLE_W - BALL_R)
+        hit_left = nx < BALL_R
         nx = torch.where(hit_left, BALL_R + (BALL_R - nx) * restitution, nx)
-        nx = torch.where(
-            hit_right,
-            (TABLE_W - BALL_R) - (nx - (TABLE_W - BALL_R)) * restitution,
-            nx,
-        )
-        nvx = torch.where(hit_left | hit_right, -nvx * restitution, nvx)
+        nvx = torch.where(hit_left, -nvx * restitution, nvx)
 
-        # 상/하 장축 쿠션 반사
-        hit_top = ny <= BALL_R
-        hit_bottom = ny >= (TABLE_H - BALL_R)
+        hit_right = nx > (TABLE_W - BALL_R)
+        nx = torch.where(hit_right, (TABLE_W - BALL_R) - (nx - (TABLE_W - BALL_R)) * restitution, nx)
+        nvx = torch.where(hit_right, -nvx * restitution, nvx)
+
+        hit_top = ny < BALL_R
         ny = torch.where(hit_top, BALL_R + (BALL_R - ny) * restitution, ny)
-        ny = torch.where(
-            hit_bottom,
-            (TABLE_H - BALL_R) - (ny - (TABLE_H - BALL_R)) * restitution,
-            ny,
-        )
-        nvy = torch.where(hit_top | hit_bottom, -nvy * restitution, nvy)
+        nvy = torch.where(hit_top, -nvy * restitution, nvy)
+
+        hit_bottom = ny > (TABLE_H - BALL_R)
+        ny = torch.where(hit_bottom, (TABLE_H - BALL_R) - (ny - (TABLE_H - BALL_R)) * restitution, ny)
+        nvy = torch.where(hit_bottom, -nvy * restitution, nvy)
 
         return torch.cat([nx, ny, nvx, nvy], dim=-1)
 
@@ -209,55 +211,33 @@ class BilliardNanoGPT(nn.Module):
         states_4d: torch.Tensor,
         target_next_4d: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        :param states_4d: (B, T, 4) 과거 프레임의 [x, y, vx, vy]
-        :param target_next_4d: (B, T, 4) 각 시점의 다음 프레임 정답 [next_x, next_y, next_vx, next_vy]
-        """
         device = states_4d.device
         b, t, _ = states_4d.size()
-        assert t <= self.config.block_size, f"시퀀스 길이 {t}가 block_size {self.config.block_size}를 초과합니다."
+        assert t <= self.config.block_size
 
-        # 8차원 물리 특징 추출 및 트랜스포머 포워드
         feat_8d = self.build_8d_features(states_4d)
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-        tok_emb = self.transformer.state_emb(feat_8d)
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb + pos_emb)
-
+        x = self.transformer.drop(self.transformer.state_emb(feat_8d) + self.transformer.wpe(pos))
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        # 모델은 정규화된 변위 [dx/W, dy/H, next_vx/MAX_V, next_vy/MAX_V]를 출력
-        pred_norm = self.physics_head(x)
+        # 트랜스포머가 예측한 비선형 스핀/마찰 잔차(Residual)
+        res_norm = self.physics_head(x)
+        res_4d = torch.cat([
+            res_norm[..., 0:1] * TABLE_W,
+            res_norm[..., 1:2] * TABLE_H,
+            res_norm[..., 2:3] * MAX_SPEED,
+            res_norm[..., 3:4] * MAX_SPEED,
+        ], dim=-1)
 
-        # 실제 물리 단위(mm, mm/s)로 다음 프레임 상태 복원
-        pred_dx = pred_norm[..., 0:1] * TABLE_W
-        pred_dy = pred_norm[..., 1:2] * TABLE_H
-        pred_vx = pred_norm[..., 2:3] * MAX_SPEED
-        pred_vy = pred_norm[..., 3:4] * MAX_SPEED
-
-        pred_next_x = states_4d[..., 0:1] + pred_dx
-        pred_next_y = states_4d[..., 1:2] + pred_dy
-        pred_next_4d = torch.cat([pred_next_x, pred_next_y, pred_vx, pred_vy], dim=-1)
+        prior_next_4d = self._compute_physics_prior(states_4d)
+        pred_next_4d = prior_next_4d + res_4d
 
         loss = None
         if target_next_4d is not None:
-            # 정규화 스케일에서 위치 오차와 속도 벡터 오차를 결합 (쿠션 반사 순간의 급격한 속도 반전 학습)
-            true_dx_n = (target_next_4d[..., 0:1] - states_4d[..., 0:1]) / TABLE_W
-            true_dy_n = (target_next_4d[..., 1:2] - states_4d[..., 1:2]) / TABLE_H
-            true_vx_n = target_next_4d[..., 2:3] / MAX_SPEED
-            true_vy_n = target_next_4d[..., 3:4] / MAX_SPEED
-            target_norm = torch.cat([true_dx_n, true_dy_n, true_vx_n, true_vy_n], dim=-1)
-
-            # 쿠션 반사 프레임(속도 부호가 바뀌는 구간)에 5배 가중치를 부여하여 반사각 정밀도 극대화
-            sign_flip_x = (states_4d[..., 2:3] * target_next_4d[..., 2:3]) < 0
-            sign_flip_y = (states_4d[..., 3:4] * target_next_4d[..., 3:4]) < 0
-            bounce_weight = torch.where(sign_flip_x | sign_flip_y, 5.0, 1.0)
-
-            element_loss = F.smooth_l1_loss(pred_norm, target_norm, reduction="none", beta=0.005)
-            loss = (element_loss * bounce_weight).mean()
+            loss = F.smooth_l1_loss(pred_next_4d, target_next_4d, beta=2.0)
 
         return pred_next_4d, loss
 
@@ -265,45 +245,23 @@ class BilliardNanoGPT(nn.Module):
     def rollout_occlusion(
         self,
         history_15_frames: torch.Tensor,
-        n_missing_frames: int,
+        n_missing_frames: int = 1,
         physics_guidance_alpha: float = 0.85,
     ) -> torch.Tensor:
         """
-        가려짐(Occlusion) 발생 시 직전 15프레임의 (x, y, vx, vy) 시퀀스만으로
-        가려진 n_missing_frames 동안의 비선형 쿠션 반사 궤적을 자기회귀(Autoregressive)로 복원합니다.
-        :param history_15_frames: shape (1, T<=15, 4)
-        :param n_missing_frames: 복원할 가려짐 프레임 수
-        :param physics_guidance_alpha: 트랜스포머 추론과 쿠션 반발 물리 법칙(Physics Prior) 결합 가중치
-        :return: 복원된 가려짐 구간 궤적 텐서 shape (1, n_missing_frames, 4)
+        가려지기 직전 최대 15프레임의 (x, y, vx, vy) 텐서를 입력받아
+        가려진 n_missing_frames 동안의 쿠션 반사 포함 궤적을 자기회귀로 복원합니다.
         """
         self.eval()
         seq = history_15_frames.clone()
         restored = []
 
         for _ in range(n_missing_frames):
-            # 최근 block_size(15) 프레임만 슬라이딩 윈도우로 잘라 입력
             seq_cond = seq[:, -self.config.block_size:, :]
             pred_seq, _ = self(seq_cond)
-            neural_next = pred_seq[:, -1:, :]  # 트랜스포머의 마지막 타임스텝 예측값
-
-            # Physics-Informed Guidance: 트랜스포머 예측과 쿠션 반발 물리 제약을 결합하여
-            # 장기 가려짐(10~15프레임) 롤아웃 시 오차 누적(Drift) 및 쿠션 미반사를 원천 차단
-            phys_next = self.compute_physics_prior_step(seq_cond[:, -1:, :])
-            next_state = (1.0 - physics_guidance_alpha) * neural_next + physics_guidance_alpha * phys_next
-
-            # 쿠션 반사가 발생한 축은 법선 속도 부호가 확실히 반전되도록 물리 부호 동기화
-            last_state = seq_cond[:, -1:, :]
-            if float((last_state[..., 2] * phys_next[..., 2]).item()) < 0.0:
-                next_state[..., 2] = phys_next[..., 2]
-                next_state[..., 0] = phys_next[..., 0]
-            if float((last_state[..., 3] * phys_next[..., 3]).item()) < 0.0:
-                next_state[..., 3] = phys_next[..., 3]
-                next_state[..., 1] = phys_next[..., 1]
-
-            # 물리적 테이블 한계 클램핑 안전장치
+            next_state = pred_seq[:, -1:, :]
             next_state[..., 0].clamp_(BALL_R, TABLE_W - BALL_R)
             next_state[..., 1].clamp_(BALL_R, TABLE_H - BALL_R)
-
             restored.append(next_state)
             seq = torch.cat([seq, next_state], dim=1)
 
