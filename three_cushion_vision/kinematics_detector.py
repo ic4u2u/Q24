@@ -58,16 +58,19 @@ class CushionImpactEvent:
 
 @dataclass
 class _PendingMicroKissCandidate:
-    """그레이존(63.5mm < d_min <= 78.0mm) 진입 후 3프레임 동안 물리 증거를 관찰하는 대기 버퍼 항목"""
+    """그레이존 진입 후 최근접점(Apex) 통과 뒤 3프레임 동안 물리 증거를 관찰하는 대기 버퍼 항목"""
 
     target_color: BallColor
     t_impact: float
     d_min_mm: float
-    u_before: np.ndarray              # 근접 직전 3프레임 평균 수구 진행 단위 벡터
-    cue_pos_at_closest: np.ndarray    # 최근접 프레임에서의 수구 위치
-    target_rest_pos: np.ndarray       # 근접 직전 목적구 초기 위치
+    u_before: np.ndarray              # 최근접 직전 수구 진행 단위 벡터
+    impact_normal: np.ndarray         # 최근접 시점 수구(A) -> 목적구(B) 단위 법선 벡터
+    cue_pos_at_closest: np.ndarray    # 최근접 시점 수구 위치
+    cue_speed_before: float           # 최근접 직전 수구 속력 (mm/s)
+    target_rest_pos: np.ndarray       # 근접 이전 목적구 정지 기준 위치
     was_target_stationary: bool       # 근접 직전 목적구 정지 여부
     cushions_at_impact: int           # 최근접 시점의 누적 쿠션 수
+    is_direct_overlap: bool = False   # d_min <= 2R + 0.15mm 강체 중첩 여부
     frames_waited: int = 0
     post_cue_positions: List[np.ndarray] = field(default_factory=list)
     post_target_positions: List[np.ndarray] = field(default_factory=list)
@@ -90,6 +93,11 @@ class KinematicsDetector:
         self._prev_timestamp: Optional[float] = None
         self._cue_pos_history: Deque[np.ndarray] = deque(maxlen=8)
         self._cue_vel_history: Deque[np.ndarray] = deque(maxlen=8)
+        self._target_pos_history: Dict[BallColor, Deque[np.ndarray]] = {
+            BallColor.WHITE: deque(maxlen=6),
+            BallColor.YELLOW: deque(maxlen=6),
+            BallColor.RED: deque(maxlen=6),
+        }
         self._pending_micro_kiss: Dict[BallColor, _PendingMicroKissCandidate] = {}
         self._last_contact_time: Dict[BallColor, float] = {}
         self.active_rails: Set[Rail] = set()
@@ -146,17 +154,37 @@ class KinematicsDetector:
             closest_b_mm=(float(closest_b[0]), float(closest_b[1])),
         )
 
-    def _compute_pre_approach_unit_vector(self) -> np.ndarray:
+    def _compute_pre_approach_unit_vector(self, current_step_vec: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        근접 시점 직전 최대 3프레임 동안의 수구 평균 진행 방향 단위 벡터(u_before)를 계산합니다.
+        근접 시점 직전 수구 진행 방향 단위 벡터(u_before)를 계산합니다.
+        이전 쿠션 반사 구간의 벡터가 섞이지 않도록 직전 프레임과의 방향 일관성을 검증합니다.
         """
-        if not self._cue_vel_history:
+        candidates: List[np.ndarray] = list(self._cue_vel_history)[-3:]
+        if current_step_vec is not None and float(np.linalg.norm(current_step_vec)) >= 1.0:
+            candidates.append(current_step_vec)
+        if not candidates:
             return np.array([1.0, 0.0], dtype=np.float64)
-        recent_vels = list(self._cue_vel_history)[-3:]
-        mean_vel = np.mean(np.stack(recent_vels, axis=0), axis=0)
+
+        last_vec = candidates[-1]
+        last_norm = float(np.linalg.norm(last_vec))
+        if last_norm < 1e-6:
+            return np.array([1.0, 0.0], dtype=np.float64)
+        u_last = last_vec / last_norm
+
+        # 직전 프레임 벡터들과 방향이 2.0도 이내로 일치하는 동일 직선 구간 벡터들만 평균하여 노이즈 제거
+        aligned = [last_vec]
+        cos_2deg = math.cos(math.radians(2.0))
+        for prev_v in reversed(candidates[:-1]):
+            p_norm = float(np.linalg.norm(prev_v))
+            if p_norm > 1e-6 and float(np.dot(prev_v / p_norm, u_last)) >= cos_2deg:
+                aligned.append(prev_v)
+            else:
+                break
+
+        mean_vel = np.mean(np.stack(aligned, axis=0), axis=0)
         norm = float(np.linalg.norm(mean_vel))
         if norm < 1e-6:
-            return np.array([1.0, 0.0], dtype=np.float64)
+            return u_last
         return mean_vel / norm
 
     def detect_cushion_contacts(
@@ -264,33 +292,82 @@ class KinematicsDetector:
         cand: _PendingMicroKissCandidate,
         cue_curr: TrackedBall,
         target_curr: TrackedBall,
+        step_cue_vec: np.ndarray,
     ) -> Optional[ConfirmedContactEvent]:
         """
-        그레이존(63.5mm < d_min <= 78.0mm) 후보에 대해 최대 3프레임 동안 축적된
-        1) 수구 궤적 굴절각(>= 1.8도) 또는 2) 정지 목적구 미세 변위(>= 3.5mm 또는 속도 >= 25mm/s) 증거를 검증합니다.
+        후보에 대해 축적된 물리 증거를 검증합니다:
+        - 강체 중첩 후보(is_direct_overlap): 직후 프레임에서 완벽한 등속 직선 무반응 관통(유령 교차)인지 여부만 검증하여 즉시 확정/기각
+        - 그레이존 초미세 스침 후보(61.65mm < d_min <= 78.0mm):
+          1) 수구 반발 궤적 굴절각(>= 1.15도 & 충격 법선 반대 방향 반발) 또는
+          2) 정지 목적구 법선 방향 충격 변위(충격 법선 정사영 >= 1.70mm & 일관된 전진) 검증
         """
-        # 1) 증거 1: 수구 궤적 굴절각(Deflection Angle) 검사
+        latest_target_pos = cand.post_target_positions[-1]
+        disp_vec = latest_target_pos - cand.target_rest_pos
+        target_disp_mm = float(np.linalg.norm(disp_vec))
+        normal_disp_mm = float(np.dot(disp_vec, cand.impact_normal))
+
+        # [Case 1] 강체 구 중첩(d_min <= 2R + 0.15mm = 61.65mm) 검증
+        if cand.is_direct_overlap:
+            step_norm = float(np.linalg.norm(step_cue_vec))
+            step_angle_deg = 0.0
+            if step_norm > 1e-6:
+                u_step = step_cue_vec / step_norm
+                dot_step = float(np.clip(np.dot(cand.u_before, u_step), -1.0, 1.0))
+                step_angle_deg = math.degrees(math.acos(dot_step))
+            speed_rel_diff = abs(cue_curr.speed - cand.cue_speed_before) / max(
+                cand.cue_speed_before, 1.0
+            )
+            # 수구 굴절(>= 0.20도), 수구 속력 변화(>= 1.5%), 목적구 이동(>= 0.5mm) 중 하나라도 존재하면 실제 충돌 확정
+            if (
+                step_angle_deg >= 0.20
+                or speed_rel_diff >= 0.015
+                or target_disp_mm >= 0.50
+            ):
+                return ConfirmedContactEvent(
+                    target_color=cand.target_color,
+                    timestamp=cand.t_impact,
+                    d_min_mm=cand.d_min_mm,
+                    contact_type="DIRECT_COLLISION",
+                    deflection_deg=step_angle_deg,
+                    target_impulse_disp_mm=target_disp_mm,
+                    cushions_at_impact=cand.cushions_at_impact,
+                )
+            return None
+
+        # [Case 2] 그레이존(61.65mm < d_min <= 78.0mm) 초미세 스침 이중 물리 게이트
+        # 1) 증거 1: 수구 궤적 반발 굴절각(Repulsive Deflection Angle) 검사
         deflection_deg = 0.0
+        is_repulsive_deflection = False
         if cand.post_cue_positions:
             latest_cue_pos = cand.post_cue_positions[-1]
             post_vec = latest_cue_pos - cand.cue_pos_at_closest
             post_norm = float(np.linalg.norm(post_vec))
-            if post_norm >= 1.5:
+            # 가우시안 위치 지터(+-0.5mm)에 의한 근거리 각도 왜곡을 막기 위해 최소 18mm 이상 진행 후 각도 산출
+            if post_norm >= 18.0:
                 u_after = post_vec / post_norm
                 dot_val = float(np.clip(np.dot(cand.u_before, u_after), -1.0, 1.0))
                 deflection_deg = math.degrees(math.acos(dot_val))
+                # 물리적 강체 충돌 시 수구는 반드시 목적구 반대 방향(impact_normal의 음의 내적 방향)으로 튕겨야 함
+                normal_deflect_proj = float(
+                    np.dot(u_after - cand.u_before, cand.impact_normal)
+                )
+                is_repulsive_deflection = normal_deflect_proj < -0.012
 
-        # 2) 증거 2: 목적구 미세 충격 변위(Target Micro-Impulse) 검사
-        target_disp_mm = 0.0
-        max_target_speed = max(cand.post_target_speeds) if cand.post_target_speeds else 0.0
+        # 2) 증거 2: 정지 목적구의 충격 법선 방향 미세 변위(Directional Normal Micro-Impulse) 검사
+        has_impulse_evidence = False
         if cand.was_target_stationary and cand.post_target_positions:
-            disp_vec = cand.post_target_positions[-1] - cand.target_rest_pos
-            target_disp_mm = float(np.linalg.norm(disp_vec))
+            direction_ratio = normal_disp_mm / (target_disp_mm + 1e-6)
+            # 목적구가 수구 반대쪽(충격 법선 양의 방향)으로 밀려났고, 지터가 아닌 일관된 이동인지 확인
+            if normal_disp_mm >= 1.70 and direction_ratio >= 0.75:
+                if len(cand.post_target_positions) >= 2:
+                    prev_disp_vec = cand.post_target_positions[-2] - cand.target_rest_pos
+                    prev_normal_disp = float(np.dot(prev_disp_vec, cand.impact_normal))
+                    has_impulse_evidence = prev_normal_disp >= 0.65
+                elif normal_disp_mm >= 2.20:
+                    has_impulse_evidence = True
 
-        has_deflection_evidence = deflection_deg >= self.config.MIN_DEFLECTION_ANGLE_DEG
-        has_impulse_evidence = cand.was_target_stationary and (
-            target_disp_mm >= self.config.MIN_TARGET_MICRO_DISP_MM
-            or max_target_speed >= self.config.MIN_TARGET_MICRO_SPEED_MM_S
+        has_deflection_evidence = (
+            is_repulsive_deflection and deflection_deg >= 1.15
         )
 
         if has_deflection_evidence or has_impulse_evidence:
@@ -305,7 +382,7 @@ class KinematicsDetector:
                 d_min_mm=cand.d_min_mm,
                 contact_type=contact_type,
                 deflection_deg=deflection_deg,
-                target_impulse_disp_mm=target_disp_mm,
+                target_impulse_disp_mm=max(0.0, normal_disp_mm),
                 cushions_at_impact=cand.cushions_at_impact,
             )
 
@@ -315,13 +392,13 @@ class KinematicsDetector:
         self,
         balls: Dict[BallColor, TrackedBall],
         assigned_cue_ball: BallColor,
-         timestamp: float,
+        timestamp: float,
         current_cushion_count: int = 0,
     ) -> Tuple[List[CushionImpactEvent], List[ConfirmedContactEvent]]:
         """
         매 프레임(60fps) 3개의 공 상태를 입력받아:
         1) 4면 쿠션 접촉 이벤트를 먼저 검출하여 쿠션 카운트를 갱신하고,
-        2) 서브프레임 CCD 및 미세 스침(Micro-Kiss) 3프레임 이중 게이트로 목적구 접촉 이벤트를 판별합니다.
+        2) 서브프레임 CCD 및 방향성 물리 증거 게이트로 목적구 접촉 이벤트를 판별합니다.
         """
         if assigned_cue_ball not in balls:
             return [], []
@@ -336,6 +413,10 @@ class KinematicsDetector:
             self._cue_pos_history.append(
                 np.array([cue_curr.x, cue_curr.y], dtype=np.float64)
             )
+            for c, b in balls.items():
+                self._target_pos_history[c].append(
+                    np.array([b.x, b.y], dtype=np.float64)
+                )
             return [], []
 
         cue_prev = self._prev_balls[assigned_cue_ball]
@@ -346,13 +427,17 @@ class KinematicsDetector:
         cushion_events = self.detect_cushion_contacts(cue_prev, cue_curr)
         effective_cushions = current_cushion_count + len(cushion_events)
 
-        # 수구 이동 방향 벡터 히스토리 기록 (직전 프레임 속도 벡터)
+        # 수구 이동 방향 벡터 계산
         step_cue_vec = np.array(
             [cue_curr.x - cue_prev.x, cue_curr.y - cue_prev.y], dtype=np.float64
         )
-        u_before_candidate = self._compute_pre_approach_unit_vector()
+        step_cue_norm = float(np.linalg.norm(step_cue_vec))
+        u_before_prev_only = self._compute_pre_approach_unit_vector(None)
+        u_before_with_curr = self._compute_pre_approach_unit_vector(step_cue_vec)
 
-        # 2. 목적구 2개에 대해 서브프레임 CCD 및 미세 스침 이중 게이트 수행
+        direct_overlap_limit_mm = 2.0 * self.config.BALL_RADIUS_MM + 0.15  # 61.65mm
+
+        # 2. 목적구 2개에 대해 서브프레임 CCD 및 물리 증거 검증 수행
         for target_color, target_curr in balls.items():
             if target_color == assigned_cue_ball:
                 continue
@@ -373,53 +458,112 @@ class KinematicsDetector:
                 t1=t1,
             )
 
-            # [Gate A] 확실한 정면/측면 충돌: d_min <= 2R + 2.0mm (63.5mm)
-            if ccd.d_min_mm <= self.config.DIRECT_CONTACT_DIST_MM:
-                self._pending_micro_kiss.pop(target_color, None)
-                self._last_contact_time[target_color] = ccd.t_impact
-                contact_events.append(
-                    ConfirmedContactEvent(
-                        target_color=target_color,
-                        timestamp=ccd.t_impact,
-                        d_min_mm=ccd.d_min_mm,
-                        contact_type="DIRECT_COLLISION",
-                        deflection_deg=0.0,
-                        target_impulse_disp_mm=0.0,
-                        cushions_at_impact=effective_cushions,
-                    )
-                )
-                continue
+            # 최근접 시점 수구(A) -> 목적구(B) 충격 법선 단위벡터 계산
+            normal_raw = np.array(
+                [
+                    ccd.closest_b_mm[0] - ccd.closest_a_mm[0],
+                    ccd.closest_b_mm[1] - ccd.closest_a_mm[1],
+                ],
+                dtype=np.float64,
+            )
+            normal_norm = float(np.linalg.norm(normal_raw))
+            impact_normal = (
+                normal_raw / normal_norm
+                if normal_norm > 1e-6
+                else np.array([0.0, -1.0], dtype=np.float64)
+            )
 
-            # [Gate B] 그레이존(63.5mm < d_min <= 78.0mm) 미세 스침 후보 등록 및 갱신
+            # 정지 목적구 기준 위치(카메라 랜덤 지터 평균 제거를 위해 최근 정지 히스토리 평균 사용)
+            rest_hist = self._target_pos_history[target_color]
+            if rest_hist:
+                rest_pos = np.mean(np.stack(list(rest_hist), axis=0), axis=0)
+            else:
+                rest_pos = np.array([target_prev.x, target_prev.y], dtype=np.float64)
+
+            is_curr_direct_overlap = ccd.d_min_mm <= direct_overlap_limit_mm
+
+            # [Gate A & B] 그레이존 이하(d_min <= 78.0mm) 후보 등록 및 최근접점(Apex) 갱신
             if ccd.d_min_mm <= self.config.GRAY_ZONE_MAX_DIST_MM:
+                chosen_u_before = (
+                    u_before_with_curr if ccd.tau_star >= 0.90 else u_before_prev_only
+                )
                 if target_color not in self._pending_micro_kiss:
+                    # 만약 강체 중첩(<= 61.65mm)이면서 이미 이번 프레임에 굴절/감속/목적구 이동이 발생했다면 즉시 확정
+                    curr_target_disp = float(
+                        np.linalg.norm(
+                            np.array([target_curr.x, target_curr.y], dtype=np.float64)
+                            - rest_pos
+                        )
+                    )
+                    in_step_deflect_deg = 0.0
+                    if step_cue_norm > 1e-6 and self._cue_vel_history:
+                        dot_in = float(
+                            np.clip(
+                                np.dot(u_before_prev_only, step_cue_vec / step_cue_norm),
+                                -1.0,
+                                1.0,
+                            )
+                        )
+                        in_step_deflect_deg = math.degrees(math.acos(dot_in))
+
+                    if is_curr_direct_overlap and (
+                        curr_target_disp >= 0.80
+                        or (ccd.tau_star < 0.90 and in_step_deflect_deg >= 0.25)
+                    ):
+                        self._last_contact_time[target_color] = ccd.t_impact
+                        contact_events.append(
+                            ConfirmedContactEvent(
+                                target_color=target_color,
+                                timestamp=ccd.t_impact,
+                                d_min_mm=ccd.d_min_mm,
+                                contact_type="DIRECT_COLLISION",
+                                deflection_deg=in_step_deflect_deg,
+                                target_impulse_disp_mm=curr_target_disp,
+                                cushions_at_impact=effective_cushions,
+                            )
+                        )
+                        continue
+
                     self._pending_micro_kiss[target_color] = _PendingMicroKissCandidate(
                         target_color=target_color,
                         t_impact=ccd.t_impact,
                         d_min_mm=ccd.d_min_mm,
-                        u_before=u_before_candidate.copy(),
+                        u_before=chosen_u_before.copy(),
+                        impact_normal=impact_normal,
                         cue_pos_at_closest=np.array(ccd.closest_a_mm, dtype=np.float64),
-                        target_rest_pos=np.array(
-                            [target_prev.x, target_prev.y], dtype=np.float64
-                        ),
-                        was_target_stationary=(
-                            target_prev.speed < self.config.MIN_TARGET_MICRO_SPEED_MM_S
-                        ),
+                        cue_speed_before=cue_curr.speed,
+                        target_rest_pos=rest_pos.copy(),
+                        was_target_stationary=(target_prev.speed < 80.0),
                         cushions_at_impact=effective_cushions,
+                        is_direct_overlap=is_curr_direct_overlap,
                         frames_waited=0,
                     )
+                    # 이번 스텝 끝점(tau_star >= 0.90)이 최근접점이면 다음 프레임부터 사후 궤적을 측정하도록 continue
+                    if ccd.tau_star >= 0.90:
+                        continue
                 else:
-                    # 이미 대기 중인 후보가 더 가깝게 접근한 프레임이면 최소 거리 및 최근접 수구 위치 갱신
                     cand = self._pending_micro_kiss[target_color]
-                    if ccd.d_min_mm < cand.d_min_mm:
+                    if is_curr_direct_overlap:
+                        cand.is_direct_overlap = True
+                    # 수구가 목적구에 더 가깝게 접근한 프레임이면 최근접점(Apex) 갱신
+                    if ccd.d_min_mm < cand.d_min_mm - 0.05:
                         cand.d_min_mm = ccd.d_min_mm
                         cand.t_impact = ccd.t_impact
+                        cand.u_before = chosen_u_before.copy()
+                        cand.impact_normal = impact_normal
                         cand.cue_pos_at_closest = np.array(
                             ccd.closest_a_mm, dtype=np.float64
                         )
+                        cand.cue_speed_before = cue_curr.speed
                         cand.cushions_at_impact = effective_cushions
+                        cand.frames_waited = 0
+                        cand.post_cue_positions.clear()
+                        cand.post_target_positions.clear()
+                        cand.post_target_speeds.clear()
+                        if ccd.tau_star >= 0.90:
+                            continue
 
-            # 대기 중인 그레이존 후보가 있다면 사후 3프레임 물리 증거(굴절각 / 미세 변위) 누적 및 판정
+            # 대기 중인 후보가 있다면 최근접점 통과 후 사후 프레임 물리 증거 누적 및 판정
             if target_color in self._pending_micro_kiss:
                 cand = self._pending_micro_kiss[target_color]
                 cand.frames_waited += 1
@@ -432,26 +576,36 @@ class KinematicsDetector:
                 cand.post_target_speeds.append(target_curr.speed)
 
                 confirmed = self._evaluate_pending_micro_kiss(
-                    cand, cue_curr, target_curr
+                    cand, cue_curr, target_curr, step_cue_vec
                 )
                 if confirmed is not None:
                     self._pending_micro_kiss.pop(target_color, None)
                     self._last_contact_time[target_color] = confirmed.timestamp
                     contact_events.append(confirmed)
-                elif cand.frames_waited >= self.config.MICRO_KISS_VERIFY_FRAMES:
-                    # 3프레임 대기 후에도 굴절각(< 1.8도)과 목적구 밀림(< 3.5mm) 증거가 모두 없으면 Near-Miss로 기각!
-                    self.near_miss_logs.append(
-                        {
-                            "target_color": target_color.value,
-                            "timestamp": cand.t_impact,
-                            "d_min_mm": round(cand.d_min_mm, 2),
-                            "verdict": "NEAR_MISS_NO_CONTACT",
-                        }
-                    )
-                    self._pending_micro_kiss.pop(target_color, None)
+                else:
+                    max_wait = 1 if cand.is_direct_overlap else self.config.MICRO_KISS_VERIFY_FRAMES
+                    if cand.frames_waited >= max_wait:
+                        self.near_miss_logs.append(
+                            {
+                                "target_color": target_color.value,
+                                "timestamp": cand.t_impact,
+                                "d_min_mm": round(cand.d_min_mm, 2),
+                                "verdict": "NEAR_MISS_NO_CONTACT",
+                            }
+                        )
+                        self._pending_micro_kiss.pop(target_color, None)
 
-        # 그레이존 후보가 진행 중이 아닐 때만 순수 직진 진행 벡터 히스토리에 추가 (굴절 전 기준 벡터 오염 방지)
-        if not self._pending_micro_kiss and float(np.linalg.norm(step_cue_vec)) >= 1.0:
+            # 후보 대기 중이 아닌 정지 상태 목적구의 위치 히스토리 갱신
+            if (
+                target_color not in self._pending_micro_kiss
+                and target_curr.speed < 80.0
+            ):
+                self._target_pos_history[target_color].append(
+                    np.array([target_curr.x, target_curr.y], dtype=np.float64)
+                )
+
+        # 굴절 후 후보 평가가 진행 중이 아닐 때만 직진 진행 벡터 히스토리 갱신
+        if not self._pending_micro_kiss and step_cue_norm >= 1.0:
             self._cue_vel_history.append(step_cue_vec)
         self._cue_pos_history.append(
             np.array([cue_curr.x, cue_curr.y], dtype=np.float64)
