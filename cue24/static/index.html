@@ -1542,6 +1542,7 @@
             class="cam-stream-img"
             src="/api/video/live"
             alt="CUE24 실시간 당구대 카메라 및 자동 리플레이"
+            onerror="setTimeout(() => { if (currentCamMode === 'LIVE') switchToLiveCam(); }, 800)"
           />
           <div class="cam-overlay-top">
             <span id="camModeBadge" class="cam-mode-badge">🔴 실시간 화면</span>
@@ -1973,6 +1974,9 @@
         pill.classList.remove('disconnected');
         text.textContent = '실시간 연결됨';
         ws.send(JSON.stringify({ action: 'ACTIVATE_VISION' }));
+        if (currentCamMode === 'LIVE') {
+          switchToLiveCam();
+        }
       };
 
       ws.onmessage = (event) => {
@@ -2148,6 +2152,11 @@
     function renderScoreboard(data) {
       if (!data || !data.players) return;
       lastScoreboardData = data;
+
+      const streamImgEl = document.getElementById('camStreamImg');
+      if (streamImgEl && currentCamMode === 'LIVE' && streamImgEl.complete && streamImgEl.naturalWidth === 0) {
+        switchToLiveCam();
+      }
 
       const p1 = data.players.P1;
       const p2 = data.players.P2;

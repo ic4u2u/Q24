@@ -33,6 +33,11 @@ class LabHungarianBallIdentifier:
             BallColor.RED: np.array([135.0, 178.0, 152.0], dtype=np.float32),
         }
         self.prev_positions_px: Dict[BallColor, np.ndarray] = {}
+        self.prev_centers = self.prev_positions_px
+
+    def reset(self) -> None:
+        """이전 프레임 위치 이력을 초기화합니다."""
+        self.prev_positions_px.clear()
 
     def extract_glare_free_lab(
         self, frame_bgr: np.ndarray, bbox_xyxy: Tuple[float, float, float, float]

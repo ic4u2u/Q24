@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from ball_identity_tracker import LabHungarianBallIdentifier
 from cue24.config.settings import settings
 from cue24.core.color_locker import ColorLocker
 from cue24.core.physics_tracker import (
@@ -154,6 +155,7 @@ class LiveStreamReader:
         ]
         self.calibrator = TableCalibrator(src_corners=default_corners)
         self.color_locker = ColorLocker()
+        self.lab_hungarian_identifier = LabHungarianBallIdentifier()
         self.detector = BallCandidateDetector()
         self.tracker = PhysicsTracker()
         self.bulletproof_tracker = BulletproofBallTracker()
@@ -261,8 +263,11 @@ class LiveStreamReader:
             cap = cv2.VideoCapture(self.camera_index)
         else:
             video_file = Path(path_str)
-            if video_file.exists():
-                cap = cv2.VideoCapture(str(video_file))
+            try:
+                if video_file.exists():
+                    cap = cv2.VideoCapture(str(video_file))
+            except OSError:
+                cap = None
 
         if cap is not None and cap.isOpened():
             self._video_cap = cap
@@ -378,6 +383,7 @@ class LiveStreamReader:
         """
         self._vision_tracks_synced = False
         self.color_locker.set_shot_lock(False)
+        self.lab_hungarian_identifier.prev_positions_px.clear()
         self.bulletproof_tracker.is_shot_in_progress = False
         self.spin_detector.reset()
         self._missing_streak_by_id.clear()
