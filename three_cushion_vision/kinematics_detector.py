@@ -125,33 +125,35 @@ class KinematicsDetector:
           d_min = ||p0 + tau* * v_rel||
           t_impact = t0 + tau* * (t1 - t0)
         """
-        vec_a0 = np.array([float(a0[0]), float(a0[1])], dtype=np.float64)
-        vec_a1 = np.array([float(a1[0]), float(a1[1])], dtype=np.float64)
-        vec_b0 = np.array([float(b0[0]), float(b0[1])], dtype=np.float64)
-        vec_b1 = np.array([float(b1[0]), float(b1[1])], dtype=np.float64)
+        ax0, ay0 = float(a0[0]), float(a0[1])
+        ax1, ay1 = float(a1[0]), float(a1[1])
+        bx0, by0 = float(b0[0]), float(b0[1])
+        bx1, by1 = float(b1[0]), float(b1[1])
 
-        p0 = vec_a0 - vec_b0
-        delta_a = vec_a1 - vec_a0
-        delta_b = vec_b1 - vec_b0
-        v_rel = delta_a - delta_b
+        px0 = ax0 - bx0
+        py0 = ay0 - by0
+        dax = ax1 - ax0
+        day = ay1 - ay0
+        dbx = bx1 - bx0
+        dby = by1 - by0
+        vrx = dax - dbx
+        vry = day - dby
 
-        v_rel_norm_sq = float(np.dot(v_rel, v_rel))
-        raw_tau = -float(np.dot(p0, v_rel)) / (v_rel_norm_sq + 1e-6)
-        tau_star = float(np.clip(raw_tau, 0.0, 1.0))
+        v_rel_norm_sq = vrx * vrx + vry * vry
+        raw_tau = -(px0 * vrx + py0 * vry) / (v_rel_norm_sq + 1e-6)
+        tau_star = 0.0 if raw_tau <= 0.0 else (1.0 if raw_tau >= 1.0 else raw_tau)
 
-        diff_at_tau = p0 + tau_star * v_rel
-        d_min = float(np.linalg.norm(diff_at_tau))
-        t_impact = float(t0 + tau_star * (t1 - t0))
-
-        closest_a = vec_a0 + tau_star * delta_a
-        closest_b = vec_b0 + tau_star * delta_b
+        dx_tau = px0 + tau_star * vrx
+        dy_tau = py0 + tau_star * vry
+        d_min = math.hypot(dx_tau, dy_tau)
+        t_impact = t0 + tau_star * (t1 - t0)
 
         return SubFrameCCDResult(
             tau_star=tau_star,
             d_min_mm=d_min,
             t_impact=t_impact,
-            closest_a_mm=(float(closest_a[0]), float(closest_a[1])),
-            closest_b_mm=(float(closest_b[0]), float(closest_b[1])),
+            closest_a_mm=(ax0 + tau_star * dax, ay0 + tau_star * day),
+            closest_b_mm=(bx0 + tau_star * dbx, by0 + tau_star * dby),
         )
 
     def _compute_pre_approach_unit_vector(self, current_step_vec: Optional[np.ndarray] = None) -> np.ndarray:
@@ -478,9 +480,9 @@ class KinematicsDetector:
         step_cue_vec = np.array(
             [cue_curr.x - cue_prev.x, cue_curr.y - cue_prev.y], dtype=np.float64
         )
-        step_cue_norm = float(np.linalg.norm(step_cue_vec))
-        u_before_prev_only = self._compute_pre_approach_unit_vector(None)
-        u_before_with_curr = self._compute_pre_approach_unit_vector(step_cue_vec)
+        step_cue_norm = math.hypot(cue_curr.x - cue_prev.x, cue_curr.y - cue_prev.y)
+        u_before_prev_only: Optional[np.ndarray] = None
+        u_before_with_curr: Optional[np.ndarray] = None
 
         direct_overlap_limit_mm = 2.0 * self.config.BALL_RADIUS_MM + 0.15  # 61.65mm
 
@@ -505,35 +507,32 @@ class KinematicsDetector:
                 t1=t1,
             )
 
-            # 최근접 시점 수구(A) -> 목적구(B) 충격 법선 단위벡터 계산
-            normal_raw = np.array(
-                [
-                    ccd.closest_b_mm[0] - ccd.closest_a_mm[0],
-                    ccd.closest_b_mm[1] - ccd.closest_a_mm[1],
-                ],
-                dtype=np.float64,
-            )
-            normal_norm = float(np.linalg.norm(normal_raw))
-            impact_normal = (
-                normal_raw / normal_norm
-                if normal_norm > 1e-6
-                else np.array([0.0, -1.0], dtype=np.float64)
-            )
-
-            # 정지 목적구 기준 위치(카메라 랜덤 지터 평균 제거를 위해 최근 정지 히스토리 평균 사용)
-            rest_hist = self._target_pos_history[target_color]
-            if rest_hist:
-                rest_pos = np.mean(np.stack(list(rest_hist), axis=0), axis=0)
-            else:
-                rest_pos = np.array([target_prev.x, target_prev.y], dtype=np.float64)
-
-            is_curr_direct_overlap = ccd.d_min_mm <= direct_overlap_limit_mm
-
-            # [Gate A & B] 그레이존 이하(d_min <= 78.0mm) 후보 등록 및 최근접점(Apex) 갱신
+            # [Gate A & B] 그레이존 이하(d_min <= 78.0mm) 진입 시에만 법선 벡터 및 기준 위치 지연 계산(Lazy Eval)
             if ccd.d_min_mm <= self.config.GRAY_ZONE_MAX_DIST_MM:
+                if u_before_prev_only is None:
+                    u_before_prev_only = self._compute_pre_approach_unit_vector(None)
+                    u_before_with_curr = self._compute_pre_approach_unit_vector(step_cue_vec)
+
+                nx = ccd.closest_b_mm[0] - ccd.closest_a_mm[0]
+                ny = ccd.closest_b_mm[1] - ccd.closest_a_mm[1]
+                normal_norm = math.hypot(nx, ny)
+                impact_normal = (
+                    np.array([nx / normal_norm, ny / normal_norm], dtype=np.float64)
+                    if normal_norm > 1e-6
+                    else np.array([0.0, -1.0], dtype=np.float64)
+                )
+
+                rest_hist = self._target_pos_history[target_color]
+                if rest_hist:
+                    rest_pos = np.mean(np.stack(list(rest_hist), axis=0), axis=0)
+                else:
+                    rest_pos = np.array([target_prev.x, target_prev.y], dtype=np.float64)
+
+                is_curr_direct_overlap = ccd.d_min_mm <= direct_overlap_limit_mm
                 chosen_u_before = (
                     u_before_with_curr if ccd.tau_star >= 0.90 else u_before_prev_only
                 )
+                assert chosen_u_before is not None and u_before_prev_only is not None
                 if target_color not in self._pending_micro_kiss:
                     # 만약 강체 중첩(<= 61.65mm)이면서 이미 이번 프레임에 굴절/감속/목적구 이동이 발생했다면 즉시 확정
                     curr_target_disp = float(
