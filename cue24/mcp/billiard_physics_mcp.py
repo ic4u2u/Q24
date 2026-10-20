@@ -256,16 +256,21 @@ class LocalPhysics3CushionAI:
 
         def _try_register(rail_name: str, idx: int, pt: Point2D, prev_vel: Point2D, curr_vel: Point2D) -> None:
             nonlocal last_rail, last_hit_pos
+            if last_rail == rail_name:
+                return
             if not rail_armed[rail_name]:
                 return
             if last_frame_by_rail[rail_name] >= 0 and (idx - last_frame_by_rail[rail_name]) < per_rail_cooldown:
                 return
             if last_hit_pos is not None:
                 travel_d = math.hypot(pt[0] - last_hit_pos[0], pt[1] - last_hit_pos[1])
-                if last_rail == rail_name and travel_d < min_same_rail_travel:
+                if travel_d < min_corner_travel:
                     return
-                if last_rail != rail_name and travel_d < min_corner_travel:
-                    return
+                if cushions:
+                    prev_idx = cushions[-1][0]
+                    dt_f = max(1, idx - prev_idx)
+                    if dt_f <= 10 and travel_d > 1050.0 and (travel_d / dt_f) > 145.0:
+                        return
             if self.verify_cushion_impulse(rail_name, pt, prev_vel, curr_vel):
                 cushions.append((idx, rail_name))
                 last_rail = rail_name

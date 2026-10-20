@@ -178,7 +178,9 @@ class ScoringEngine:
         if self.fsm_state == ShotFSMState.VALID_SCORE_PENDING:
             return False
 
-        # [4대 업그레이드 ①] 슈미트 트리거 무장 상태 확인
+        # [4대 업그레이드 ①] 직전 타격 레일과 동일한 레일 연속 카운트 차단 + 슈미트 트리거 무장 상태 확인
+        if self._last_rail_hit == rail_name:
+            return False
         if not self._rail_armed.get(rail_name, True):
             return False
 
@@ -187,14 +189,23 @@ class ScoringEngine:
         if last_f >= 0 and (frame_idx - last_f) < self.PER_RAIL_COOLDOWN_FRAMES:
             return False
 
+        # 직전 이벤트(FIRST_HIT 또는 CUSHION)로부터 비물리적 순간이동(예: 10프레임 이내 1100mm 반대편 점프) 차단
+        if self.events:
+            last_ev = self.events[-1]
+            dt_frames = max(1, frame_idx - last_ev.frame_idx)
+            jump_d = math.hypot(
+                cue_pos[0] - last_ev.position_mm[0],
+                cue_pos[1] - last_ev.position_mm[1],
+            )
+            if dt_frames <= 10 and jump_d > 1050.0 and (jump_d / dt_frames) > 145.0:
+                return False
+
         # 직전 쿠션 타격 위치로부터의 실제 이동 변위 검사
         if self._last_cushion_hit_pos is not None:
             travel_from_last = math.hypot(
                 cue_pos[0] - self._last_cushion_hit_pos[0],
                 cue_pos[1] - self._last_cushion_hit_pos[1],
             )
-            if self._last_rail_hit == rail_name and travel_from_last < self.MIN_RAIL_TRAVEL_DIST:
-                return False
             if self._last_rail_hit != rail_name:
                 # 코너에서 제자리 바운딩 박스 떨림으로 두 레일이 번갈아 찍히는 11쿠션 폭주 현상 완벽 차단
                 if travel_from_last < self.CORNER_MIN_TRAVEL_DIST and not has_clear_reversal:
@@ -279,9 +290,28 @@ class ScoringEngine:
         결정론적 4단계 FSM(VALID_SCORE_PENDING vs NO_SCORE_LOCKED) 상태를 전이합니다.
         """
         if self.first_object_ball_id is None:
+            # 제1적구 최초 접촉 직전에 선수 신체/큐대 가림으로 당구대 반대편(예: 12프레임 이내 950mm 이상 점프)에서
+            # 잘못 찍힌 가짜 선행 1쿠션이 있다면 자동으로 무효화하여 정확한 쿠션 수를 보장합니다.
+            if self.cushion_count_before_first_hit == 1 and len(self.events) == 1:
+                ev0 = self.events[0]
+                dt_f = max(1, frame_idx - ev0.frame_idx)
+                dist_f = math.hypot(
+                    cue_pos[0] - ev0.position_mm[0],
+                    cue_pos[1] - ev0.position_mm[1],
+                )
+                if dt_f <= 12 and dist_f > 950.0:
+                    self.events.clear()
+                    self.cushion_count_before_first_hit = 0
+                    self.cushion_count_before_second_hit = 0
+                    self.total_cushion_count = 0
+                    self._rail_armed[ev0.detail] = True
+                    self._last_cushion_hit_pos = None
+
             self.first_object_ball_id = target_ball_id
             self._first_hit_frame = frame_idx
             self._last_rail_hit = None
+            for r_k in self._rail_armed:
+                self._rail_armed[r_k] = True
             if self.fsm_state == ShotFSMState.IDLE:
                 self.fsm_state = ShotFSMState.IN_PLAY
             self.events.append(

@@ -939,8 +939,8 @@ class CausalKissSafeFSM:
                 vn_in, vn_out = norm_vels[rail]
                 has_true_normal_reversal = (vn_in < -45.0) and (vn_out > 35.0)
 
-                # 동일 레일 연속 타격 시 최소 이동 변위(80mm) 강제
-                if rail == self.last_rail_hit and cur_travel < self.MIN_RAIL_TRAVEL_DIST:
+                # 직전 타격 레일과 동일한 레일은 다른 레일이나 목적구 충돌 전까지 연속 카운트 원천 차단
+                if rail == self.last_rail_hit:
                     continue
 
                 # 코너 핑퐁 방지: 서로 다른 레일 간에도 최소 이동 변위(22.0mm) 또는 실제 법선 속도 반전이 확인될 때만 카운트
