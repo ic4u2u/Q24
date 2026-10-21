@@ -2508,11 +2508,18 @@
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ action: 'SET_RULE_MODE', rule_mode: nextMode }));
       } else {
-        await fetch('/api/match/rule-mode', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ rule_mode: nextMode }),
-        });
+        try {
+          const res = await fetch('/api/match/rule-mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rule_mode: nextMode }),
+          });
+          if (res.ok) {
+            renderScoreboard(await res.json());
+            return;
+          }
+        } catch (_) {}
+        applyLocalCloudAction('SET_RULE_MODE', { rule_mode: nextMode });
       }
     }
 
@@ -2520,11 +2527,18 @@
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ action: 'ADJUST_SCORE', player_id: playerId, delta }));
       } else {
-        await fetch('/api/match/adjust-score', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ player_id: playerId, delta }),
-        });
+        try {
+          const res = await fetch('/api/match/adjust-score', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ player_id: playerId, delta }),
+          });
+          if (res.ok) {
+            renderScoreboard(await res.json());
+            return;
+          }
+        } catch (_) {}
+        applyLocalCloudAction('ADJUST_SCORE', { player_id: playerId, delta });
       }
     }
 
@@ -2532,7 +2546,14 @@
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ action: 'USE_TIMEOUT' }));
       } else {
-        await fetch('/api/match/timeout', { method: 'POST' });
+        try {
+          const res = await fetch('/api/match/timeout', { method: 'POST' });
+          if (res.ok) {
+            renderScoreboard(await res.json());
+            return;
+          }
+        } catch (_) {}
+        applyLocalCloudAction('USE_TIMEOUT', {});
       }
     }
 
@@ -2540,7 +2561,14 @@
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ action: 'SWITCH_TURN' }));
       } else {
-        await fetch('/api/match/switch-turn', { method: 'POST' });
+        try {
+          const res = await fetch('/api/match/switch-turn', { method: 'POST' });
+          if (res.ok) {
+            renderScoreboard(await res.json());
+            return;
+          }
+        } catch (_) {}
+        applyLocalCloudAction('SWITCH_TURN', {});
       }
     }
 
@@ -2548,7 +2576,214 @@
       return startMatch();
     }
 
+    // ------------------------------------------------------------------
+    // [Vercel 클라우드 단독 배포용 Mock & 3쿠션 물리 시뮬레이션 폴백]
+    // 로컬 FastAPI 서버가 없는 정적 클라우드 환경에서도 점수판 및 3쿠션 비전 화면이 100% 작동합니다.
+    // ------------------------------------------------------------------
+    let cloudSimActive = false;
+    let cloudSimCanvas = null;
+    let cloudSimBalls = [
+      { color: 'WHITE', fill: '#f8fafc', x: 160, y: 180, vx: 4.4, vy: -3.1 },
+      { color: 'YELLOW', fill: '#fde047', x: 460, y: 150, vx: 0, vy: 0 },
+      { color: 'RED', fill: '#ef4444', x: 320, y: 110, vx: 0, vy: 0 },
+    ];
+    let cloudCushionCount = 0;
+    let cloudTrail = [];
+
+    function createInitialCloudState() {
+      return {
+        rule_mode: 'STANDARD',
+        fsm_state: 'WAIT_SHOT',
+        current_inning: 1,
+        active_player_id: 'P1',
+        is_match_paused: false,
+        match_timer: { elapsed_sec: matchElapsedSec, is_paused: false },
+        shot_timer: { remaining_sec: 40, default_sec: 40, is_paused: false },
+        players: {
+          P1: {
+            name: '1번 선수',
+            score: 0,
+            innings: 1,
+            average: 0.0,
+            high_run: 0,
+            current_run: 0,
+            bank_shots: 0,
+            timeouts_remaining: 2,
+            target_score: 40,
+            cue_ball_color: 'WHITE',
+          },
+          P2: {
+            name: '2번 선수',
+            score: 0,
+            innings: 0,
+            average: 0.0,
+            high_run: 0,
+            current_run: 0,
+            bank_shots: 0,
+            timeouts_remaining: 2,
+            target_score: 40,
+            cue_ball_color: 'YELLOW',
+          },
+        },
+        inning_history: [{ inning: 1, P1: 0, P2: null }],
+        last_shot_result: {
+          shot_type: 'READY',
+          is_scored: false,
+          message: '클라우드 시뮬레이션 모드 (1번 선수 선공 - 흰공 수구)',
+        },
+      };
+    }
+
+    let cloudState = createInitialCloudState();
+
+    function applyLocalCloudAction(action, payload = {}) {
+      const st = lastScoreboardData || cloudState;
+      const activeId = st.active_player_id || 'P1';
+      const activeP = st.players[activeId];
+      if (action === 'SET_RULE_MODE') {
+        st.rule_mode = payload.rule_mode || 'STANDARD';
+      } else if (action === 'ADJUST_SCORE') {
+        const pid = payload.player_id || activeId;
+        const delta = Number(payload.delta) || 0;
+        const p = st.players[pid];
+        p.score = Math.max(0, (p.score || 0) + delta);
+        if (delta >= 2) p.bank_shots = (p.bank_shots || 0) + 1;
+        if (delta > 0) {
+          p.current_run = (p.current_run || 0) + delta;
+          p.high_run = Math.max(p.high_run || 0, p.current_run);
+          st.shot_timer.remaining_sec = st.shot_timer.default_sec;
+          st.last_shot_result = {
+            shot_id: Date.now(),
+            shot_type: delta >= 2 ? 'BANK_SHOT' : 'REGULAR_3C',
+            is_scored: true,
+            immediate_score: true,
+            cue_ball: p.cue_ball_color,
+            message:
+              delta >= 2
+                ? `득점 성공 (뱅크샷 +2점): ${p.name} 수구 유지!`
+                : `득점 성공 (일반 3쿠션 +1점): ${p.name} 수구 유지!`,
+          };
+        }
+        p.average = p.innings > 0 ? p.score / p.innings : 0;
+        const hist = (st.inning_history || []).find((h) => h.inning === st.current_inning);
+        if (hist) hist[pid] = Math.max(0, (Number(hist[pid]) || 0) + delta);
+      } else if (action === 'SWITCH_TURN') {
+        if (activeId === 'P1') {
+          st.active_player_id = 'P2';
+          st.players.P2.innings = Math.max(1, (st.players.P2.innings || 0) + 1);
+          const hist = (st.inning_history || []).find((h) => h.inning === st.current_inning);
+          if (hist && hist.P2 === null) hist.P2 = 0;
+        } else {
+          st.active_player_id = 'P1';
+          st.current_inning += 1;
+          st.players.P1.innings += 1;
+          st.inning_history.push({ inning: st.current_inning, P1: 0, P2: null });
+        }
+        st.shot_timer.remaining_sec = st.shot_timer.default_sec;
+        const nextP = st.players[st.active_player_id];
+        st.last_shot_result = {
+          shot_id: Date.now(),
+          shot_type: 'MISS',
+          is_scored: false,
+          message: `공격권 교대 -> ${nextP.name} (${nextP.cue_ball_color === 'YELLOW' ? '노란공' : '흰공'} 수구)`,
+        };
+      } else if (action === 'USE_TIMEOUT') {
+        if ((activeP.timeouts_remaining || 0) > 0) {
+          activeP.timeouts_remaining -= 1;
+          st.shot_timer.remaining_sec = Math.min(80, (st.shot_timer.remaining_sec || 40) + 40);
+        }
+      }
+      cloudState = st;
+      renderScoreboard(st);
+    }
+
+    function startCloudCanvasFallback() {
+      if (cloudSimActive) return;
+      cloudSimActive = true;
+      const pill = document.getElementById('wsStatusPill');
+      const text = document.getElementById('wsStatusText');
+      if (pill && text) {
+        pill.classList.remove('disconnected');
+        text.textContent = '클라우드 데모 가동 중';
+      }
+      if (!lastScoreboardData) {
+        renderScoreboard(cloudState);
+      }
+
+      cloudSimCanvas = document.createElement('canvas');
+      cloudSimCanvas.width = 640;
+      cloudSimCanvas.height = 360;
+      const ctx = cloudSimCanvas.getContext('2d');
+      const streamImg = document.getElementById('camStreamImg');
+
+      function stepSim() {
+        if (!cloudSimActive) return;
+        ctx.fillStyle = '#072f5f';
+        ctx.fillRect(0, 0, 640, 360);
+        ctx.strokeStyle = '#0ea5e9';
+        ctx.lineWidth = 10;
+        ctx.strokeRect(18, 18, 604, 324);
+
+        const cue = cloudSimBalls[0];
+        cue.x += cue.vx;
+        cue.y += cue.vy;
+        if (cue.x <= 32 || cue.x >= 608) {
+          cue.vx *= -1;
+          cloudCushionCount = (cloudCushionCount % 4) + 1;
+        }
+        if (cue.y <= 32 || cue.y >= 328) {
+          cue.vy *= -1;
+          cloudCushionCount = (cloudCushionCount % 4) + 1;
+        }
+        cloudTrail.push({ x: cue.x, y: cue.y });
+        if (cloudTrail.length > 55) cloudTrail.shift();
+
+        ctx.beginPath();
+        cloudTrail.forEach((pt, idx) => {
+          if (idx === 0) ctx.moveTo(pt.x, pt.y);
+          else ctx.lineTo(pt.x, pt.y);
+        });
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.75)';
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+
+        cloudSimBalls.forEach((b) => {
+          ctx.beginPath();
+          ctx.arc(b.x, b.y, 11, 0, Math.PI * 2);
+          ctx.fillStyle = b.fill;
+          ctx.fill();
+          ctx.strokeStyle = '#0f172a';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        });
+
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.82)';
+        ctx.fillRect(28, 28, 320, 32);
+        ctx.fillStyle = '#38bdf8';
+        ctx.font = 'bold 13px sans-serif';
+        ctx.fillText(
+          `CUE24 AI Vision [Polylines & LAB Hungarian] · 쿠션: ${cloudCushionCount}`,
+          38,
+          49
+        );
+
+        if (streamImg) {
+          streamImg.src = cloudSimCanvas.toDataURL('image/jpeg', 0.82);
+        }
+        setTimeout(stepSim, 100);
+      }
+      stepSim();
+    }
+
     window.addEventListener('DOMContentLoaded', () => {
+      const streamImg = document.getElementById('camStreamImg');
+      if (streamImg) {
+        streamImg.addEventListener('error', () => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            startCloudCanvasFallback();
+          }
+        });
+      }
       renderInningSheet([], '1번 선수', '2번 선수', 1);
       startLocalMatchTimerLoop();
       initCamInteractiveEvents();
