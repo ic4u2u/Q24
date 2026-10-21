@@ -855,8 +855,8 @@ class CausalKissSafeFSM:
         d_min, _, n_xy = self._subframe_ccd(
             f_prev.pos[ball_x], f_curr.pos[ball_x], f_prev.pos[ball_y], f_curr.pos[ball_y]
         )
-        max_allow_dist = 95.0 if subpixel_phase_hit else self.TARGET_APPROACH_ZONE_MM
-        if d_min > max_allow_dist:
+        # 30fps 고속 샷에서 프레임 사이(Mid-Frame) 정지 적구를 타격하고 튕겨나간 경우 최대 135mm까지 스냅샷 이격이 발생할 수 있음
+        if d_min > 135.0:
             return False
 
         # 1) 적구 간 키스(B <-> C) 판정인 경우:
@@ -923,20 +923,31 @@ class CausalKissSafeFSM:
         recent_ob_kiss = abs(t_eval - self.last_object_kiss_time) <= 0.08
 
         phenomenon_a_hit = False
-        if speed_y_before < 40.0 and not recent_ob_kiss:
+        if speed_y_before < 45.0 and not recent_ob_kiss:
             # 목적구가 정지해 있었고 직전 적구 간 키스가 없었던 경우:
-            # 직전 정지 앵커(p_y_before) 대비 5.2mm 이상 이동하고 국소 속도 변화(||Delta v_Y|| >= 42.0mm/s)가 발생했는지 확인!
+            # 1) 일반 근접(d_min <= 68.5mm): 5.2mm 이상 이동 & ||Delta v_Y|| >= 42.0mm/s
+            # 2) 30fps 프레임 사이 고속 반발(68.5mm < d_min <= 135.0mm):
+            #    관성의 법칙에 따라 정지해 있던 적구가 스스로 움직일 수 없으므로,
+            #    정지 적구가 15.0mm 이상 강하게 튀어나가고(||Delta v_Y|| >= 140mm/s) 제3의 공 Z가 멀리(> 85mm) 있을 때 인정!
             net_disp_y = float(np.linalg.norm(p_y_after - p_y_before))
             step_after_hit = float(np.linalg.norm(p_y_after - f_curr.pos[ball_y]))
-            if (
-                net_disp_y >= self.TARGET_MOVED_DISP_TH_MM
-                and step_after_hit >= 1.5
-                and delta_v_y_mag >= self.TARGET_MIN_DELTA_V_MM_S
+            if d_min <= self.TARGET_APPROACH_ZONE_MM:
+                if (
+                    net_disp_y >= self.TARGET_MOVED_DISP_TH_MM
+                    and step_after_hit >= 1.5
+                    and delta_v_y_mag >= self.TARGET_MIN_DELTA_V_MM_S
+                ):
+                    if d_min <= d_x_other + 6.0 or d_y_other > 68.0:
+                        phenomenon_a_hit = True
+            elif (
+                net_disp_y >= 15.0
+                and step_after_hit >= 6.0
+                and delta_v_y_mag >= 140.0
+                and d_y_other > 85.0
+                and d_x_other > d_min
             ):
-                # 제3의 공 Z가 친 간접 충격(J_ZY > J_AY)이 아닌지 확인
-                if d_min <= d_x_other + 6.0 or d_y_other > 68.0:
-                    phenomenon_a_hit = True
-        else:
+                phenomenon_a_hit = True
+        elif d_min <= self.TARGET_APPROACH_ZONE_MM:
             # 목적구가 이미 적구 간 키스로 굴러가고 있거나 직전(0.08s 이내) 키스가 발생한 경우 (Case 1, Case 5, Case 7):
             # 원래 등속 직진 예상 위치(expected_after) 대비 새로운 방향으로 12.0mm 이상 꺾여 밀려났고,
             # 동시에 수구도 반작용으로 꼭짓점 굴절이 동반되었을 때만 진짜 타격으로 인정!

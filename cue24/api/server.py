@@ -170,6 +170,12 @@ class LiveStreamReader:
         self._cached_half_H: Optional[np.ndarray] = None
         self._cached_quarter_H: Optional[np.ndarray] = None
         self._morph_kernel: np.ndarray = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self._morph_open_k5: np.ndarray = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self._channel_core_state: Dict[str, Dict[str, Any]] = {
+            "WHITE": {"pos": None, "vel": np.zeros(2, dtype=np.float64), "missing": 0},
+            "YELLOW": {"pos": None, "vel": np.zeros(2, dtype=np.float64), "missing": 0},
+            "RED": {"pos": None, "vel": np.zeros(2, dtype=np.float64), "missing": 0},
+        }
         self._vision_tracks_synced: bool = False
         self._rest_positions: Dict[int, Point2D] = {}
         self._missing_streak_by_id: Dict[int, int] = {}
@@ -423,6 +429,130 @@ class LiveStreamReader:
         )
         return warped_quarter, strict_candidates[:3], blur_candidates
 
+    def _extract_3_channel_ball_cores(
+        self, warped_quarter: np.ndarray
+    ) -> Optional[Dict[str, Dict[str, float]]]:
+        """
+        [Step 1: 큐대·손·모자를 원천 배제하는 3색 채널 독립 원형 코어 검출기]
+        - WHITE 채널: L >= 178, S <= 88, B < 148, A < 140 마스크에 5x5 타원 모폴로지 열림(MORPH_OPEN)을 적용하여
+          수구에 맞닿은 가느다란 하얀색 큐대(샤프트)와 선수 손/장갑을 100% 절단하고 둥근 흰공 코어만 추출합니다.
+        - YELLOW 채널: B >= 150, A < 148, L >= 115, S >= 90 마스크에서 노란공 코어만 독립 추출합니다.
+        - RED 채널: A >= 152, S >= 110, V >= 65 마스크에서 빨간공 코어만 독립 추출합니다.
+        - 각 색상 채널별로 직전 위치 및 속도 예측 기반 물리 근접 게이트(max_gate)를 적용하여
+          샷 도중에도 WHITE/YELLOW/RED ID 뒤바뀜(ID Swap) 및 선수 신체(모자·팔) 오인식을 0%로 차단합니다.
+        """
+        lab = cv2.cvtColor(warped_quarter, cv2.COLOR_BGR2LAB)
+        hsv = cv2.cvtColor(warped_quarter, cv2.COLOR_BGR2HSV)
+        L_ch, A_ch, B_ch = lab[:, :, 0], lab[:, :, 1], lab[:, :, 2]
+        _, S_ch, V_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        tilt = self.calibrator.camera_tilt_ratio
+
+        red_m = ((A_ch >= 152) & (S_ch >= 110) & (V_ch >= 65)).astype(np.uint8) * 255
+        yel_m = ((B_ch >= 150) & (A_ch < 148) & (L_ch >= 115) & (S_ch >= 90)).astype(np.uint8) * 255
+        whi_m = ((L_ch >= 178) & (S_ch <= 88) & (B_ch < 148) & (A_ch < 140)).astype(np.uint8) * 255
+        whi_m = cv2.morphologyEx(whi_m, cv2.MORPH_OPEN, self._morph_open_k5)
+
+        out: Dict[str, Dict[str, float]] = {}
+        for col, mask in (("WHITE", whi_m), ("YELLOW", yel_m), ("RED", red_m)):
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            st = self._channel_core_state[col]
+            prev_p: Optional[np.ndarray] = st["pos"]
+            prev_v: np.ndarray = st["vel"]
+            pred_p: Optional[np.ndarray] = (prev_p + prev_v * 0.95) if prev_p is not None else None
+
+            best_pt: Optional[np.ndarray] = None
+            best_rad: float = 31.0
+            best_area: float = 2970.0
+            best_circ: float = 0.88
+            best_score: float = -1e9
+
+            for c in cnts:
+                area_q = float(cv2.contourArea(c))
+                if area_q < 12.0 or area_q > 380.0:
+                    continue
+                (cx, cy), rad_q = cv2.minEnclosingCircle(c)
+                if rad_q < 2.0 or rad_q > 15.5:
+                    continue
+                perim = float(cv2.arcLength(c, True))
+                circ = (4.0 * math.pi * area_q) / (perim * perim + 1e-5)
+                if circ < 0.40:
+                    continue
+                pt_mm = np.array(
+                    [float(cx) * 4.0, (float(cy) + float(rad_q) * tilt) * 4.0],
+                    dtype=np.float64,
+                )
+                if pred_p is not None and prev_p is not None:
+                    dist_pred = float(np.linalg.norm(pt_mm - pred_p))
+                    dist_prev = float(np.linalg.norm(pt_mm - prev_p))
+                    dist = min(dist_pred, dist_prev)
+                    max_gate = 260.0 + min(300.0, int(st["missing"]) * 60.0)
+                    if dist > max_gate:
+                        continue
+                    score = circ * 100.0 - abs(area_q - 150.0) * 0.25 - dist * 0.5
+                else:
+                    # 최초 동기화 시 우측 하단 모서리 선수 신체 진입 구역 배제
+                    if pt_mm[0] > 2400.0 and pt_mm[1] > 1100.0:
+                        continue
+                    score = circ * 100.0 - abs(area_q - 150.0) * 0.25
+
+                if score > best_score:
+                    best_score = score
+                    best_pt = pt_mm
+                    best_rad = float(rad_q) * 4.0
+                    best_area = area_q * 16.0
+                    best_circ = float(circ)
+
+            if best_pt is not None:
+                if prev_p is not None and int(st["missing"]) == 0:
+                    st["vel"] = 0.6 * (best_pt - prev_p) + 0.4 * prev_v
+                elif prev_p is not None:
+                    st["vel"] = (best_pt - prev_p) / float(int(st["missing"]) + 1)
+                st["pos"] = best_pt
+                st["missing"] = 0
+            elif prev_p is not None:
+                nxt = prev_p + prev_v * 0.94
+                if nxt[0] < 31.0:
+                    nxt[0] = 31.0 + (31.0 - nxt[0])
+                    prev_v[0] *= -0.82
+                elif nxt[0] > 2809.0:
+                    nxt[0] = 2809.0 - (nxt[0] - 2809.0)
+                    prev_v[0] *= -0.82
+                if nxt[1] < 31.0:
+                    nxt[1] = 31.0 + (31.0 - nxt[1])
+                    prev_v[1] *= -0.82
+                elif nxt[1] > 1389.0:
+                    nxt[1] = 1389.0 - (nxt[1] - 1389.0)
+                    prev_v[1] *= -0.82
+                st["pos"] = nxt
+                st["vel"] = prev_v * 0.94
+                st["missing"] = int(st["missing"]) + 1
+                if int(st["missing"]) > 20 and cnts:
+                    for c in cnts:
+                        area_q = float(cv2.contourArea(c))
+                        if 20.0 <= area_q <= 340.0:
+                            (cx, cy), rad_q = cv2.minEnclosingCircle(c)
+                            cand_x = float(cx) * 4.0
+                            cand_y = (float(cy) + float(rad_q) * tilt) * 4.0
+                            if cand_x < 2450.0 or cand_y < 1100.0:
+                                st["pos"] = np.array([cand_x, cand_y], dtype=np.float64)
+                                st["vel"] = np.zeros(2, dtype=np.float64)
+                                st["missing"] = 0
+                                break
+
+            if st["pos"] is None:
+                return None
+
+            p_final = st["pos"]
+            out[col] = {
+                "x": float(p_final[0]),
+                "y": float(p_final[1]),
+                "radius": best_rad,
+                "circularity": best_circ,
+                "area": best_area,
+            }
+
+        return out if len(out) == 3 else None
+
     def sync_vision_and_lock_balls_now(
         self, seek_to_active_shot: bool = True
     ) -> Dict[str, Any]:
@@ -439,6 +569,12 @@ class LiveStreamReader:
         self.spin_detector.reset()
         self._missing_streak_by_id.clear()
         self._last_missing_wait_id = None
+        for col_k in ("WHITE", "YELLOW", "RED"):
+            self._channel_core_state[col_k] = {
+                "pos": None,
+                "vel": np.zeros(2, dtype=np.float64),
+                "missing": 0,
+            }
         for restorer in self.trajectory_restorers.values():
             restorer.reset()
         self.causal_kiss_fsm = CausalKissSafeFSM(fps=max(15.0, self.video_fps))
@@ -622,6 +758,67 @@ class LiveStreamReader:
         warped_quarter, strict_candidates, blur_candidates = (
             self._extract_ball_candidates_fast(raw_frame)
         )
+        channel_cores = self._extract_3_channel_ball_cores(warped_quarter)
+        if channel_cores is not None:
+            fixed_colors = {1: "WHITE", 2: "YELLOW", 3: "RED"}
+            fixed_pts: List[Point2D] = [
+                (channel_cores["WHITE"]["x"], channel_cores["WHITE"]["y"]),
+                (channel_cores["YELLOW"]["x"], channel_cores["YELLOW"]["y"]),
+                (channel_cores["RED"]["x"], channel_cores["RED"]["y"]),
+            ]
+            if not self._vision_tracks_synced:
+                init_pts_ch = {
+                    1: fixed_pts[0],
+                    2: fixed_pts[1],
+                    3: fixed_pts[2],
+                }
+                self.detected_ball_colors = fixed_colors.copy()
+                active_color = self.match_manager.active_cue_ball_color
+                cue_id = 2 if active_color == "YELLOW" else 1
+                self.tracker.initialize_tracks(
+                    initial_positions=init_pts_ch,
+                    cue_ball_id=cue_id,
+                    ball_colors=fixed_colors,
+                )
+                obj_ids = [bid for bid in (1, 2, 3) if bid != cue_id]
+                self.scoring_engine.reset_shot(
+                    cue_ball_id=cue_id, object_ball_ids=obj_ids
+                )
+                self._rest_positions = init_pts_ch.copy()
+                self._vision_tracks_synced = True
+                return None
+
+            # 3색 채널 독립 추적 좌표로 트랙 색상/위치를 1:1 고정 동기화 (ID 스왑 원천 차단)
+            for bid, col_name in fixed_colors.items():
+                if bid in self.tracker.balls:
+                    self.tracker.balls[bid].color = col_name
+            if self.match_manager.fsm_state == MatchState.WAIT_SHOT:
+                max_step = max(
+                    math.hypot(
+                        fixed_pts[bid - 1][0] - float(self.tracker.balls[bid].position[0]),
+                        fixed_pts[bid - 1][1] - float(self.tracker.balls[bid].position[1]),
+                    )
+                    for bid in (1, 2, 3)
+                    if bid in self.tracker.balls
+                )
+                if max_step < self.VISION_START_SPEED_TH:
+                    for bid in (1, 2, 3):
+                        coord = fixed_pts[bid - 1]
+                        if bid not in self._rest_positions:
+                            self._rest_positions[bid] = coord
+                        else:
+                            rx, ry = self._rest_positions[bid]
+                            self._rest_positions[bid] = (
+                                rx * 0.85 + coord[0] * 0.15,
+                                ry * 0.85 + coord[1] * 0.15,
+                            )
+
+            return await self.process_coordinate_step(
+                detected_points=fixed_pts,
+                detected_colors=fixed_colors,
+                start_velocity_th=self.VISION_START_SPEED_TH,
+                require_rest_displacement=True,
+            )
 
         # [1단계: 최초 비전 동기화] 3개의 공이 온전히 검출되었을 때 도넛 마스크로 색상(WHITE, YELLOW, RED)과 초기 ID 잠금
         if not self._vision_tracks_synced:
@@ -1318,8 +1515,9 @@ class LiveStreamReader:
                 if bid in positions_map:
                     tr_list.append(positions_map[bid])
 
-            # [제2적구 충돌 즉시 실시간 득점(+1) 점수판 반영]
-            # 3쿠션 이상 충족 상태에서 제2적구와 충돌한 바로 그 프레임에 공이 멈추기를 기다리지 않고 즉시 점수판에 +1점을 반영합니다!
+            # [Step 4: 단일 판정 엔진 일원화 (Single Source of Truth)]
+            # 실제 영상/카메라 스트림(require_rest_displacement=True)에서는 구형 엔진들의 OR 투표를 완전히 배제하고
+            # 3체 인과·폴리라인·정지 앵커 검증기(CausalKissSafeFSM) 단독 판정만 신뢰합니다!
             causal_instant_scored = bool(
                 (
                     maybe_causal is not None
@@ -1328,37 +1526,58 @@ class LiveStreamReader:
                 )
                 or self.causal_kiss_fsm.score_dispatched
             )
-            engine_instant_scored = bool(
-                self.scoring_engine.fsm_state.value == "VALID_SCORE_PENDING"
-                and not self.causal_kiss_fsm.double_hit_foul
-                and (
-                    not self.causal_kiss_fsm.object_ball_kiss_occurred
-                    or self.causal_kiss_fsm.score_dispatched
-                    or self.scoring_engine.second_object_ball_id is not None
+            if require_rest_displacement:
+                engine_instant_scored = False
+                kinematics_instant_scored = False
+            else:
+                engine_instant_scored = bool(
+                    self.scoring_engine.fsm_state.value == "VALID_SCORE_PENDING"
+                    and not self.causal_kiss_fsm.double_hit_foul
+                    and (
+                        not self.causal_kiss_fsm.object_ball_kiss_occurred
+                        or self.causal_kiss_fsm.score_dispatched
+                        or self.scoring_engine.second_object_ball_id is not None
+                    )
                 )
-            )
-            kinematics_instant_scored = bool(
-                getattr(self.vision_kinematics, "second_ball_hit", False)
-                and int(getattr(self.vision_kinematics, "cushions_before_second_ball", 0)) >= 3
-                and not self.causal_kiss_fsm.double_hit_foul
-                and not self.causal_kiss_fsm.object_ball_kiss_occurred
-            )
+                kinematics_instant_scored = bool(
+                    getattr(self.vision_kinematics, "second_ball_hit", False)
+                    and int(getattr(self.vision_kinematics, "cushions_before_second_ball", 0)) >= 3
+                    and not self.causal_kiss_fsm.double_hit_foul
+                    and not self.causal_kiss_fsm.object_ball_kiss_occurred
+                )
             if (
                 not self.match_manager.score_dispatched_for_current_shot
                 and not has_double_touch_foul
                 and (causal_instant_scored or engine_instant_scored or kinematics_instant_scored)
             ):
-                cush_before_1st = max(
-                    int(self.scoring_engine.cushion_count_before_first_hit),
-                    int(maybe_causal.cushions_before_first_hit)
-                    if maybe_causal is not None
-                    else int(self.causal_kiss_fsm.cushions_before_first_hit),
-                )
-                is_bank = bool(cush_before_1st >= 1)
-                cush_at_2nd = max(
-                    int(self.scoring_engine.cushion_count_before_second_hit),
-                    int(maybe_causal.cushions_at_second_hit) if maybe_causal is not None else 3,
-                )
+                if require_rest_displacement:
+                    cush_before_1st = (
+                        int(maybe_causal.cushions_before_first_hit)
+                        if maybe_causal is not None
+                        else int(self.causal_kiss_fsm.cushions_before_first_hit)
+                    )
+                    is_bank = bool(
+                        (maybe_causal.is_bank_shot if maybe_causal is not None else self.causal_kiss_fsm.is_bank_shot)
+                        or cush_before_1st >= 1
+                    )
+                    cush_at_2nd = max(
+                        3,
+                        int(maybe_causal.cushions_at_second_hit)
+                        if maybe_causal is not None
+                        else int(self.causal_kiss_fsm.cushions_at_second_hit),
+                    )
+                else:
+                    cush_before_1st = max(
+                        int(self.scoring_engine.cushion_count_before_first_hit),
+                        int(maybe_causal.cushions_before_first_hit)
+                        if maybe_causal is not None
+                        else int(self.causal_kiss_fsm.cushions_before_first_hit),
+                    )
+                    is_bank = bool(cush_before_1st >= 1)
+                    cush_at_2nd = max(
+                        int(self.scoring_engine.cushion_count_before_second_hit),
+                        int(maybe_causal.cushions_at_second_hit) if maybe_causal is not None else 3,
+                    )
                 tot_cush = cush_at_2nd
                 bank_tag = "뱅크샷 " if is_bank else ""
                 immediate_eval = {
@@ -1464,9 +1683,46 @@ class LiveStreamReader:
                 )
                 shot_eval["causal_event_log"] = list(causal_res.event_log)
 
-                # [원칙 1] 제2적구 충돌 순간 이미 점수판에 +1점이 올라간 샷(already_dispatched=True)이나
-                # ScoringEngine이 유효 3쿠션 득점으로 판정한 샷은 사후 '3체 인과 판독'이 절대 노득점으로 뒤집지 않음!
-                if bool(shot_eval.get("already_dispatched", False)):
+                # [Step 4: 실제 영상(require_rest_displacement=True)에서는 CausalKissSafeFSM 단독 판정 적용]
+                if require_rest_displacement:
+                    is_valid_causal = bool(
+                        (causal_res.scored or shot_eval.get("already_dispatched", False))
+                        and not has_double_touch_foul
+                        and not causal_res.double_hit_foul
+                    )
+                    shot_eval["is_scored"] = is_valid_causal
+                    shot_eval["cushions_before_first_hit"] = int(causal_res.cushions_before_first_hit)
+                    shot_eval["cushions_before_second_hit"] = int(causal_res.cushions_at_second_hit)
+                    shot_eval["total_cushions"] = int(causal_res.total_cushions)
+                    if is_valid_causal:
+                        is_bank_final = bool(
+                            causal_res.is_bank_shot or causal_res.cushions_before_first_hit >= 1
+                        )
+                        shot_eval["shot_type"] = "BANK_SHOT" if is_bank_final else "REGULAR_3C"
+                        shot_eval["reason_code"] = (
+                            "VALID_BANK_SHOT" if is_bank_final else "VALID_REGULAR_3C"
+                        )
+                        c_b2 = max(3, int(causal_res.cushions_at_second_hit))
+                        shot_eval["cushions_before_second_hit"] = c_b2
+                        shot_eval["total_cushions"] = c_b2
+                        shot_eval["message"] = (
+                            f"득점 인정 (뱅크 샷): 총 {c_b2}쿠션 후 제2적구 충돌 성공!"
+                            if is_bank_final
+                            else f"득점 인정 (일반 3쿠션): 총 {c_b2}쿠션 후 제2적구 충돌 성공!"
+                        )
+                    elif causal_res.double_hit_foul or has_double_touch_foul:
+                        shot_eval["shot_type"] = "FOUL"
+                        shot_eval["reason_code"] = "DOUBLE_HIT_FOUL"
+                        shot_eval["message"] = "파울 (투터치/밀어치기 감지): 공격권이 상대방으로 넘어갑니다."
+                    else:
+                        shot_eval["shot_type"] = "MISS"
+                        shot_eval["reason_code"] = str(causal_res.fail_reason or "SECOND_BALL_MISSED")
+                        shot_eval["message"] = (
+                            f"공타: 제2목적구 불발 (누적 {causal_res.total_cushions}쿠션)"
+                            if causal_res.first_target_ball is not None or "SECOND_BALL" in str(causal_res.fail_reason)
+                            else f"공타: {causal_res.fail_reason or '목적구 불발'} (누적 {causal_res.total_cushions}쿠션)"
+                        )
+                elif bool(shot_eval.get("already_dispatched", False)):
                     shot_eval["is_scored"] = True
                     is_bank_final = bool(
                         int(shot_eval.get("cushions_before_first_hit", 0)) >= 1

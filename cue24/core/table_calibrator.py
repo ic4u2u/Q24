@@ -152,11 +152,38 @@ class TableCalibrator:
             y_box = int(valid_rows[0])
             h_box = int(valid_rows[-1] - valid_rows[0])
 
-        # 실제 탑뷰 카메라 영상: 파란색 외곽 사각형에서 상/하/좌/우 고무 쿠션 턱 두께를 안쪽으로 보정하여 내경 산출
-        left_x = float(x_box) + float(w_box) * 0.018
-        right_x = float(x_box + w_box) - float(w_box) * 0.018
-        top_y = float(y_box) + float(h_box) * 0.042
-        bottom_y = float(y_box + h_box) - float(h_box) * 0.039
+        # 실제 탑뷰 카메라 영상:
+        # 1순위: 고무 쿠션 코 바로 아래에 형성되는 진한 남색 그림자 골(Shadow Trench, V 채널 급감 지점)을 직접 스캔하여
+        #        공이 실제로 반사되는 쿠션 코 끝 내경(가로:세로 = 2.000)을 1px 단위로 정밀 검출합니다.
+        left_x = float(x_box) + float(w_box) * 0.022
+        right_x = float(x_box + w_box) - float(w_box) * 0.021
+        top_y = float(y_box) + float(h_box) * 0.038
+        bottom_y = float(y_box + h_box) - float(h_box) * 0.036
+
+        if w_box >= 600 and h_box >= 300:
+            V_ch = hsv[:, :, 2]
+            x0, x1 = int(x_box), int(x_box + w_box)
+            y0, y1 = int(y_box), int(y_box + h_box)
+            pad_x = max(12, int(w_box * 0.055))
+            pad_y = max(12, int(h_box * 0.075))
+            min_in_x = max(6, int(w_box * 0.008))
+            min_in_y = max(6, int(h_box * 0.012))
+
+            v_prof_x = np.median(V_ch[y0 + pad_y : y1 - pad_y, :], axis=0)
+            v_prof_y = np.median(V_ch[:, x0 + pad_x : x1 - pad_x], axis=1)
+
+            lx_cand = x0 + min_in_x + int(np.argmin(v_prof_x[x0 + min_in_x : x0 + pad_x]))
+            rx_cand = x1 - pad_x + int(np.argmin(v_prof_x[x1 - pad_x : x1 - min_in_x]))
+            ty_cand = y0 + min_in_y + int(np.argmin(v_prof_y[y0 + min_in_y : y0 + pad_y]))
+            by_cand = y1 - pad_y + int(np.argmin(v_prof_y[y1 - pad_y : y1 - min_in_y]))
+
+            inner_w = float(rx_cand - lx_cand)
+            inner_h = float(by_cand - ty_cand)
+            if inner_h > 100.0 and 1.85 <= (inner_w / inner_h) <= 2.15:
+                left_x = float(lx_cand)
+                right_x = float(rx_cand)
+                top_y = float(ty_cand)
+                bottom_y = float(by_cand)
 
         corners = [
             (round(left_x, 1), round(top_y, 1)),
