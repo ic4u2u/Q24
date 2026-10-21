@@ -667,7 +667,29 @@ class LiveStreamReader:
                 warped_q, strict_cands, _ = self._extract_ball_candidates_fast(
                     raw_frame
                 )
-                if len(strict_cands) == 3:
+                channel_cores = self._extract_3_channel_ball_cores(warped_q)
+                if channel_cores is not None:
+                    fixed_colors = {1: "WHITE", 2: "YELLOW", 3: "RED"}
+                    init_pts_ch: Dict[int, Point2D] = {
+                        1: (channel_cores["WHITE"]["x"], channel_cores["WHITE"]["y"]),
+                        2: (channel_cores["YELLOW"]["x"], channel_cores["YELLOW"]["y"]),
+                        3: (channel_cores["RED"]["x"], channel_cores["RED"]["y"]),
+                    }
+                    self.detected_ball_colors = fixed_colors.copy()
+                    active_color = self.match_manager.active_cue_ball_color
+                    cue_id = 2 if active_color == "YELLOW" else 1
+                    self.tracker.initialize_tracks(
+                        initial_positions=init_pts_ch,
+                        cue_ball_id=cue_id,
+                        ball_colors=fixed_colors,
+                    )
+                    obj_ids = [bid for bid in (1, 2, 3) if bid != cue_id]
+                    self.scoring_engine.reset_shot(
+                        cue_ball_id=cue_id, object_ball_ids=obj_ids
+                    )
+                    self._rest_positions = init_pts_ch.copy()
+                    self._vision_tracks_synced = True
+                elif len(strict_cands) == 3:
                     init_pts: Dict[int, Point2D] = {
                         i + 1: (float(c["x"]), float(c["y"]))
                         for i, c in enumerate(strict_cands)
@@ -1258,8 +1280,21 @@ class LiveStreamReader:
         """
         self.frame_counter += 1
 
-        # 1. [2단계 & 3단계] 색상 무시 최단 거리 위치 추적 및 물리 충돌 가드(법선 벡터 N 기반 ID 스왑 원복) 업데이트
-        ball_states = self.tracker.update(detected_points)
+        # 1. [2단계 & 3단계] 3채널 고정 코어 좌표인 경우 ID 1:1 직결 업데이트(충돌 시 ID 스왑 0% 원천 차단),
+        # 일반 좌표인 경우 최단 거리 위치 추적 및 물리 충돌 가드 업데이트
+        if (
+            require_rest_displacement
+            and detected_colors is not None
+            and detected_colors == {1: "WHITE", 2: "YELLOW", 3: "RED"}
+            and len(detected_points) == 3
+            and len(self.tracker.balls) == 3
+        ):
+            for bid in (1, 2, 3):
+                self.tracker.balls[bid].color = detected_colors[bid]
+                self.tracker.balls[bid].update_kinematics(detected_points[bid - 1])
+            ball_states = self.tracker.balls
+        else:
+            ball_states = self.tracker.update(detected_points)
 
         # 정지 상태(1단계)에서만 색상 갱신 허용, 주행 중(2단계)에는 기존 잠긴 색상 100% 유지
         if (
@@ -1343,13 +1378,9 @@ class LiveStreamReader:
                 if exp_st.speed >= vel_th and exp_disp >= self.VISION_START_DISP_MM:
                     first_moving_id = expected_cue_id
 
-            # 1-B순위: 경기 시작 첫 초구(턴 잠금 전) 또는 합성 좌표 시뮬레이션(not require_rest_displacement)에서
-            # 아직 공끼리 충돌하기 전(>= 66mm)에 WHITE/YELLOW 중 가장 먼저 출발한 공(First-Mover)을 수구로 결정!
-            if (
-                first_moving_id is None
-                and (is_opening_unlocked or not require_rest_displacement)
-                and min_pair_dist_now >= 66.0
-            ):
+            # 1-B순위: 아직 공끼리 충돌하기 전(>= 66mm) 상태에서 WHITE/YELLOW 중 실제로 정지 위치에서
+            # 먼저 출발한 공(First-Mover)을 수구로 결정! (가만히 있는 공을 수구로 오인하는 현상 차단)
+            if first_moving_id is None and min_pair_dist_now >= 66.0:
                 best_onset_id: Optional[int] = None
                 best_onset_speed: float = 0.0
                 for bid, st in ball_states.items():
@@ -1368,7 +1399,7 @@ class LiveStreamReader:
                 if best_onset_id is not None:
                     first_moving_id = best_onset_id
                     mover_color = str(ball_states[best_onset_id].color).upper()
-                    if is_opening_unlocked:
+                    if is_opening_unlocked or require_rest_displacement:
                         self.match_manager.active_player_id = (
                             "P2" if mover_color == "YELLOW" else "P1"
                         )
@@ -1461,10 +1492,42 @@ class LiveStreamReader:
                 if len(init_vpos) == 3:
                     t_init = max(0, self.frame_counter - 1) / fps_scale
                     self.causal_kiss_fsm.stroke_start_time = t_init
-                    self.causal_kiss_fsm.initial_positions = {
-                        vc: np.array([float(pt[0]), float(pt[1])], dtype=np.float64)
-                        for vc, pt in init_vpos.items()
+                    id_to_vcol = {
+                        1: VisionBallColor.WHITE,
+                        2: VisionBallColor.YELLOW,
+                        3: VisionBallColor.RED,
                     }
+                    rest_vpos: Dict[VisionBallColor, np.ndarray] = {}
+                    for bid, vcol in id_to_vcol.items():
+                        if self._rest_positions and bid in self._rest_positions:
+                            rp = self._rest_positions[bid]
+                            rest_vpos[vcol] = np.array([float(rp[0]), float(rp[1])], dtype=np.float64)
+                        elif vcol in init_vpos:
+                            pt = init_vpos[vcol]
+                            rest_vpos[vcol] = np.array([float(pt[0]), float(pt[1])], dtype=np.float64)
+                    if len(rest_vpos) == 3:
+                        self.causal_kiss_fsm.rest_pos = {
+                            vc: arr.copy() for vc, arr in rest_vpos.items()
+                        }
+                        self.causal_kiss_fsm.initial_positions = {
+                            vc: arr.copy() for vc, arr in rest_vpos.items()
+                        }
+                        self.causal_kiss_fsm.target_rest_anchor = {
+                            vc: arr.copy() for vc, arr in rest_vpos.items()
+                        }
+                        cue_origin = rest_vpos[shooter_vcol].copy()
+                        self.causal_kiss_fsm.stroke_origin_pos = cue_origin
+                        self.causal_kiss_fsm.cue_path = [
+                            (float(cue_origin[0]), float(cue_origin[1]))
+                        ]
+                        cur_cue_pt = np.array(
+                            [float(cue_state.position[0]), float(cue_state.position[1])],
+                            dtype=np.float64,
+                        )
+                        stroke_vec = cur_cue_pt - cue_origin
+                        s_norm = float(np.linalg.norm(stroke_vec))
+                        if s_norm > 1e-6:
+                            self.causal_kiss_fsm.initial_stroke_dir = stroke_vec / s_norm
                     self.causal_kiss_fsm.update(
                         t=t_init,
                         coords_mm=init_vpos,
@@ -1540,8 +1603,19 @@ class LiveStreamReader:
             }
             cue_vel = (float(cue_state.velocity[0]), float(cue_state.velocity[1]))
 
-            prev_cushions = self.scoring_engine.total_cushion_count
+            prev_cushions = max(
+                int(self.scoring_engine.total_cushion_count),
+                int(
+                    self._last_causal_shot_result.total_cushions
+                    if (
+                        self._last_causal_shot_result is not None
+                        and self._last_causal_shot_result.is_turn_end
+                    )
+                    else self.causal_kiss_fsm.cushion_count
+                ),
+            )
             prev_events_count = len(self.scoring_engine.events)
+            prev_causal_events_count = len(self.causal_kiss_fsm.event_log)
 
             # [득점 후 잔여 구름 동결(Freeze)]
             # 제2적구 충돌로 즉시 득점이 이미 발송된 이후에는 사후 쿠션/충돌 평가를 완전히 중단하고 공이 멈추기만 기다립니다!
@@ -1559,13 +1633,39 @@ class LiveStreamReader:
             maybe_causal = None
             if len(cur_vpos) == 3:
                 t_curr = self.frame_counter / fps_scale
-                maybe_causal = self.causal_kiss_fsm.update(
-                    t=t_curr,
-                    coords_mm=cur_vpos,
-                )
-                if maybe_causal is not None:
-                    self._last_causal_shot_result = maybe_causal
+                if (
+                    self._last_causal_shot_result is None
+                    or not self._last_causal_shot_result.is_turn_end
+                ):
+                    maybe_causal = self.causal_kiss_fsm.update(
+                        t=t_curr,
+                        coords_mm=cur_vpos,
+                    )
+                    if maybe_causal is not None:
+                        self._last_causal_shot_result = maybe_causal
                 if not self.match_manager.score_dispatched_for_current_shot:
+                    fsm_c_now = (
+                        int(self._last_causal_shot_result.total_cushions)
+                        if (
+                            self._last_causal_shot_result is not None
+                            and self._last_causal_shot_result.is_turn_end
+                        )
+                        else int(self.causal_kiss_fsm.cushion_count)
+                    )
+                    se_c_now = int(self.scoring_engine.total_cushion_count)
+                    live_total_cushions = max(fsm_c_now, se_c_now)
+                    if (
+                        self.causal_kiss_fsm.state == CausalShotState.IN_PLAY
+                        and self.causal_kiss_fsm.second_target_ball is None
+                    ):
+                        self.causal_kiss_fsm.cushion_count = max(
+                            int(self.causal_kiss_fsm.cushion_count),
+                            live_total_cushions,
+                        )
+                    self.scoring_engine.total_cushion_count = max(
+                        int(self.scoring_engine.total_cushion_count),
+                        live_total_cushions,
+                    )
                     self.vision_kinematics.step(
                         balls=cur_kdpos,
                         assigned_cue_ball=(
@@ -1574,8 +1674,13 @@ class LiveStreamReader:
                             else KDColor.WHITE
                         ),
                         timestamp=t_curr,
-                        current_cushion_count=self.scoring_engine.total_cushion_count,
+                        current_cushion_count=live_total_cushions,
                     )
+            else:
+                live_total_cushions = max(
+                    int(self.scoring_engine.total_cushion_count),
+                    int(self.causal_kiss_fsm.cushion_count),
+                )
 
             self._cue_trajectory.append(positions_map[cue_id])
             for bid, tr_list in self._target_trajectories.items():
@@ -1592,6 +1697,10 @@ class LiveStreamReader:
                     and not maybe_causal.already_dispatched
                 )
                 or self.causal_kiss_fsm.score_dispatched
+                or (
+                    self._last_causal_shot_result is not None
+                    and self._last_causal_shot_result.scored
+                )
             )
             if require_rest_displacement:
                 engine_instant_scored = False
@@ -1632,6 +1741,7 @@ class LiveStreamReader:
                         int(maybe_causal.cushions_at_second_hit)
                         if maybe_causal is not None
                         else int(self.causal_kiss_fsm.cushions_at_second_hit),
+                        int(self.scoring_engine.total_cushion_count),
                     )
                 else:
                     cush_before_1st = max(
@@ -1668,11 +1778,26 @@ class LiveStreamReader:
             elif (
                 self.scoring_engine.total_cushion_count != prev_cushions
                 or len(self.scoring_engine.events) != prev_events_count
+                or len(self.causal_kiss_fsm.event_log) != prev_causal_events_count
             ):
-                hit1 = "접촉완료" if self.scoring_engine.first_object_ball_id is not None else "대기"
-                hit2 = "접촉완료" if self.scoring_engine.second_object_ball_id is not None else "대기"
+                hit1 = (
+                    "접촉완료"
+                    if (
+                        self.causal_kiss_fsm.first_target_ball is not None
+                        or self.scoring_engine.first_object_ball_id is not None
+                    )
+                    else "대기"
+                )
+                hit2 = (
+                    "접촉완료"
+                    if (
+                        self.causal_kiss_fsm.second_target_ball is not None
+                        or self.scoring_engine.second_object_ball_id is not None
+                    )
+                    else "대기"
+                )
                 fsm_val = self.scoring_engine.fsm_state.value
-                if fsm_val == "VALID_SCORE_PENDING":
+                if fsm_val == "VALID_SCORE_PENDING" or self.causal_kiss_fsm.score_dispatched:
                     fsm_ko = "즉시득점완료(3쿠션충족)"
                 elif fsm_val == "NO_SCORE_LOCKED":
                     fsm_ko = "노카운트잠금(조기키스)"
@@ -1690,8 +1815,11 @@ class LiveStreamReader:
                             f"실시간 추적 중[{fsm_ko}]: {self.scoring_engine.total_cushion_count}쿠션 "
                             f"| 제1적구({hit1}) / 제2적구({hit2})"
                         ),
-                        "cushions_before_second_hit": self.scoring_engine.cushion_count_before_second_hit,
-                        "total_cushions": self.scoring_engine.total_cushion_count,
+                        "cushions_before_second_hit": max(
+                            int(self.scoring_engine.cushion_count_before_second_hit),
+                            int(self.causal_kiss_fsm.cushions_at_second_hit),
+                        ),
+                        "total_cushions": int(self.scoring_engine.total_cushion_count),
                     }
                 await self.ws_manager.broadcast_event(
                     "SCORE_UPDATED", self.match_manager.get_match_payload()
@@ -1758,9 +1886,13 @@ class LiveStreamReader:
                         and not causal_res.double_hit_foul
                     )
                     shot_eval["is_scored"] = is_valid_causal
+                    final_tot_cush = max(
+                        int(causal_res.total_cushions),
+                        int(self.scoring_engine.total_cushion_count),
+                    )
                     shot_eval["cushions_before_first_hit"] = int(causal_res.cushions_before_first_hit)
                     shot_eval["cushions_before_second_hit"] = int(causal_res.cushions_at_second_hit)
-                    shot_eval["total_cushions"] = int(causal_res.total_cushions)
+                    shot_eval["total_cushions"] = final_tot_cush
                     if is_valid_causal:
                         is_bank_final = bool(
                             causal_res.is_bank_shot or causal_res.cushions_before_first_hit >= 1
@@ -1769,7 +1901,7 @@ class LiveStreamReader:
                         shot_eval["reason_code"] = (
                             "VALID_BANK_SHOT" if is_bank_final else "VALID_REGULAR_3C"
                         )
-                        c_b2 = max(3, int(causal_res.cushions_at_second_hit))
+                        c_b2 = max(3, int(causal_res.cushions_at_second_hit), final_tot_cush)
                         shot_eval["cushions_before_second_hit"] = c_b2
                         shot_eval["total_cushions"] = c_b2
                         shot_eval["message"] = (
@@ -1785,9 +1917,9 @@ class LiveStreamReader:
                         shot_eval["shot_type"] = "MISS"
                         shot_eval["reason_code"] = str(causal_res.fail_reason or "SECOND_BALL_MISSED")
                         shot_eval["message"] = (
-                            f"공타: 제2목적구 불발 (누적 {causal_res.total_cushions}쿠션)"
+                            f"공타: 제2목적구 불발 (누적 {final_tot_cush}쿠션)"
                             if "SECOND_BALL" in str(causal_res.fail_reason)
-                            else f"공타: {causal_res.fail_reason or '목적구 불발'} (누적 {causal_res.total_cushions}쿠션)"
+                            else f"공타: {causal_res.fail_reason or '목적구 불발'} (누적 {final_tot_cush}쿠션)"
                         )
                 elif bool(shot_eval.get("already_dispatched", False)):
                     shot_eval["is_scored"] = True

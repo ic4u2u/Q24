@@ -581,7 +581,7 @@ class CausalKissSafeFSM:
             len_in = float(np.linalg.norm(vec_in))
             len_out = float(np.linalg.norm(vec_out))
 
-            min_seg_len = 12.0 if (k == 1 or k == len(approx) - 2) else 18.0
+            min_seg_len = 8.0 if (k == 1 or k == len(approx) - 2) else 16.0
             if len_in < min_seg_len or len_out < min_seg_len:
                 continue
 
