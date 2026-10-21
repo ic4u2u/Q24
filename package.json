@@ -4,6 +4,6 @@
   "private": true,
   "description": "CUE24 - 스마트 3쿠션 디지털 점수판 & Hawk-Eye AI 비전 시스템",
   "scripts": {
-    "build": "node -e \"const fs=require('fs'),path=require('path');fs.mkdirSync('public',{recursive:true});fs.copyFileSync(path.join('cue24','static','index.html'),path.join('public','index.html'));console.log('Build complete: public/index.html generated.');\""
+    "build": "node -e \"const fs=require('fs'),path=require('path');const src=path.join('cue24','static','index.html');fs.copyFileSync(src,'index.html');fs.mkdirSync('public',{recursive:true});fs.copyFileSync(src,path.join('public','index.html'));console.log('Build complete: index.html and public/index.html generated.');\""
   }
 }

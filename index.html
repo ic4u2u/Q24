@@ -1,0 +1,2794 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CUE24 - 스마트 3쿠션 디지털 점수판 & Hawk-Eye VAR</title>
+  <!-- 큐스코(CUESCO) 및 빌리보드(PBA) 전광판 스타일 고밀도 스포츠 숫자 폰트 로드 -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@700;800&family=Oswald:wght@700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg-dark: #050811;
+      --bg-panel: #0c1324;
+      --bg-panel-active: #111d38;
+      --border-dim: #1e293b;
+      --border-active-white: #38bdf8;
+      --border-active-yellow: #facc15;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent-cyan: #00f2fe;
+      --accent-green: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-red: #ef4444;
+      --score-white: #ffffff;
+      --score-yellow: #fde047;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    html,
+    body {
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+      max-height: 100dvh;
+      overflow: hidden;
+    }
+
+    body {
+      background: radial-gradient(circle at 50% 0%, #101c38 0%, var(--bg-dark) 78%);
+      color: var(--text-main);
+      font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 1.0vh 1.2vw;
+      gap: 0.9vh;
+    }
+
+    /* 상단 헤더 바 (좌: 브랜드, 중앙: 누적 경기 타이머 + [선수변경]/[자리바꿈] 나란히 배치, 우: 룰/상태 제어) */
+    .top-bar {
+      position: relative;
+      flex: 0 0 auto;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: center;
+      padding: 0.6vh 1.2vw;
+      background: rgba(12, 19, 36, 0.94);
+      border: 1px solid var(--border-dim);
+      border-radius: 14px;
+      backdrop-filter: blur(10px);
+      gap: 12px;
+    }
+
+    .brand-box {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      justify-self: start;
+    }
+
+    .brand-logo {
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: clamp(1.25rem, 2.1vh, 1.65rem);
+      font-weight: 800;
+      letter-spacing: 2px;
+      background: linear-gradient(90deg, #38bdf8, #818cf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand-sub {
+      font-size: clamp(0.72rem, 1.2vh, 0.85rem);
+      color: var(--text-muted);
+      border-left: 2px solid var(--border-dim);
+      padding-left: 12px;
+      font-weight: 600;
+    }
+
+    /* 중앙 상단: 누적 경기 타이머 및 [선수변경] / [자리바꿈] 나란히 배치 그룹 */
+    .top-center-group {
+      justify-self: center;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .top-center-timer {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0.35vh 1.1vw;
+      border-radius: 12px;
+      background: linear-gradient(180deg, rgba(15, 23, 42, 0.96) 0%, rgba(2, 6, 23, 0.96) 100%);
+      border: 2px solid rgba(56, 189, 248, 0.55);
+      box-shadow: 0 0 22px rgba(56, 189, 248, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    }
+
+    .match-timer-label {
+      font-size: clamp(0.74rem, 1.2vh, 0.88rem);
+      font-weight: 800;
+      color: #7dd3fc;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+    }
+
+    .match-timer-digits {
+      font-family: 'Oswald', 'Chakra Petch', sans-serif;
+      font-size: clamp(1.35rem, 2.6vh, 2.0rem);
+      font-weight: 700;
+      letter-spacing: 2px;
+      color: #ffffff;
+      text-shadow: 0 0 14px rgba(56, 189, 248, 0.65);
+      font-variant-numeric: tabular-nums;
+      line-height: 1;
+    }
+
+    /* [선수변경] / [자리바꿈] 나란히 배치 버튼 그룹 */
+    .swap-pair-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .swap-action-btn {
+      min-height: clamp(36px, 4.2vh, 44px);
+      padding: 0 13px;
+      border-radius: 10px;
+      border: 1px solid rgba(56, 189, 248, 0.5);
+      background: rgba(15, 23, 42, 0.9);
+      color: #e2e8f0;
+      font-size: clamp(0.76rem, 1.25vh, 0.88rem);
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+    }
+
+    .swap-action-btn:hover {
+      background: rgba(56, 189, 248, 0.22);
+      border-color: #38bdf8;
+      color: #ffffff;
+      transform: translateY(-1px);
+    }
+
+    .swap-action-btn.seat-swap {
+      border-color: rgba(250, 204, 21, 0.55);
+      color: #fde047;
+    }
+
+    .swap-action-btn.seat-swap:hover {
+      background: rgba(250, 204, 21, 0.2);
+      border-color: #facc15;
+      color: #fef08a;
+    }
+
+    .top-controls {
+      display: flex;
+      align-items: center;
+      justify-self: end;
+      gap: 8px;
+    }
+
+    .rule-toggle-btn {
+      min-height: clamp(36px, 4.2vh, 44px);
+      padding: 0 14px;
+      border-radius: 10px;
+      border: 1px solid #38bdf8;
+      background: rgba(56, 189, 248, 0.14);
+      color: #7dd3fc;
+      font-weight: 800;
+      font-size: clamp(0.76rem, 1.25vh, 0.88rem);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      white-space: nowrap;
+    }
+
+    .rule-toggle-btn.pba-mode {
+      border-color: #f59e0b;
+      background: rgba(245, 158, 11, 0.22);
+      color: #fde047;
+      box-shadow: 0 0 15px rgba(245, 158, 11, 0.3);
+    }
+
+    .ws-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 12px;
+      border-radius: 999px;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      color: #34d399;
+      font-weight: 700;
+      font-size: clamp(0.74rem, 1.2vh, 0.84rem);
+      white-space: nowrap;
+    }
+
+    .ws-pill.disconnected {
+      background: rgba(239, 68, 68, 0.15);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: #f87171;
+    }
+
+    .ws-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 8px currentColor;
+    }
+
+    /* 메인 스코어보드 3단 그리드 (남는 세로 공간을 정확히 100% 채움) */
+    .scoreboard-grid {
+      display: grid;
+      grid-template-columns: 1fr clamp(380px, 32vw, 540px) 1fr;
+      gap: 1.1vw;
+      align-items: stretch;
+      flex: 1 1 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    /* 플레이어 카드 */
+    .player-card {
+      position: relative;
+      background: var(--bg-panel);
+      border: 2px solid var(--border-dim);
+      border-radius: 20px;
+      padding: 1.5vh 1.5vw;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
+      transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+    }
+
+    .player-card.active-p1 {
+      background: linear-gradient(160deg, #112242 0%, #0a1224 100%);
+      border-color: var(--border-active-white);
+      box-shadow: 0 0 34px rgba(56, 189, 248, 0.25);
+    }
+
+    .player-card.active-p2 {
+      background: linear-gradient(160deg, #29220f 0%, #0a1224 100%);
+      border-color: var(--border-active-yellow);
+      box-shadow: 0 0 34px rgba(250, 204, 21, 0.25);
+    }
+
+    .player-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .player-title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    /* 수구 표시등 (WHITE / YELLOW 구체) */
+    .cue-ball-lamp {
+      width: clamp(30px, 4.2vh, 40px);
+      height: clamp(30px, 4.2vh, 40px);
+      border-radius: 50%;
+      position: relative;
+      flex-shrink: 0;
+      box-shadow: inset -5px -5px 10px rgba(0, 0, 0, 0.45), 0 0 16px rgba(255, 255, 255, 0.3);
+    }
+
+    .cue-ball-lamp::after {
+      content: '';
+      position: absolute;
+      top: 16%;
+      left: 20%;
+      width: 28%;
+      height: 16%;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.9);
+      transform: rotate(-25deg);
+    }
+
+    .cue-ball-lamp.white {
+      background: radial-gradient(circle at 35% 35%, #ffffff, #cbd5e1);
+    }
+
+    .cue-ball-lamp.yellow {
+      background: radial-gradient(circle at 35% 35%, #fef08a, #eab308);
+      box-shadow: inset -5px -5px 10px rgba(0, 0, 0, 0.45), 0 0 16px rgba(250, 204, 21, 0.45);
+    }
+
+    .player-name {
+      font-size: clamp(1.35rem, 2.7vh, 2.0rem);
+      font-weight: 900;
+      letter-spacing: 0.5px;
+      cursor: pointer;
+    }
+
+    /* 자신의 메인 점수 바로 위에 크게 인식하기 편한 크기로 표기하는 '현재 이닝' 배지 */
+    .above-score-inning-row {
+      margin-top: 0.7vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+    }
+
+    .player-inning-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 0.45vh 1.6vw;
+      border-radius: 999px;
+      background: linear-gradient(180deg, rgba(15, 23, 42, 0.95) 0%, rgba(7, 12, 26, 0.95) 100%);
+      border: 2px solid rgba(56, 189, 248, 0.7);
+      color: #ffffff;
+      font-family: 'Oswald', 'Chakra Petch', sans-serif;
+      font-size: clamp(1.35rem, 2.65vh, 1.95rem);
+      font-weight: 800;
+      letter-spacing: 1px;
+      text-shadow: 0 0 14px rgba(56, 189, 248, 0.75);
+      box-shadow: 0 0 20px rgba(56, 189, 248, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+      white-space: nowrap;
+    }
+
+    .active-p2 .player-inning-badge {
+      border-color: rgba(250, 204, 21, 0.8);
+      color: #fde047;
+      text-shadow: 0 0 14px rgba(250, 204, 21, 0.75);
+      box-shadow: 0 0 20px rgba(250, 204, 21, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+    }
+
+    .header-right-badges {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* 선수 정보 영역 바로 옆 [선수변경] / [자리바꿈] 나란히 배치 미니 버튼 */
+    .card-swap-btn {
+      min-height: 32px;
+      padding: 0 9px;
+      border-radius: 8px;
+      border: 1px solid rgba(148, 163, 184, 0.38);
+      background: rgba(30, 41, 59, 0.82);
+      color: #e2e8f0;
+      font-size: 0.74rem;
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      white-space: nowrap;
+    }
+
+    .card-swap-btn:hover {
+      background: #334155;
+      color: #ffffff;
+      border-color: #38bdf8;
+    }
+
+    .card-swap-btn.seat {
+      border-color: rgba(250, 204, 21, 0.45);
+      color: #fde047;
+    }
+
+    .card-swap-btn.seat:hover {
+      background: rgba(250, 204, 21, 0.2);
+      border-color: #facc15;
+    }
+
+    .timeout-dots {
+      display: flex;
+      gap: 5px;
+      align-items: center;
+      background: rgba(15, 23, 42, 0.8);
+      padding: 4px 9px;
+      border-radius: 999px;
+      border: 1px solid #334155;
+      font-size: 0.72rem;
+      font-weight: 800;
+      color: var(--text-muted);
+    }
+
+    .t-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #334155;
+    }
+
+    .t-dot.on {
+      background: #10b981;
+      box-shadow: 0 0 8px #10b981;
+    }
+
+    .attack-badge {
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-size: clamp(0.7rem, 1.15vh, 0.82rem);
+      font-weight: 800;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      opacity: 0;
+      transform: scale(0.9);
+      transition: all 0.25s ease;
+    }
+
+    .active-p1 .attack-badge {
+      opacity: 1;
+      transform: scale(1);
+      background: rgba(56, 189, 248, 0.22);
+      border: 1px solid #38bdf8;
+      color: #7dd3fc;
+    }
+
+    .active-p2 .attack-badge {
+      opacity: 1;
+      transform: scale(1);
+      background: rgba(250, 204, 21, 0.22);
+      border: 1px solid #facc15;
+      color: #fde047;
+    }
+
+    /* 선수 이름 바로 옆에 나란히 배치되는 '핸디' 및 상대방과의 실시간 '점수차' 배지 */
+    .handicap-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 11px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: clamp(0.84rem, 1.4vh, 1.02rem);
+      font-weight: 800;
+      color: #e2e8f0;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .handicap-pill strong {
+      color: #38bdf8;
+      font-size: clamp(0.95rem, 1.58vh, 1.15rem);
+    }
+
+    .score-diff-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: clamp(0.84rem, 1.4vh, 1.02rem);
+      font-weight: 900;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      background: rgba(30, 41, 59, 0.85);
+      color: #cbd5e1;
+      white-space: nowrap;
+    }
+
+    .score-diff-pill.diff-lead {
+      background: rgba(16, 185, 129, 0.18);
+      border-color: #10b981;
+      color: #34d399;
+      box-shadow: 0 0 12px rgba(16, 185, 129, 0.25);
+    }
+
+    .score-diff-pill.diff-behind {
+      background: rgba(239, 68, 68, 0.18);
+      border-color: #ef4444;
+      color: #f87171;
+    }
+
+    .score-diff-pill.diff-even {
+      background: rgba(56, 189, 248, 0.12);
+      border-color: rgba(148, 163, 184, 0.35);
+      color: #94a3b8;
+    }
+
+    /* 큐스코(CUESCO) 스타일 초대형 고대비 디지털 스코어 숫자 폰트 */
+    .score-zone {
+      position: relative;
+      flex: 1 1 0;
+      min-height: 0;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0;
+      overflow: hidden;
+    }
+
+    .score-adj-btn {
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 4;
+      width: clamp(44px, 5.2vh, 54px);
+      height: clamp(44px, 6.2vh, 64px);
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      background: rgba(15, 23, 42, 0.55);
+      color: #cbd5e1;
+      font-size: clamp(1.05rem, 1.9vh, 1.35rem);
+      font-weight: 900;
+      cursor: pointer;
+      opacity: 0.55;
+      transition: all 0.2s ease;
+    }
+
+    .score-zone .score-adj-btn:first-of-type {
+      left: 0;
+    }
+
+    .score-zone .score-adj-btn:last-of-type {
+      right: 0;
+    }
+
+    .score-adj-btn:hover {
+      background: #334155;
+      color: #ffffff;
+      opacity: 1;
+      transform: translateY(-50%) scale(1.06);
+    }
+
+    .score-display {
+      width: 100%;
+      font-family: 'Oswald', 'Chakra Petch', sans-serif;
+      font-size: clamp(11rem, min(48vh, 25vw), 32rem);
+      font-weight: 700;
+      line-height: 0.78;
+      text-align: center;
+      letter-spacing: -4px;
+      font-variant-numeric: tabular-nums;
+      transform: scaleY(1.08);
+      transition: transform 0.25s ease, filter 0.25s ease;
+    }
+
+    .score-display.white-theme {
+      color: var(--score-white);
+      text-shadow: 0 0 36px rgba(56, 189, 248, 0.45), 0 12px 28px rgba(0, 0, 0, 0.9);
+    }
+
+    .score-display.yellow-theme {
+      color: var(--score-yellow);
+      text-shadow: 0 0 36px rgba(250, 204, 21, 0.5), 0 12px 28px rgba(0, 0, 0, 0.9);
+    }
+
+    .score-display.bump,
+    .score-display.scale-110 {
+      transform: scale(1.10) scaleY(1.14);
+      filter: brightness(1.38);
+    }
+
+    .transition-transform {
+      transition-property: transform, filter;
+      transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .duration-150 {
+      transition-duration: 150ms;
+    }
+
+    .scale-110 {
+      transform: scale(1.10);
+    }
+
+    /* 요구사항 2: 각 선수의 메인 점수 숫자 바로 아래 긴장감 그라데이션 타이머 바 */
+    .shot-timer-under-score {
+      flex: 0 0 auto;
+      width: 100%;
+      margin: 0.4vh 0 0.8vh 0;
+      padding: 0.55vh 0.8vw;
+      border-radius: 12px;
+      background: rgba(2, 6, 23, 0.75);
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      transition: opacity 0.25s ease, border-color 0.25s ease;
+    }
+
+    .shot-timer-under-score.inactive-turn {
+      opacity: 0.28;
+    }
+
+    .shot-timer-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 4px;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: clamp(0.72rem, 1.15vh, 0.84rem);
+      font-weight: 800;
+      color: #cbd5e1;
+    }
+
+    .shot-timer-sec-val {
+      font-family: 'Oswald', 'Chakra Petch', sans-serif;
+      font-size: clamp(0.95rem, 1.6vh, 1.2rem);
+      font-weight: 700;
+      color: #ffffff;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .shot-timer-track {
+      width: 100%;
+      height: clamp(12px, 1.7vh, 16px);
+      background: #0f172a;
+      border-radius: 999px;
+      overflow: hidden;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      position: relative;
+    }
+
+    .shot-timer-bar-fill {
+      height: 100%;
+      width: 100%;
+      border-radius: 999px;
+      transition: width 0.35s linear, background 0.3s ease, box-shadow 0.3s ease;
+    }
+
+    /* 잔여 시간 100% ~ 50%: 에메랄드/시안 그린 그라데이션 (from-emerald-400 to-cyan-500) */
+    .shot-timer-bar-fill.from-emerald-400.to-cyan-500 {
+      background: linear-gradient(90deg, #34d399 0%, #06b6d4 100%);
+      box-shadow: 0 0 12px rgba(6, 182, 212, 0.45);
+    }
+
+    /* 잔여 시간 50% ~ 25%: 옐로우/앰버 오렌지 그라데이션 (from-yellow-400 via-amber-500 to-orange-500) */
+    .shot-timer-bar-fill.from-yellow-400.via-amber-500.to-orange-500 {
+      background: linear-gradient(90deg, #facc15 0%, #f59e0b 50%, #f97316 100%);
+      box-shadow: 0 0 14px rgba(245, 158, 11, 0.55);
+    }
+
+    /* 잔여 시간 25%(10초) 이하: 강렬한 크림슨/네온 레드 그라데이션 (from-orange-600 via-red-600 to-rose-500) + 빠른 글로우 맥동 */
+    @keyframes urgentGlowPulse {
+      0%, 100% {
+        opacity: 1;
+        filter: brightness(1.25);
+        box-shadow: 0 0 22px rgba(244, 63, 94, 0.95), 0 0 36px rgba(220, 38, 38, 0.8);
+      }
+      50% {
+        opacity: 0.65;
+        filter: brightness(0.95);
+        box-shadow: 0 0 8px rgba(244, 63, 94, 0.45);
+      }
+    }
+
+    .shot-timer-bar-fill.from-orange-600.via-red-600.to-rose-500 {
+      background: linear-gradient(90deg, #ea580c 0%, #dc2626 50%, #f43f5e 100%);
+      box-shadow: 0 0 20px rgba(244, 63, 94, 0.9);
+    }
+
+    .animate-pulse {
+      animation: urgentGlowPulse 0.55s infinite ease-in-out;
+    }
+
+    /* 플레이어 하단 스탯 그리드 (이닝, 애버리지, 하이런, 뱅크샷) */
+    .player-stats {
+      flex: 0 0 auto;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      border-top: 1px solid rgba(148, 163, 184, 0.15);
+      padding-top: 0.9vh;
+    }
+
+    .stat-box {
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid rgba(148, 163, 184, 0.14);
+      border-radius: 10px;
+      padding: 0.65vh 0.5vw;
+      text-align: center;
+    }
+
+    .stat-label {
+      font-size: clamp(0.66rem, 1.05vh, 0.76rem);
+      color: var(--text-muted);
+      font-weight: 800;
+      margin-bottom: 2px;
+    }
+
+    .stat-value {
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: clamp(1.05rem, 2vh, 1.45rem);
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* 중앙 허브 (상단: 라이브캠/자동리플레이 모니터, 중단: 경기/화면 4대 제어바, 하단: 보조 컨트롤 및 배너) */
+    .center-hub {
+      background: var(--bg-panel);
+      border: 1px solid var(--border-dim);
+      border-radius: 20px;
+      padding: 1.1vh 1vw;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.8vh;
+      min-height: 0;
+      height: 100%;
+      overflow: hidden;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+    }
+
+    /* 보드판 중앙 상단 실시간 카메라 & 자동 리플레이 & 터치 전체화면/줌 모니터 */
+    .cam-monitor-box {
+      width: 100%;
+      flex: 1 1 0;
+      min-height: 0;
+      background: #020617;
+      border: 2px solid #334155;
+      border-radius: 14px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      transition: border-color 0.3s ease, box-shadow 0.3s ease;
+    }
+
+    .cam-monitor-box.replay-active {
+      border-color: #f59e0b;
+      box-shadow: 0 0 24px rgba(245, 158, 11, 0.38);
+    }
+
+    /* 라이브캠 화면 터치 또는 [전체화면] 클릭 시 전체화면(Fullscreen) 전환 모드 */
+    .cam-monitor-box.fullscreen-mode {
+      position: fixed;
+      inset: 14px;
+      width: auto;
+      height: auto;
+      z-index: 960;
+      border-radius: 20px;
+      border: 2px solid #38bdf8;
+      box-shadow: 0 0 0 9999px rgba(2, 6, 23, 0.88), 0 25px 60px rgba(0, 0, 0, 0.95);
+    }
+
+    .cam-viewport {
+      position: relative;
+      width: 100%;
+      flex: 1 1 0;
+      min-height: 110px;
+      background: #000000;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      touch-action: none;
+    }
+
+    .cam-monitor-box.fullscreen-mode .cam-viewport {
+      flex: 1;
+      height: 100%;
+    }
+
+    .cam-viewport.is-zoomed {
+      cursor: grab;
+    }
+
+    .cam-viewport.is-dragging {
+      cursor: grabbing;
+    }
+
+    .cam-stream-img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      transform-origin: center center;
+      transition: transform 0.14s ease-out;
+      will-change: transform;
+      pointer-events: none;
+    }
+
+    .cam-stream-img.no-transition {
+      transition: none;
+    }
+
+    .cam-overlay-top {
+      position: absolute;
+      top: 8px;
+      left: 10px;
+      right: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      pointer-events: none;
+      z-index: 5;
+    }
+
+    .cam-fullscreen-hud {
+      display: none;
+      align-items: center;
+      gap: 14px;
+      padding: 5px 16px;
+      border-radius: 999px;
+      background: rgba(9, 14, 28, 0.92);
+      border: 1px solid #38bdf8;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.95rem;
+      font-weight: 800;
+      color: #f8fafc;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.65);
+    }
+
+    .cam-monitor-box.fullscreen-mode .cam-fullscreen-hud {
+      display: inline-flex;
+    }
+
+    .cam-mode-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.6px;
+      background: rgba(239, 68, 68, 0.88);
+      color: #ffffff;
+      box-shadow: 0 2px 10px rgba(239, 68, 68, 0.5);
+    }
+
+    .cam-mode-badge.replay-mode {
+      background: rgba(245, 158, 11, 0.94);
+      color: #020617;
+      box-shadow: 0 2px 12px rgba(245, 158, 11, 0.65);
+    }
+
+    .cam-shot-tag {
+      padding: 2px 8px;
+      border-radius: 6px;
+      background: rgba(15, 23, 42, 0.82);
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      color: #7dd3fc;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.68rem;
+      font-weight: 800;
+    }
+
+    /* 요구사항 5: 전체화면(Fullscreen) 진입 시에만 노출되는 하단 플로팅 HUD 컨트롤 바 */
+    .fullscreen-only-controls {
+      display: none;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px 16px;
+      background: rgba(9, 14, 28, 0.95);
+      border-top: 1px solid rgba(56, 189, 248, 0.4);
+      z-index: 10;
+    }
+
+    .cam-monitor-box.fullscreen-mode .fullscreen-only-controls {
+      display: flex;
+    }
+
+    .cam-btn-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .cam-ctrl-btn {
+      min-height: 44px;
+      padding: 0 14px;
+      border-radius: 9px;
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: #e2e8f0;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.88rem;
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .cam-ctrl-btn:hover {
+      background: #334155;
+      color: #ffffff;
+    }
+
+    .cam-ctrl-btn.active {
+      background: rgba(56, 189, 248, 0.22);
+      border-color: #38bdf8;
+      color: #7dd3fc;
+    }
+
+    .cam-ctrl-btn.close-fs-btn {
+      background: rgba(239, 68, 68, 0.22);
+      border-color: #ef4444;
+      color: #fca5a5;
+    }
+
+    .cam-zoom-pill {
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.92);
+      border: 1px solid #38bdf8;
+      color: #38bdf8;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.85rem;
+      font-weight: 800;
+    }
+
+    /* 요구사항 5: 기본 화면 전용 4대 경기/화면 제어 바 ([경기시작], [경기종료], [일시정지], [전체화면]) */
+    .match-screen-control-bar {
+      flex: 0 0 auto;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      width: 100%;
+      gap: 8px;
+    }
+
+    .main-kiosk-btn {
+      min-height: clamp(44px, 5.4vh, 54px);
+      border-radius: 12px;
+      border: 1px solid #334155;
+      background: #162238;
+      color: #f8fafc;
+      font-size: clamp(0.84rem, 1.4vh, 1.0rem);
+      font-weight: 900;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .main-kiosk-btn:hover {
+      background: #233554;
+      transform: translateY(-1px);
+    }
+
+    .main-kiosk-btn.btn-start {
+      background: rgba(16, 185, 129, 0.2);
+      border-color: #10b981;
+      color: #6ee7b7;
+    }
+
+    .main-kiosk-btn.btn-end {
+      background: rgba(239, 68, 68, 0.18);
+      border-color: #ef4444;
+      color: #fca5a5;
+    }
+
+    .main-kiosk-btn.btn-pause {
+      background: rgba(245, 158, 11, 0.18);
+      border-color: #f59e0b;
+      color: #fde047;
+    }
+
+    .main-kiosk-btn.btn-pause.paused {
+      background: rgba(245, 158, 11, 0.38);
+      border-color: #fde047;
+      color: #ffffff;
+      box-shadow: 0 0 14px rgba(245, 158, 11, 0.45);
+    }
+
+    .main-kiosk-btn.btn-fullscreen {
+      background: rgba(56, 189, 248, 0.18);
+      border-color: #38bdf8;
+      color: #7dd3fc;
+    }
+
+    .quick-hub-actions {
+      flex: 0 0 auto;
+      display: flex;
+      width: 100%;
+      gap: 6px;
+    }
+
+    .hub-btn {
+      flex: 1;
+      min-height: clamp(34px, 4.0vh, 42px);
+      border-radius: 10px;
+      border: 1px solid #334155;
+      background: #162238;
+      color: #e2e8f0;
+      font-size: clamp(0.74rem, 1.18vh, 0.84rem);
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .hub-btn:hover {
+      background: #233554;
+    }
+
+    /* 경기 상태 배너 */
+    .state-banner {
+      flex: 0 0 auto;
+      width: 100%;
+      padding: 0.55vh 10px;
+      border-radius: 10px;
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      text-align: center;
+    }
+
+    .state-code {
+      font-size: 0.72rem;
+      font-weight: 800;
+      color: #38bdf8;
+      letter-spacing: 1px;
+      margin-bottom: 1px;
+    }
+
+    .state-message {
+      font-size: clamp(0.74rem, 1.15vh, 0.85rem);
+      color: #f1f5f9;
+      font-weight: 600;
+      line-height: 1.25;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* 요구사항 3: '이닝별득점' 간소화 및 현재 이닝 하이라이트 표시 (INNING SCORE SHEET) */
+    .inning-sheet-panel {
+      flex: 0 0 auto;
+      background: rgba(12, 19, 36, 0.94);
+      border: 1px solid var(--border-dim);
+      border-radius: 12px;
+      padding: 0.55vh 0.9vw;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      overflow-x: hidden;
+    }
+
+    .sheet-title-wrap {
+      display: flex;
+      align-items: center;
+      padding-right: 12px;
+      border-right: 1px solid var(--border-dim);
+      white-space: nowrap;
+    }
+
+    .sheet-title {
+      font-size: clamp(0.84rem, 1.35vh, 0.96rem);
+      font-weight: 900;
+      color: #38bdf8;
+      letter-spacing: 0.5px;
+    }
+
+    .sheet-table {
+      border-collapse: collapse;
+      flex: 1;
+      width: 100%;
+      table-layout: fixed;
+    }
+
+    .sheet-table th,
+    .sheet-table td {
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      text-align: center;
+      padding: 3px 1px;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: clamp(0.7rem, 1.15vh, 0.84rem);
+      font-weight: 700;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .sheet-table th {
+      background: rgba(30, 41, 59, 0.65);
+      color: var(--text-muted);
+      font-size: clamp(0.66rem, 1.05vh, 0.76rem);
+    }
+
+    /* 현재 진행 중인 이닝(Current Inning) 열 전체 하이라이트 (밝은 테두리 ring-2 ring-amber-400 / border-cyan-400 + 강조 배경 + 굵은 텍스트) */
+    .sheet-table th.current-inning-col {
+      background: linear-gradient(180deg, rgba(245, 158, 11, 0.45), rgba(56, 189, 248, 0.35));
+      color: #fde047;
+      font-weight: 900;
+      border-top: 2px solid #fbbf24 !important;
+      border-left: 2px solid #fbbf24 !important;
+      border-right: 2px solid #fbbf24 !important;
+      box-shadow: inset 0 0 8px rgba(251, 191, 36, 0.45);
+    }
+
+    .sheet-table td.current-inning-col {
+      background: rgba(251, 191, 36, 0.18);
+      color: #ffffff;
+      font-weight: 900;
+      border-left: 2px solid #fbbf24 !important;
+      border-right: 2px solid #fbbf24 !important;
+      box-shadow: inset 0 0 10px rgba(56, 189, 248, 0.25);
+    }
+
+    .sheet-table tr:last-child td.current-inning-col {
+      border-bottom: 2px solid #fbbf24 !important;
+    }
+
+    .sheet-player-col {
+      text-align: left !important;
+      padding-left: 8px !important;
+      width: 96px !important;
+      min-width: 96px !important;
+      max-width: 96px !important;
+      color: #e2e8f0;
+      font-weight: 800 !important;
+    }
+
+    .pts-positive {
+      color: #34d399;
+      background: rgba(16, 185, 129, 0.15);
+    }
+
+    /* 선수 이름/핸디 변경 모달창 오버레이 */
+    .player-modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.82);
+      backdrop-filter: blur(6px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 990;
+    }
+
+    .player-modal-overlay.show {
+      display: flex;
+    }
+
+    .player-modal-card {
+      width: min(92vw, 460px);
+      background: #0f172a;
+      border: 2px solid #38bdf8;
+      border-radius: 20px;
+      padding: 22px 24px;
+      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.9);
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .player-modal-title {
+      font-size: 1.15rem;
+      font-weight: 900;
+      color: #f8fafc;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .modal-input-row {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 10px;
+    }
+
+    .player-name-input {
+      width: 100%;
+      height: 48px;
+      border-radius: 10px;
+      border: 2px solid #334155;
+      background: #020617;
+      color: #ffffff;
+      font-size: 1.1rem;
+      font-weight: 800;
+      padding: 0 14px;
+      outline: none;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+
+    .player-name-input:focus {
+      border-color: #38bdf8;
+    }
+
+    .player-preset-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+
+    .preset-name-btn {
+      min-height: 38px;
+      border-radius: 8px;
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: #e2e8f0;
+      font-size: 0.82rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .preset-name-btn:hover {
+      background: #334155;
+      border-color: #38bdf8;
+    }
+
+    .player-modal-actions {
+      display: flex;
+      gap: 10px;
+      margin-top: 4px;
+    }
+
+    .modal-action-btn {
+      flex: 1;
+      min-height: 44px;
+      border-radius: 10px;
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: #f8fafc;
+      font-size: 0.95rem;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .modal-action-btn.save {
+      background: linear-gradient(90deg, #0284c7, #2563eb);
+      border-color: #38bdf8;
+      color: #ffffff;
+    }
+
+    /* 우측 상단 오버레이: [CUE24 HAWK-EYE VAR] 현미경 판독 팝업창 */
+    .var-popup {
+      position: fixed;
+      top: 68px;
+      right: 24px;
+      width: 400px;
+      background: rgba(9, 14, 28, 0.96);
+      border: 2px solid #38bdf8;
+      border-radius: 18px;
+      padding: 18px 20px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.85), 0 0 30px rgba(56, 189, 248, 0.35);
+      z-index: 999;
+      transform: translateX(460px);
+      opacity: 0;
+      pointer-events: none;
+      transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .var-popup.show {
+      transform: translateX(0);
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .var-popup.foul {
+      border-color: var(--accent-red);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.85), 0 0 35px rgba(239, 68, 68, 0.45);
+    }
+
+    .var-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+      padding-bottom: 10px;
+      margin-bottom: 12px;
+    }
+
+    .var-title {
+      font-size: 1rem;
+      font-weight: 900;
+      letter-spacing: 1px;
+      color: #38bdf8;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .var-popup.foul .var-title {
+      color: #f87171;
+    }
+
+    .var-close-btn {
+      background: transparent;
+      border: 1px solid #475569;
+      color: #cbd5e1;
+      border-radius: 8px;
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      min-height: 36px;
+    }
+
+    .var-metrics {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .var-metric-card {
+      background: rgba(30, 41, 59, 0.65);
+      border-radius: 10px;
+      padding: 10px 12px;
+      text-align: center;
+    }
+
+    .var-metric-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+
+    .var-metric-val {
+      font-size: 1.35rem;
+      font-weight: 900;
+      color: #f8fafc;
+    }
+
+    .var-desc {
+      font-size: 0.9rem;
+      line-height: 1.45;
+      color: #e2e8f0;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 상단 상태 헤더: 좌(브랜드), 중앙(누적 타이머 + [선수변경]/[자리바꿈] 나란히 배치), 우(규칙/상태) -->
+  <header class="top-bar">
+    <div class="brand-box">
+      <div class="brand-logo">CUE24</div>
+      <div class="brand-sub">스마트 3쿠션 디지털 점수판 &amp; AI 자동 판독</div>
+    </div>
+
+    <div class="top-center-group">
+      <div id="matchElapsedTimerBox" class="top-center-timer" title="경기 시작부터 누적된 총 경과 시간">
+        <span class="match-timer-label">⏱️ 경기시간</span>
+        <span id="matchElapsedDigits" class="match-timer-digits">00:00:00</span>
+      </div>
+      <!-- 요구사항 1: [선수변경] 버튼과 [자리바꿈] 버튼 나란히 배치 -->
+      <div class="swap-pair-group" aria-label="선수변경 및 자리바꿈 제어">
+        <button
+          id="btnSwapPlayerNames"
+          class="swap-action-btn"
+          onclick="swapPlayerNamesOnly()"
+          title="당구공 색상(흰공/노란공)은 현재 위치에 그대로 두고, 좌우 선수의 이름(및 핸디)만 서로 맞바꿉니다"
+        >
+          선수변경
+        </button>
+        <button
+          id="btnSwapSeatsFull"
+          class="swap-action-btn seat-swap"
+          onclick="swapPlayerSeats()"
+          title="좌우 선수의 이름과 당구공 색깔(흰공/노란공 및 해당 진영의 점수·기록 상태)을 함께 통째로 좌우 맞바꿉니다"
+        >
+          자리바꿈
+        </button>
+      </div>
+    </div>
+
+    <div class="top-controls">
+      <button id="ruleToggleBtn" class="rule-toggle-btn" onclick="toggleRuleMode()">
+        🏆 경기 규칙: 일반 3쿠션 (1점제)
+      </button>
+      <div id="fsmBadge" style="font-weight:800; color:#94a3b8; font-size:0.85rem;">상태: 샷 대기 중</div>
+      <div id="wsStatusPill" class="ws-pill">
+        <span class="ws-dot"></span>
+        <span id="wsStatusText">실시간 연결됨</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- 선수 이름 및 핸디 설정 모달창 -->
+  <div id="playerModalOverlay" class="player-modal-overlay" role="dialog" aria-modal="true">
+    <div class="player-modal-card">
+      <div class="player-modal-title">
+        <span id="playerModalHeading">✏️ 1번 선수 정보 설정</span>
+        <button class="var-close-btn" onclick="closePlayerNameModal()">닫기 ✕</button>
+      </div>
+      <div class="modal-input-row">
+        <input
+          id="playerNameInput"
+          class="player-name-input"
+          type="text"
+          maxlength="16"
+          placeholder="선수 이름 입력"
+          onkeydown="if(event.key==='Enter') submitPlayerNameModal();"
+        />
+        <input
+          id="playerHandicapInput"
+          class="player-name-input"
+          type="number"
+          min="10"
+          max="100"
+          step="1"
+          value="40"
+          placeholder="핸디"
+          title="선수 핸디 점수"
+          onkeydown="if(event.key==='Enter') submitPlayerNameModal();"
+        />
+      </div>
+      <div class="player-preset-grid">
+        <button class="preset-name-btn" onclick="selectPresetPlayerName('1번 선수')">1번 선수</button>
+        <button class="preset-name-btn" onclick="selectPresetPlayerName('2번 선수')">2번 선수</button>
+        <button class="preset-name-btn" onclick="selectPresetPlayerName('조재호')">조재호</button>
+        <button class="preset-name-btn" onclick="selectPresetPlayerName('쿠드롱')">쿠드롱</button>
+        <button class="preset-name-btn" onclick="selectPresetPlayerName('김행직')">김행직</button>
+        <button class="preset-name-btn" onclick="selectPresetPlayerName('딕 야스퍼스')">딕 야스퍼스</button>
+        <button class="preset-name-btn" onclick="selectPresetPlayerName('동호인 A')">동호인 A</button>
+        <button class="preset-name-btn" onclick="selectPresetPlayerName('동호인 B')">동호인 B</button>
+      </div>
+      <div class="player-modal-actions">
+        <button class="modal-action-btn" onclick="closePlayerNameModal()">취소</button>
+        <button class="modal-action-btn save" onclick="submitPlayerNameModal()">저장하기</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 우측 상단 오버레이: [CUE24 HAWK-EYE VAR] 팝업창 -->
+  <aside id="varPopup" class="var-popup" role="alert" data-legacy-title="CUE24 HAWK-EYE VAR">
+    <div class="var-header">
+      <div class="var-title">
+        <span>🔬 [AI 초정밀 비디오 판독 (VAR)]</span>
+      </div>
+      <button class="var-close-btn" onclick="hideVarPopup()">닫기 ✕</button>
+    </div>
+    <div class="var-metrics">
+      <div class="var-metric-card">
+        <div class="var-metric-label">공 사이 최소 간격</div>
+        <div id="varGapVal" class="var-metric-val">-0.15 mm</div>
+      </div>
+      <div class="var-metric-card">
+        <div id="varSecondLabel" class="var-metric-label">수구 진행 굴절각</div>
+        <div id="varSecondVal" class="var-metric-val">0.68°</div>
+      </div>
+    </div>
+    <div id="varMessage" class="var-desc">
+      미세 접촉 판독 결과가 이곳에 표시됩니다.
+    </div>
+  </aside>
+
+  <!-- 메인 3단 스코어보드 -->
+  <main class="scoreboard-grid">
+    <!-- 좌측: Player 1 카드 -->
+    <section id="p1Card" class="player-card active-p1" data-player-default="PLAYER 1">
+      <div>
+        <div class="player-header">
+          <div class="player-title-wrap">
+            <div id="p1CueLamp" class="cue-ball-lamp white" title="수구: 흰공"></div>
+            <h2 id="p1Name" class="player-name" onclick="openPlayerNameModal('P1')" title="클릭하여 선수 이름/핸디 설정">1번 선수</h2>
+            <!-- 선수 이름 바로 옆에 '핸디' 및 상대방과의 실시간 '점수차' 표기 -->
+            <span id="p1HandicapLabel" class="handicap-pill" onclick="openPlayerNameModal('P1')" title="클릭하여 핸디 변경">
+              핸디 <strong id="p1HandicapVal">40</strong>
+            </span>
+            <span id="p1ScoreDiffBadge" class="score-diff-pill diff-even">점수차 0</span>
+          </div>
+          <div class="header-right-badges">
+            <!-- 선수 정보 영역 바로 옆 [선수변경] / [자리바꿈] 나란히 배치 -->
+            <button class="card-swap-btn" onclick="swapPlayerNamesOnly()" title="당구공 색상은 그대로 두고 좌우 선수 이름(및 핸디)만 맞바꿈">선수변경</button>
+            <button class="card-swap-btn seat" onclick="swapPlayerSeats()" title="좌우 선수 이름과 당구공 색깔(및 점수·기록)을 통째로 맞바꿈">자리바꿈</button>
+            <div class="timeout-dots" title="남은 작전타임">
+              <span>타임</span>
+              <span id="p1To1" class="t-dot on"></span>
+              <span id="p1To2" class="t-dot on"></span>
+            </div>
+            <span class="attack-badge">공격 중</span>
+          </div>
+        </div>
+
+        <!-- 자신의 메인 점수 바로 위에 크게 인식하기 편한 크기로 '현재 이닝' 표기 -->
+        <div class="above-score-inning-row">
+          <span id="p1NameInningBadge" class="player-inning-badge">1 이닝</span>
+        </div>
+      </div>
+
+      <!-- 큐스코 스타일 초대형 스코어 + 좌우 수동 보정 버튼 -->
+      <div class="score-zone">
+        <button class="score-adj-btn" onclick="adjustScore('P1', -1)" title="좌측 선수 점수 -1 보정">-1</button>
+        <div id="p1Score" class="score-display white-theme transition-transform duration-150">0</div>
+        <button class="score-adj-btn" onclick="adjustScore('P1', 1)" title="좌측 선수 점수 +1 보정">+1</button>
+      </div>
+
+      <!-- 요구사항 2: 메인 점수 숫자 바로 아래 가로 프로그레스 타이머 바 (동적 긴장감 그라데이션) -->
+      <div id="p1ShotTimerWrap" class="shot-timer-under-score">
+        <div class="shot-timer-meta">
+          <span id="p1TimerStateLabel">남은 시간</span>
+          <span id="p1TimerSecVal" class="shot-timer-sec-val">40초</span>
+        </div>
+        <div class="shot-timer-track">
+          <div id="p1ShotTimerBar" class="shot-timer-bar-fill from-emerald-400 to-cyan-500" style="width: 100%;"></div>
+        </div>
+      </div>
+
+      <div class="player-stats">
+        <div class="stat-box">
+          <div class="stat-label">이닝</div>
+          <div id="p1Inning" class="stat-value">1</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">애버리지</div>
+          <div id="p1Avg" class="stat-value">0.000</div>
+        </div>
+        <div class="stat-box" data-legacy-label="하이런 (연속득점)">
+          <!-- 요구사항 2: '하이런' 단독 표기 -->
+          <div class="stat-label">하이런</div>
+          <div id="p1HighRun" class="stat-value">0</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">뱅크샷</div>
+          <div id="p1Bank" class="stat-value">0</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 중앙: 상단 실시간 라이브캠/자동 리플레이 모니터 & 4대 핵심 경기/화면 제어 바 -->
+    <section class="center-hub">
+      <!-- 요구사항 5: 기본 비디오 화면에서 상단 터치/배율 배지 및 하단 배속/줌 버튼 제거, 전체화면 진입 시에만 전용 HUD 노출 -->
+      <div id="camMonitorBox" class="cam-monitor-box">
+        <div id="camViewport" class="cam-viewport" title="화면을 터치(클릭)하면 전체화면으로 전환/복귀됩니다">
+          <img
+            id="camStreamImg"
+            class="cam-stream-img"
+            src="/api/video/live"
+            alt="CUE24 실시간 당구대 카메라 및 자동 리플레이"
+            onerror="setTimeout(() => { if (currentCamMode === 'LIVE') switchToLiveCam(); }, 800)"
+          />
+          <div class="cam-overlay-top">
+            <span id="camModeBadge" class="cam-mode-badge">🔴 실시간 화면</span>
+            <div id="camFullscreenHud" class="cam-fullscreen-hud">
+              <span id="hudP1Text">1번 선수: 0</span>
+              <span style="color:#94a3b8;">|</span>
+              <span id="hudInningText">1 이닝</span>
+              <span style="color:#94a3b8;">|</span>
+              <span id="hudP2Text" style="color:#fde047;">2번 선수: 0</span>
+            </div>
+            <span id="camShotBadge" class="cam-shot-tag">LIVE</span>
+          </div>
+        </div>
+
+        <!-- 전체화면(Fullscreen) 진입 시에만 노출되는 배속/줌/닫기 전용 컨트롤 바 -->
+        <div id="fullscreenControlsBar" class="fullscreen-only-controls" aria-label="전체화면 전용 배속 및 줌 제어">
+          <div class="cam-btn-group">
+            <button id="btnLiveCam" class="cam-ctrl-btn active" onclick="switchToLiveCam()">🔴 실시간</button>
+            <button id="btnReplayCam" class="cam-ctrl-btn" onclick="switchToReplayCam()">⏪ 리플레이</button>
+          </div>
+          <div class="cam-btn-group" aria-label="리플레이 배속 제어">
+            <button id="speedBtn10" class="cam-ctrl-btn active" onclick="changeReplaySpeed(1.0)">1.0배속</button>
+            <button id="speedBtn05" class="cam-ctrl-btn" onclick="changeReplaySpeed(0.5)">0.5배속</button>
+            <button id="speedBtn025" class="cam-ctrl-btn" onclick="changeReplaySpeed(0.25)">0.25배속</button>
+          </div>
+          <div class="cam-btn-group" aria-label="화면 확대 및 전체화면 제어">
+            <span id="camZoomBadge" class="cam-zoom-pill">배율 1.0x</span>
+            <button id="btnZoomOut" class="cam-ctrl-btn" onclick="zoomCam(-0.5)" title="화면 축소 (-0.5배)">🔍 -</button>
+            <button id="btnZoomReset" class="cam-ctrl-btn" onclick="resetCamZoom()" title="배율 1.0배 초기화">1:1</button>
+            <button id="btnZoomIn" class="cam-ctrl-btn" onclick="zoomCam(0.5)" title="화면 확대 (+0.5배)">🔍 +</button>
+            <button id="btnFullscreenClose" class="cam-ctrl-btn close-fs-btn" onclick="toggleCamFullscreen()">
+              ✕ 전체화면 닫기
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 요구사항 5: 기본 화면 전용 경기/화면 제어 바 ([경기시작], [경기종료], [일시정지], [전체화면]) -->
+      <div class="match-screen-control-bar" aria-label="경기 및 전체화면 제어">
+        <button id="btnMatchStart" class="main-kiosk-btn btn-start" onclick="startMatch()">
+          경기시작
+        </button>
+        <button id="btnMatchEnd" class="main-kiosk-btn btn-end" onclick="endMatch()">
+          경기종료
+        </button>
+        <button id="btnMatchPause" class="main-kiosk-btn btn-pause" onclick="togglePauseMatch()">
+          일시정지
+        </button>
+        <button id="btnFullscreenToggle" class="main-kiosk-btn btn-fullscreen" onclick="toggleCamFullscreen()">
+          전체화면
+        </button>
+      </div>
+
+      <div class="quick-hub-actions">
+        <button class="hub-btn" onclick="useTimeout()" data-legacy-action="TIME-OUT (+40s)">⏱️ 작전타임 (+40초)</button>
+        <button class="hub-btn" onclick="swapCueBalls()">🔄 공격권(턴) 교대</button>
+      </div>
+
+      <div class="state-banner">
+        <div id="bannerCode" class="state-code">샷 대기</div>
+        <div id="bannerMsg" class="state-message">경기 시작 대기 중 (1번 선수 선공 - 흰공 수구)</div>
+      </div>
+    </section>
+
+    <!-- 우측: Player 2 카드 -->
+    <section id="p2Card" class="player-card" data-player-default="PLAYER 2">
+      <div>
+        <div class="player-header">
+          <div class="player-title-wrap">
+            <div id="p2CueLamp" class="cue-ball-lamp yellow" title="수구: 노란공"></div>
+            <h2 id="p2Name" class="player-name" onclick="openPlayerNameModal('P2')" title="클릭하여 선수 이름/핸디 설정">2번 선수</h2>
+            <!-- 선수 이름 바로 옆에 '핸디' 및 상대방과의 실시간 '점수차' 표기 -->
+            <span id="p2HandicapLabel" class="handicap-pill" onclick="openPlayerNameModal('P2')" title="클릭하여 핸디 변경">
+              핸디 <strong id="p2HandicapVal">40</strong>
+            </span>
+            <span id="p2ScoreDiffBadge" class="score-diff-pill diff-even">점수차 0</span>
+          </div>
+          <div class="header-right-badges">
+            <!-- 선수 정보 영역 바로 옆 [선수변경] / [자리바꿈] 나란히 배치 -->
+            <button class="card-swap-btn" onclick="swapPlayerNamesOnly()" title="당구공 색상은 그대로 두고 좌우 선수 이름(및 핸디)만 맞바꿈">선수변경</button>
+            <button class="card-swap-btn seat" onclick="swapPlayerSeats()" title="좌우 선수 이름과 당구공 색깔(및 점수·기록)을 통째로 맞바꿈">자리바꿈</button>
+            <div class="timeout-dots" title="남은 작전타임">
+              <span>타임</span>
+              <span id="p2To1" class="t-dot on"></span>
+              <span id="p2To2" class="t-dot on"></span>
+            </div>
+            <span class="attack-badge">공격 중</span>
+          </div>
+        </div>
+
+        <!-- 자신의 메인 점수 바로 위에 크게 인식하기 편한 크기로 '현재 이닝' 표기 -->
+        <div class="above-score-inning-row">
+          <span id="p2NameInningBadge" class="player-inning-badge">1 이닝</span>
+        </div>
+      </div>
+
+      <!-- 큐스코 스타일 초대형 스코어 + 좌우 수동 보정 버튼 -->
+      <div class="score-zone">
+        <button class="score-adj-btn" onclick="adjustScore('P2', -1)" title="우측 선수 점수 -1 보정">-1</button>
+        <div id="p2Score" class="score-display yellow-theme transition-transform duration-150">0</div>
+        <button class="score-adj-btn" onclick="adjustScore('P2', 1)" title="우측 선수 점수 +1 보정">+1</button>
+      </div>
+
+      <!-- 요구사항 2: 메인 점수 숫자 바로 아래 가로 프로그레스 타이머 바 (동적 긴장감 그라데이션) -->
+      <div id="p2ShotTimerWrap" class="shot-timer-under-score inactive-turn">
+        <div class="shot-timer-meta">
+          <span id="p2TimerStateLabel">대기 중</span>
+          <span id="p2TimerSecVal" class="shot-timer-sec-val">40초</span>
+        </div>
+        <div class="shot-timer-track">
+          <div id="p2ShotTimerBar" class="shot-timer-bar-fill from-emerald-400 to-cyan-500" style="width: 100%;"></div>
+        </div>
+      </div>
+
+      <div class="player-stats">
+        <div class="stat-box">
+          <div class="stat-label">이닝</div>
+          <div id="p2Inning" class="stat-value">0</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">애버리지</div>
+          <div id="p2Avg" class="stat-value">0.000</div>
+        </div>
+        <div class="stat-box" data-legacy-label="하이런 (연속득점)">
+          <!-- 요구사항 2: '하이런' 단독 표기 -->
+          <div class="stat-label">하이런</div>
+          <div id="p2HighRun" class="stat-value">0</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">뱅크샷</div>
+          <div id="p2Bank" class="stat-value">0</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 요구사항 3: '이닝별득점'으로 간결하게 표기하고 부가 설명 제거, 현재 이닝 셀/열 하이라이트 (INNING SCORE SHEET) -->
+  <section class="inning-sheet-panel" aria-label="INNING SCORE SHEET" data-legacy-title="이닝별 득점 기록표">
+    <div class="sheet-title-wrap">
+      <div class="sheet-title">이닝별득점</div>
+    </div>
+    <table class="sheet-table">
+      <thead>
+        <tr id="sheetHeadRow">
+          <th class="sheet-player-col">선수</th>
+          <th class="current-inning-col">1</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr id="sheetP1Row">
+          <td id="sheetP1Name" class="sheet-player-col">1번 선수</td>
+          <td class="current-inning-col">0</td>
+        </tr>
+        <tr id="sheetP2Row">
+          <td id="sheetP2Name" class="sheet-player-col">2번 선수</td>
+          <td class="current-inning-col">-</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <script>
+    const CIRCUMFERENCE = 2 * Math.PI * 94;
+    let ws = null;
+    let varTimeoutId = null;
+    let replayOneShotTimerId = null;
+    let lastAutoReplayedClipId = null;
+    let lastReplayMeta = null;
+    let prevScores = { P1: 0, P2: 0 };
+    let currentRuleMode = 'STANDARD';
+    let currentCamMode = 'LIVE'; // 'LIVE' | 'REPLAY'
+    let currentReplaySpeed = 1.0;
+    let prevFsmState = 'WAIT_SHOT';
+    let isMatchPaused = false;
+    let lastScoreboardData = null;
+    let lastScoredShotId = -1;
+    let activeCueBall = 'WHITE'; // 규칙 1~3: 현재 턴의 지정 수구 ('WHITE' | 'YELLOW')
+
+    // 샷 ID(shot_id) 기반 멱등성(Idempotent) 가드 및 규칙 2·3(득점 시 수구 유지 / 실패 시 수구 교체) 동기화
+    function handleShotResult(result) {
+      if (!result) return false;
+      const shotId = Number(result.shot_id ?? -1);
+      const isScored = Boolean(result.is_scored || result.scored);
+      if (isScored) {
+        // [규칙 2: 득점 인정 시 현재 선수의 수구를 그대로 유지 (Keep Same Cue Ball on Score)]
+        if (result.cue_ball) {
+          activeCueBall = String(result.cue_ball).toUpperCase();
+        }
+        if (!result.already_dispatched && (shotId < 0 || shotId !== lastScoredShotId)) {
+          if (shotId >= 0) {
+            lastScoredShotId = shotId;
+          }
+          return true;
+        }
+        return false;
+      }
+      // [규칙 3: 득점 실패 시 상대방 수구로 전환 (Switch Cue Ball on Miss)]
+      if (
+        result.shot_type &&
+        ['MISS', 'FOUL', 'TIME_OUT_FOUL'].includes(String(result.shot_type))
+      ) {
+        activeCueBall = activeCueBall === 'WHITE' ? 'YELLOW' : 'WHITE';
+      }
+      return false;
+    }
+
+    const FSM_KO_MAP = {
+      WAIT_SHOT: '샷 대기 중',
+      SHOT_IN_PROGRESS: '샷 진행 중 (실시간 추적)',
+      BALL_STOPPED: '정지 판독 완료',
+    };
+
+    const SHOT_TYPE_KO_MAP = {
+      READY: '샷 대기',
+      IN_PROGRESS: '실시간 궤적 추적 중',
+      REGULAR_3C: '일반 3쿠션 득점!',
+      BANK_SHOT: '뱅크샷 득점!',
+      MISS: '득점 실패 (공격권 교대)',
+      FOUL: '파울 (공격권 교대)',
+      TIME_OUT_FOUL: '시간 초과 (공격권 교대)',
+    };
+
+    function formatPlayerNameKo(rawName) {
+      if (!rawName) return '선수';
+      const upper = String(rawName).trim().toUpperCase();
+      if (upper === 'PLAYER 1' || upper === 'P1') return '1번 선수';
+      if (upper === 'PLAYER 2' || upper === 'P2') return '2번 선수';
+      return rawName;
+    }
+
+    // 전체화면(Fullscreen) 토글 및 1.0x~4.0x 줌인/줌아웃 & 드래그 패닝 상태
+    let isCamFullscreen = false;
+    let currentZoom = 1.0;
+    let panX = 0;
+    let panY = 0;
+    let isDraggingCam = false;
+    let pointerStartX = 0;
+    let pointerStartY = 0;
+    let startPanX = 0;
+    let startPanY = 0;
+    let maxDragDistance = 0;
+    const TAP_MOVE_THRESHOLD_PX = 6; // 6px 미만 이동은 단순 터치(전체화면 토글), 6px 이상은 드래그 패닝
+
+    function clampPanOffsets() {
+      const viewport = document.getElementById('camViewport');
+      if (!viewport || currentZoom <= 1.0) {
+        panX = 0;
+        panY = 0;
+        return;
+      }
+      const maxX = ((viewport.clientWidth || 400) * (currentZoom - 1)) / 2;
+      const maxY = ((viewport.clientHeight || 225) * (currentZoom - 1)) / 2;
+      panX = Math.max(-maxX, Math.min(maxX, panX));
+      panY = Math.max(-maxY, Math.min(maxY, panY));
+    }
+
+    function applyCamTransform(withTransition = true) {
+      const streamImg = document.getElementById('camStreamImg');
+      const viewport = document.getElementById('camViewport');
+      const zoomBadge = document.getElementById('camZoomBadge');
+      const resetBtn = document.getElementById('btnZoomReset');
+
+      clampPanOffsets();
+      streamImg.classList.toggle('no-transition', !withTransition);
+      streamImg.style.transform = `translate3d(${panX.toFixed(1)}px, ${panY.toFixed(1)}px, 0) scale(${currentZoom.toFixed(2)})`;
+      viewport.classList.toggle('is-zoomed', currentZoom > 1.0);
+      if (zoomBadge) {
+        zoomBadge.textContent = `배율 ${currentZoom.toFixed(1)}x`;
+      }
+      if (resetBtn) {
+        resetBtn.textContent = currentZoom > 1.0 ? `${currentZoom.toFixed(1)}x` : '1:1';
+        resetBtn.classList.toggle('active', currentZoom > 1.0);
+      }
+    }
+
+    function zoomCam(delta) {
+      const nextZoom = Math.max(1.0, Math.min(4.0, Number((currentZoom + delta).toFixed(2))));
+      currentZoom = nextZoom;
+      if (currentZoom <= 1.0) {
+        panX = 0;
+        panY = 0;
+      }
+      applyCamTransform(true);
+    }
+
+    function resetCamZoom() {
+      currentZoom = 1.0;
+      panX = 0;
+      panY = 0;
+      applyCamTransform(true);
+    }
+
+    function toggleCamFullscreen() {
+      isCamFullscreen = !isCamFullscreen;
+      const monitorBox = document.getElementById('camMonitorBox');
+      const fsBtn = document.getElementById('btnFullscreenToggle');
+
+      monitorBox.classList.toggle('fullscreen-mode', isCamFullscreen);
+      if (fsBtn) {
+        fsBtn.textContent = isCamFullscreen ? '전체화면 닫기' : '전체화면';
+        fsBtn.classList.toggle('active', isCamFullscreen);
+      }
+      setTimeout(() => applyCamTransform(true), 40);
+    }
+
+    function initCamInteractiveEvents() {
+      const viewport = document.getElementById('camViewport');
+      if (!viewport) return;
+
+      viewport.addEventListener('pointerdown', (e) => {
+        isDraggingCam = true;
+        pointerStartX = e.clientX;
+        pointerStartY = e.clientY;
+        startPanX = panX;
+        startPanY = panY;
+        maxDragDistance = 0;
+        viewport.classList.add('is-dragging');
+        if (viewport.setPointerCapture) {
+          try {
+            viewport.setPointerCapture(e.pointerId);
+          } catch (_) {}
+        }
+      });
+
+      viewport.addEventListener('pointermove', (e) => {
+        if (!isDraggingCam) return;
+        const dx = e.clientX - pointerStartX;
+        const dy = e.clientY - pointerStartY;
+        const dist = Math.hypot(dx, dy);
+        if (dist > maxDragDistance) {
+          maxDragDistance = dist;
+        }
+        if (currentZoom > 1.0 && maxDragDistance >= TAP_MOVE_THRESHOLD_PX) {
+          panX = startPanX + dx;
+          panY = startPanY + dy;
+          applyCamTransform(false);
+        }
+      });
+
+      const finishPointer = (e) => {
+        if (!isDraggingCam) return;
+        isDraggingCam = false;
+        viewport.classList.remove('is-dragging');
+        if (viewport.releasePointerCapture) {
+          try {
+            viewport.releasePointerCapture(e.pointerId);
+          } catch (_) {}
+        }
+        if (maxDragDistance < TAP_MOVE_THRESHOLD_PX) {
+          toggleCamFullscreen();
+        } else {
+          applyCamTransform(true);
+        }
+      };
+
+      viewport.addEventListener('pointerup', finishPointer);
+      viewport.addEventListener('pointercancel', () => {
+        isDraggingCam = false;
+        viewport.classList.remove('is-dragging');
+      });
+
+      viewport.addEventListener(
+        'wheel',
+        (e) => {
+          e.preventDefault();
+          const step = e.deltaY < 0 ? 0.5 : -0.5;
+          zoomCam(step);
+        },
+        { passive: false }
+      );
+    }
+
+    function switchToLiveCam() {
+      if (replayOneShotTimerId) {
+        clearTimeout(replayOneShotTimerId);
+        replayOneShotTimerId = null;
+      }
+      currentCamMode = 'LIVE';
+      const streamImg = document.getElementById('camStreamImg');
+      const monitorBox = document.getElementById('camMonitorBox');
+      const modeBadge = document.getElementById('camModeBadge');
+      const shotBadge = document.getElementById('camShotBadge');
+      const btnLive = document.getElementById('btnLiveCam');
+      const btnReplay = document.getElementById('btnReplayCam');
+
+      streamImg.src = `/api/video/live?t=${Date.now()}`;
+      monitorBox.classList.remove('replay-active');
+      modeBadge.classList.remove('replay-mode');
+      modeBadge.textContent = '🔴 실시간 화면';
+      shotBadge.textContent = 'LIVE';
+      if (btnLive) btnLive.classList.add('active');
+      if (btnReplay) btnReplay.classList.remove('active');
+    }
+
+    function switchToReplayCam(replayMeta) {
+      if (replayOneShotTimerId) {
+        clearTimeout(replayOneShotTimerId);
+        replayOneShotTimerId = null;
+      }
+      if (replayMeta) {
+        lastReplayMeta = replayMeta;
+      }
+      const meta = replayMeta || lastReplayMeta || {};
+      currentCamMode = 'REPLAY';
+      const streamImg = document.getElementById('camStreamImg');
+      const monitorBox = document.getElementById('camMonitorBox');
+      const modeBadge = document.getElementById('camModeBadge');
+      const shotBadge = document.getElementById('camShotBadge');
+      const btnLive = document.getElementById('btnLiveCam');
+      const btnReplay = document.getElementById('btnReplayCam');
+
+      streamImg.src = `/api/video/replay?speed=${currentReplaySpeed}&t=${Date.now()}`;
+      monitorBox.classList.add('replay-active');
+      modeBadge.classList.add('replay-mode');
+      modeBadge.textContent = `⏪ 리플레이 (${currentReplaySpeed}배속)`;
+
+      if (meta && meta.shot_type) {
+        const typeKo = SHOT_TYPE_KO_MAP[meta.shot_type] || meta.shot_type;
+        const statusLabel = meta.is_scored ? '득점 인정' : '노카운트';
+        shotBadge.textContent = `${typeKo} · ${statusLabel}`;
+      } else {
+        shotBadge.textContent = '리플레이 재생';
+      }
+
+      if (btnLive) btnLive.classList.remove('active');
+      if (btnReplay) btnReplay.classList.add('active');
+
+      const frameCount = Math.max(30, Number(meta.frame_count || 90));
+      const oneShotDurationMs =
+        Math.round((frameCount / (30.0 * Math.max(0.25, currentReplaySpeed))) * 1000) + 300;
+      replayOneShotTimerId = setTimeout(() => {
+        if (currentCamMode === 'REPLAY') {
+          switchToLiveCam();
+        }
+      }, oneShotDurationMs);
+    }
+
+    function changeReplaySpeed(speed) {
+      currentReplaySpeed = Number(speed);
+      document.getElementById('speedBtn10').classList.toggle('active', currentReplaySpeed === 1.0);
+      document.getElementById('speedBtn05').classList.toggle('active', currentReplaySpeed === 0.5);
+      document.getElementById('speedBtn025').classList.toggle('active', currentReplaySpeed === 0.25);
+
+      if (currentCamMode === 'REPLAY') {
+        switchToReplayCam();
+      }
+    }
+
+    function connectWebSocket() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.host || 'localhost:8000';
+      const wsUrl = `${protocol}//${host}/ws/scoreboard`;
+
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        const pill = document.getElementById('wsStatusPill');
+        const text = document.getElementById('wsStatusText');
+        pill.classList.remove('disconnected');
+        text.textContent = '실시간 연결됨';
+        ws.send(JSON.stringify({ action: 'ACTIVATE_VISION' }));
+        if (currentCamMode === 'LIVE') {
+          switchToLiveCam();
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const packet = JSON.parse(event.data);
+          if (packet.type === 'SCORE_UPDATED' || packet.type === 'TURN_CHANGED') {
+            renderScoreboard(packet.data);
+          } else if (packet.type === 'VAR_ALERT') {
+            showVarPopup(packet.data);
+          } else if (packet.type === 'AUTO_REPLAY_READY') {
+            const clipId = packet.data && packet.data.clip_id;
+            if (clipId !== undefined && clipId !== null) {
+              if (clipId === lastAutoReplayedClipId) {
+                return;
+              }
+              lastAutoReplayedClipId = clipId;
+            }
+            switchToReplayCam(packet.data);
+          } else if (packet.type === 'REPLAY_FINISHED') {
+            if (currentCamMode === 'REPLAY') {
+              switchToLiveCam();
+            }
+          }
+        } catch (err) {
+          console.error('WebSocket message parse error:', err);
+        }
+      };
+
+      ws.onclose = () => {
+        const pill = document.getElementById('wsStatusPill');
+        const text = document.getElementById('wsStatusText');
+        pill.classList.add('disconnected');
+        text.textContent = '재연결 중...';
+        setTimeout(connectWebSocket, 2000);
+      };
+    }
+
+    function applyCueTheme(playerPrefix, cueColor) {
+      const lamp = document.getElementById(`${playerPrefix}CueLamp`);
+      const scoreEl = document.getElementById(`${playerPrefix}Score`);
+
+      const isYellow = String(cueColor || '').toUpperCase() === 'YELLOW';
+      lamp.className = `cue-ball-lamp ${isYellow ? 'yellow' : 'white'}`;
+      lamp.title = `수구: ${isYellow ? '노란공' : '흰공'}`;
+
+      scoreEl.classList.toggle('yellow-theme', isYellow);
+      scoreEl.classList.toggle('white-theme', !isYellow);
+    }
+
+    const VISIBLE_INNINGS = 30;
+    let matchElapsedSec = 0;
+    let matchElapsedIntervalId = null;
+    let editingPlayerId = 'P1';
+
+    function formatElapsedTime(sec) {
+      const total = Math.max(0, Math.floor(Number(sec) || 0));
+      const h = String(Math.floor(total / 3600)).padStart(2, '0');
+      const m = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+      const s = String(total % 60).padStart(2, '0');
+      return `${h}:${m}:${s}`;
+    }
+
+    function startLocalMatchTimerLoop() {
+      if (matchElapsedIntervalId) clearInterval(matchElapsedIntervalId);
+      matchElapsedIntervalId = setInterval(() => {
+        if (!isMatchPaused) {
+          matchElapsedSec += 1;
+          const el = document.getElementById('matchElapsedDigits');
+          if (el) {
+            el.textContent = formatElapsedTime(matchElapsedSec);
+          }
+        }
+      }, 1000);
+    }
+
+    // 요구사항 3: 이닝별득점 테이블 렌더링 및 현재 이닝(Current Inning) 열 전체 하이라이트
+    function renderInningSheet(historyList, p1Name, p2Name, activeInning = 1) {
+      const headRow = document.getElementById('sheetHeadRow');
+      const p1Row = document.getElementById('sheetP1Row');
+      const p2Row = document.getElementById('sheetP2Row');
+
+      const mapByInning = {};
+      let maxRecordedInning = 1;
+      (historyList || []).forEach((item) => {
+        mapByInning[item.inning] = item;
+        if (item.inning > maxRecordedInning) {
+          maxRecordedInning = item.inning;
+        }
+      });
+
+      const currentInningNum = Math.max(1, Number(activeInning) || 1);
+      const maxInning = Math.max(1, currentInningNum, maxRecordedInning);
+      const startInning = maxInning > VISIBLE_INNINGS ? maxInning - VISIBLE_INNINGS + 1 : 1;
+      const endInning = startInning + VISIBLE_INNINGS - 1;
+
+      const p1Display = formatPlayerNameKo(p1Name);
+      const p2Display = formatPlayerNameKo(p2Name);
+
+      let headHtml = '<th class="sheet-player-col">선수</th>';
+      let p1Html = `<td class="sheet-player-col">${p1Display}</td>`;
+      let p2Html = `<td class="sheet-player-col">${p2Display}</td>`;
+
+      for (let i = startInning; i <= endInning; i++) {
+        const isCurrent = i === currentInningNum;
+        const colClass = isCurrent ? 'current-inning-col ring-2 ring-amber-400 border-cyan-400' : '';
+        headHtml += `<th class="${colClass}">${i}</th>`;
+        const rec = mapByInning[i];
+        const v1 = rec && rec.P1 !== null && rec.P1 !== undefined ? rec.P1 : '-';
+        const v2 = rec && rec.P2 !== null && rec.P2 !== undefined ? rec.P2 : '-';
+        const c1 = [colClass, Number(v1) > 0 ? 'pts-positive' : ''].filter(Boolean).join(' ');
+        const c2 = [colClass, Number(v2) > 0 ? 'pts-positive' : ''].filter(Boolean).join(' ');
+        p1Html += `<td class="${c1}">${v1}</td>`;
+        p2Html += `<td class="${c2}">${v2}</td>`;
+      }
+
+      headRow.innerHTML = headHtml;
+      p1Row.innerHTML = p1Html;
+      p2Row.innerHTML = p2Html;
+    }
+
+    // 요구사항 7: 상대방 현재 점수 대비 실시간 점수차 렌더링 (+N 리드 초록/시안, -N 열세 레드/오렌지, 0 동점 중립)
+    function updateScoreDiffBadge(badgeId, myScore, oppScore) {
+      const el = document.getElementById(badgeId);
+      if (!el) return;
+      const diff = (Number(myScore) || 0) - (Number(oppScore) || 0);
+      el.classList.remove('diff-lead', 'diff-behind', 'diff-even');
+      if (diff > 0) {
+        el.textContent = `점수차 +${diff}`;
+        el.classList.add('diff-lead');
+      } else if (diff < 0) {
+        el.textContent = `점수차 ${diff}`;
+        el.classList.add('diff-behind');
+      } else {
+        el.textContent = '점수차 0';
+        el.classList.add('diff-even');
+      }
+    }
+
+    // 요구사항 2: 각 선수 메인 점수 바로 아래 긴장감 그라데이션 타이머 바 업데이트
+    function updatePlayerShotTimerBar(prefix, isActiveTurn, remainingSec, defaultSec, isPaused) {
+      const wrap = document.getElementById(`${prefix}ShotTimerWrap`);
+      const bar = document.getElementById(`${prefix}ShotTimerBar`);
+      const secLabel = document.getElementById(`${prefix}TimerSecVal`);
+      const stateLabel = document.getElementById(`${prefix}TimerStateLabel`);
+      if (!wrap || !bar || !secLabel || !stateLabel) return;
+
+      if (!isActiveTurn) {
+        wrap.classList.add('inactive-turn');
+        stateLabel.textContent = '대기 중';
+        secLabel.textContent = `${defaultSec}초`;
+        bar.style.width = '100%';
+        bar.className = 'shot-timer-bar-fill from-emerald-400 to-cyan-500';
+        return;
+      }
+
+      wrap.classList.remove('inactive-turn');
+      stateLabel.textContent = isPaused ? '일시정지' : '남은 시간';
+      secLabel.textContent = `${remainingSec}초`;
+
+      const pct = Math.max(0, Math.min(100, (remainingSec / Math.max(1, defaultSec)) * 100));
+      bar.style.width = `${pct.toFixed(1)}%`;
+
+      // 잔여 시간 구간별 동적 그라데이션 클래스 적용
+      if (pct > 50) {
+        bar.className = 'shot-timer-bar-fill from-emerald-400 to-cyan-500';
+      } else if (pct > 25) {
+        bar.className = 'shot-timer-bar-fill from-yellow-400 via-amber-500 to-orange-500';
+      } else {
+        bar.className = 'shot-timer-bar-fill from-orange-600 via-red-600 to-rose-500 animate-pulse';
+      }
+    }
+
+    function renderScoreboard(data) {
+      if (!data || !data.players) return;
+      lastScoreboardData = data;
+
+      const streamImgEl = document.getElementById('camStreamImg');
+      if (streamImgEl && currentCamMode === 'LIVE' && streamImgEl.complete && streamImgEl.naturalWidth === 0) {
+        switchToLiveCam();
+      }
+
+      const p1 = data.players.P1;
+      const p2 = data.players.P2;
+      const p1NameKo = formatPlayerNameKo(p1.name);
+      const p2NameKo = formatPlayerNameKo(p2.name);
+      const currentInning = Math.max(1, Number(data.current_inning) || 1);
+
+      // 중앙 상단 누적 경기 타이머 동기화
+      if (data.match_timer && data.match_timer.elapsed_sec !== undefined) {
+        matchElapsedSec = Number(data.match_timer.elapsed_sec) || 0;
+        const elapsedEl = document.getElementById('matchElapsedDigits');
+        if (elapsedEl) {
+          elapsedEl.textContent = data.match_timer.formatted || formatElapsedTime(matchElapsedSec);
+        }
+      }
+
+      // 새로운 샷이 출발(SHOT_IN_PROGRESS)하면 자동으로 실시간 라이브캠으로 복귀
+      if (data.fsm_state === 'SHOT_IN_PROGRESS' && prevFsmState !== 'SHOT_IN_PROGRESS') {
+        switchToLiveCam();
+      }
+      prevFsmState = data.fsm_state;
+
+      // 전체화면 상단 미니 스코어 HUD 동기화
+      document.getElementById('hudP1Text').textContent = `${p1NameKo}: ${p1.score}`;
+      document.getElementById('hudInningText').textContent = `${currentInning} 이닝`;
+      document.getElementById('hudP2Text').textContent = `${p2NameKo}: ${p2.score}`;
+
+      // 룰 모드 토글 버튼 업데이트
+      currentRuleMode = data.rule_mode || 'STANDARD';
+      const ruleBtn = document.getElementById('ruleToggleBtn');
+      if (currentRuleMode === 'PBA') {
+        ruleBtn.textContent = '🔥 경기 규칙: PBA 프로 룰 (뱅크샷 2점)';
+        ruleBtn.classList.add('pba-mode');
+      } else {
+        ruleBtn.textContent = '🏆 경기 규칙: 일반 3쿠션 (1점제)';
+        ruleBtn.classList.remove('pba-mode');
+      }
+
+      // FSM 상태 업데이트
+      const fsmLabel = FSM_KO_MAP[data.fsm_state] || data.fsm_state;
+      document.getElementById('fsmBadge').textContent = `상태: ${fsmLabel}`;
+
+      // 공격 턴 하이라이트
+      const p1Card = document.getElementById('p1Card');
+      const p2Card = document.getElementById('p2Card');
+      if (data.active_player_id === 'P1') {
+        p1Card.classList.add('active-p1');
+        p2Card.classList.remove('active-p2');
+      } else {
+        p1Card.classList.remove('active-p1');
+        p2Card.classList.add('active-p2');
+      }
+
+      // 기본 수구 테마 적용 (초기 상태: applyCueTheme('p1', 'WHITE'), applyCueTheme('p2', 'YELLOW') 및 자리바꿈 시 동적 반영)
+      applyCueTheme('p1', p1.cue_ball_color || 'WHITE');
+      applyCueTheme('p2', p2.cue_ball_color || 'YELLOW');
+
+      // 선수 이름 및 메인 점수 바로 위 대형 '현재 이닝' 배지 직관적 표기
+      document.getElementById('p1Name').textContent = p1NameKo;
+      document.getElementById('p1NameInningBadge').textContent = `${currentInning} 이닝`;
+      document.getElementById('p2Name').textContent = p2NameKo;
+      document.getElementById('p2NameInningBadge').textContent = `${currentInning} 이닝`;
+
+      // 요구사항 7: 핸디 및 상대방과의 실시간 점수차 표기
+      document.getElementById('p1HandicapVal').textContent = p1.target_score || 40;
+      document.getElementById('p2HandicapVal').textContent = p2.target_score || 40;
+      updateScoreDiffBadge('p1ScoreDiffBadge', p1.score, p2.score);
+      updateScoreDiffBadge('p2ScoreDiffBadge', p2.score, p1.score);
+
+      // P1 데이터 렌더링 (제2적구 충돌 즉시 점수 증가 시 scale-110 transition-transform duration-150 타격 피드백 적용)
+      const p1ScoreEl = document.getElementById('p1Score');
+      const p1JustScored = p1.score > prevScores.P1;
+      if (p1.score !== prevScores.P1) {
+        p1ScoreEl.classList.add('bump', 'scale-110', 'transition-transform', 'duration-150');
+        setTimeout(() => p1ScoreEl.classList.remove('bump', 'scale-110'), 180);
+        prevScores.P1 = p1.score;
+      }
+      p1ScoreEl.textContent = p1.score;
+      document.getElementById('p1Inning').textContent = p1.innings;
+      document.getElementById('p1Avg').textContent = Number(p1.average).toFixed(3);
+      document.getElementById('p1HighRun').textContent = p1.high_run;
+      document.getElementById('p1Bank').textContent = p1.bank_shots ?? 0;
+      document.getElementById('p1To1').classList.toggle('on', (p1.timeouts_remaining ?? 2) >= 1);
+      document.getElementById('p1To2').classList.toggle('on', (p1.timeouts_remaining ?? 2) >= 2);
+
+      // P2 데이터 렌더링 (제2적구 충돌 즉시 점수 증가 시 scale-110 transition-transform duration-150 타격 피드백 적용)
+      const p2ScoreEl = document.getElementById('p2Score');
+      const p2JustScored = p2.score > prevScores.P2;
+      if (p2.score !== prevScores.P2) {
+        p2ScoreEl.classList.add('bump', 'scale-110', 'transition-transform', 'duration-150');
+        setTimeout(() => p2ScoreEl.classList.remove('bump', 'scale-110'), 180);
+        prevScores.P2 = p2.score;
+      }
+      p2ScoreEl.textContent = p2.score;
+      document.getElementById('p2Inning').textContent = p2.innings;
+      document.getElementById('p2Avg').textContent = Number(p2.average).toFixed(3);
+      document.getElementById('p2HighRun').textContent = p2.high_run;
+      document.getElementById('p2Bank').textContent = p2.bank_shots ?? 0;
+      document.getElementById('p2To1').classList.toggle('on', (p2.timeouts_remaining ?? 2) >= 1);
+      document.getElementById('p2To2').classList.toggle('on', (p2.timeouts_remaining ?? 2) >= 2);
+
+      // 이닝별득점 기록지 업데이트
+      renderInningSheet(data.inning_history || [], p1NameKo, p2NameKo, currentInning);
+
+      // 요구사항 2: 각 선수의 메인 점수 숫자 바로 아래 가로 프로그레스 타이머 바 렌더링
+      // 제2적구 타격으로 득점이 인정되는 순간 해당 선수의 그라데이션 타이머 바를 즉시 40초(100%, 에메랄드 그린)로 리셋
+      const last = data.last_shot_result || {};
+      const firstTimeScoredForShot = handleShotResult(last);
+      const isImmediateScore =
+        (Boolean(last.immediate_score) && firstTimeScoredForShot) || p1JustScored || p2JustScored;
+      const timer = data.shot_timer || { remaining_sec: 40, default_sec: 40, is_paused: false };
+      const def = Math.max(1, Number(timer.default_sec) || 40);
+      const rem = isImmediateScore ? def : Math.max(0, Number(timer.remaining_sec) || 0);
+
+      // 선수가 [일시정지] 버튼을 클릭한 상태(is_match_paused)와 공 주행 중 샷클락 일시정지(timer.is_paused)를 명확히 분리
+      const manualMatchPaused =
+        data.match_timer && data.match_timer.is_paused !== undefined
+          ? Boolean(data.match_timer.is_paused)
+          : data.is_match_paused !== undefined
+          ? Boolean(data.is_match_paused)
+          : Boolean(timer.is_paused && data.fsm_state !== 'SHOT_IN_PROGRESS');
+
+      isMatchPaused = manualMatchPaused;
+      const isShotClockPaused = isMatchPaused || (isImmediateScore ? false : Boolean(timer.is_paused));
+
+      const pauseBtn = document.getElementById('btnMatchPause');
+      if (pauseBtn) {
+        pauseBtn.textContent = isMatchPaused ? '다시시작' : '일시정지';
+        pauseBtn.classList.toggle('paused', isMatchPaused);
+      }
+
+      updatePlayerShotTimerBar('p1', data.active_player_id === 'P1', rem, def, isShotClockPaused);
+      updatePlayerShotTimerBar('p2', data.active_player_id === 'P2', rem, def, isShotClockPaused);
+
+      // 경기 상태 배너 업데이트
+      const rawShotType = last.shot_type || 'READY';
+      document.getElementById('bannerCode').textContent = SHOT_TYPE_KO_MAP[rawShotType] || rawShotType;
+      const rawMsg = last.message || '';
+      document.getElementById('bannerMsg').textContent = rawMsg
+        .replace('P1 선공 - WHITE 수구', '1번 선수 선공 - 흰공 수구')
+        .replace('P2 선공 - YELLOW 수구', '2번 선수 선공 - 노란공 수구');
+    }
+
+    function openPlayerNameModal(playerId) {
+      editingPlayerId = playerId === 'P2' ? 'P2' : 'P1';
+      const heading = document.getElementById('playerModalHeading');
+      const input = document.getElementById('playerNameInput');
+      const handicapInput = document.getElementById('playerHandicapInput');
+      const currentName =
+        editingPlayerId === 'P1'
+          ? document.getElementById('p1Name').textContent
+          : document.getElementById('p2Name').textContent;
+      const currentHandicap =
+        editingPlayerId === 'P1'
+          ? document.getElementById('p1HandicapVal').textContent
+          : document.getElementById('p2HandicapVal').textContent;
+
+      heading.textContent =
+        editingPlayerId === 'P1'
+          ? '✏️ 좌측 선수 이름 및 핸디 설정'
+          : '✏️ 우측 선수 이름 및 핸디 설정';
+      input.value = currentName || '';
+      if (handicapInput) {
+        handicapInput.value = Number(currentHandicap) || 40;
+      }
+      document.getElementById('playerModalOverlay').classList.add('show');
+      setTimeout(() => {
+        input.focus();
+        input.select();
+      }, 40);
+    }
+
+    function closePlayerNameModal() {
+      document.getElementById('playerModalOverlay').classList.remove('show');
+    }
+
+    function selectPresetPlayerName(presetName) {
+      const input = document.getElementById('playerNameInput');
+      input.value = presetName;
+      submitPlayerNameModal();
+    }
+
+    async function submitPlayerNameModal() {
+      const input = document.getElementById('playerNameInput');
+      const handicapInput = document.getElementById('playerHandicapInput');
+      const newName = (input.value || '').trim() || (editingPlayerId === 'P1' ? '1번 선수' : '2번 선수');
+      const newHandicap = Math.max(1, Number(handicapInput && handicapInput.value) || 40);
+      closePlayerNameModal();
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            action: 'SET_PLAYER_NAME',
+            player_id: editingPlayerId,
+            name: newName,
+            handicap: newHandicap,
+          })
+        );
+      } else {
+        const res = await fetch('/api/match/player-name', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ player_id: editingPlayerId, name: newName, handicap: newHandicap }),
+        });
+        const data = await res.json();
+        renderScoreboard(data);
+      }
+    }
+
+    // 요구사항 1: [선수변경] - 당구공 색상(흰공/노란공)은 현재 위치에 그대로 두고 좌우 선수의 이름(및 핸디)만 서로 맞바꿈
+    async function swapPlayerNamesOnly() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'SWAP_PLAYER_NAMES' }));
+      } else {
+        const res = await fetch('/api/match/swap-player-names', { method: 'POST' });
+        const data = await res.json();
+        renderScoreboard(data);
+      }
+    }
+
+    // 요구사항 1: [자리바꿈] - 좌우 선수의 이름과 당구공 색깔(흰공/노란공 및 해당 진영의 점수·기록 상태)이 함께 통째로 좌우 위치가 바뀜
+    async function swapPlayerSeats() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'SWAP_SEATS_FULL' }));
+      } else {
+        const res = await fetch('/api/match/swap-seats-full', { method: 'POST' });
+        const data = await res.json();
+        renderScoreboard(data);
+      }
+    }
+
+    // 요구사항 5: [경기시작] 클릭 시 테스트 버전 기준 전체 상태 완벽 초기화, [경기종료], [일시정지]
+    async function startMatch() {
+      hideVarPopup();
+      closePlayerNameModal();
+      resetCamZoom();
+      lastAutoReplayedClipId = null;
+      lastReplayMeta = null;
+      lastScoredShotId = -1;
+      prevScores = { P1: 0, P2: 0 };
+      prevFsmState = 'WAIT_SHOT';
+      isMatchPaused = false;
+      matchElapsedSec = 0;
+
+      const elapsedEl = document.getElementById('matchElapsedDigits');
+      if (elapsedEl) elapsedEl.textContent = '00:00:00';
+
+      try {
+        const res = await fetch('/api/match/reset', { method: 'POST' });
+        const data = await res.json();
+        renderScoreboard(data);
+      } catch (err) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: 'RESET_MATCH' }));
+        }
+      }
+      switchToLiveCam();
+    }
+
+    async function endMatch() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'END_MATCH' }));
+      } else {
+        const res = await fetch('/api/match/end', { method: 'POST' });
+        const data = await res.json();
+        renderScoreboard(data);
+      }
+    }
+
+    async function togglePauseMatch() {
+      // 선수가 클릭하는 즉시 경기시간 카운트다운/업 루프를 멈추거나 다시 시작하고 버튼 글자를 '다시시작' <-> '일시정지'로 즉시 전환
+      isMatchPaused = !isMatchPaused;
+      const pauseBtn = document.getElementById('btnMatchPause');
+      if (pauseBtn) {
+        pauseBtn.textContent = isMatchPaused ? '다시시작' : '일시정지';
+        pauseBtn.classList.toggle('paused', isMatchPaused);
+      }
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'TOGGLE_PAUSE' }));
+      } else {
+        const res = await fetch('/api/match/pause', { method: 'POST' });
+        const data = await res.json();
+        renderScoreboard(data);
+      }
+    }
+
+    function showVarPopup(varData) {
+      if (!varData) return;
+      const popup = document.getElementById('varPopup');
+      const isFoul = varData.status === 'DOUBLE_TOUCH_FOUL' || varData.is_double_touch === true;
+
+      popup.classList.toggle('foul', isFoul);
+      document.getElementById('varGapVal').textContent = `${Number(varData.gap_mm || 0).toFixed(2)} mm`;
+
+      const secondLabel = document.getElementById('varSecondLabel');
+      const secondVal = document.getElementById('varSecondVal');
+      if (isFoul) {
+        secondLabel.textContent = '극솟점 시간 간격';
+        secondVal.textContent = `${Number(varData.minima_interval_ms || 0).toFixed(1)} ms`;
+      } else {
+        secondLabel.textContent = '수구 진행 굴절각';
+        secondVal.textContent = `${Number(varData.deflection_deg || 0).toFixed(2)}°`;
+      }
+
+      document.getElementById('varMessage').textContent = varData.message || 'VAR 판독 완료';
+      popup.classList.add('show');
+
+      if (varTimeoutId) clearTimeout(varTimeoutId);
+      varTimeoutId = setTimeout(hideVarPopup, 7000);
+    }
+
+    function hideVarPopup() {
+      document.getElementById('varPopup').classList.remove('show');
+    }
+
+    async function toggleRuleMode() {
+      const nextMode = currentRuleMode === 'STANDARD' ? 'PBA' : 'STANDARD';
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'SET_RULE_MODE', rule_mode: nextMode }));
+      } else {
+        try {
+          const res = await fetch('/api/match/rule-mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rule_mode: nextMode }),
+          });
+          if (res.ok) {
+            renderScoreboard(await res.json());
+            return;
+          }
+        } catch (_) {}
+        applyLocalCloudAction('SET_RULE_MODE', { rule_mode: nextMode });
+      }
+    }
+
+    async function adjustScore(playerId, delta) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'ADJUST_SCORE', player_id: playerId, delta }));
+      } else {
+        try {
+          const res = await fetch('/api/match/adjust-score', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ player_id: playerId, delta }),
+          });
+          if (res.ok) {
+            renderScoreboard(await res.json());
+            return;
+          }
+        } catch (_) {}
+        applyLocalCloudAction('ADJUST_SCORE', { player_id: playerId, delta });
+      }
+    }
+
+    async function useTimeout() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'USE_TIMEOUT' }));
+      } else {
+        try {
+          const res = await fetch('/api/match/timeout', { method: 'POST' });
+          if (res.ok) {
+            renderScoreboard(await res.json());
+            return;
+          }
+        } catch (_) {}
+        applyLocalCloudAction('USE_TIMEOUT', {});
+      }
+    }
+
+    async function swapCueBalls() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: 'SWITCH_TURN' }));
+      } else {
+        try {
+          const res = await fetch('/api/match/switch-turn', { method: 'POST' });
+          if (res.ok) {
+            renderScoreboard(await res.json());
+            return;
+          }
+        } catch (_) {}
+        applyLocalCloudAction('SWITCH_TURN', {});
+      }
+    }
+
+    async function resetMatch() {
+      return startMatch();
+    }
+
+    // ------------------------------------------------------------------
+    // [Vercel 클라우드 단독 배포용 Mock & 3쿠션 물리 시뮬레이션 폴백]
+    // 로컬 FastAPI 서버가 없는 정적 클라우드 환경에서도 점수판 및 3쿠션 비전 화면이 100% 작동합니다.
+    // ------------------------------------------------------------------
+    let cloudSimActive = false;
+    let cloudSimCanvas = null;
+    let cloudSimBalls = [
+      { color: 'WHITE', fill: '#f8fafc', x: 160, y: 180, vx: 4.4, vy: -3.1 },
+      { color: 'YELLOW', fill: '#fde047', x: 460, y: 150, vx: 0, vy: 0 },
+      { color: 'RED', fill: '#ef4444', x: 320, y: 110, vx: 0, vy: 0 },
+    ];
+    let cloudCushionCount = 0;
+    let cloudTrail = [];
+
+    function createInitialCloudState() {
+      return {
+        rule_mode: 'STANDARD',
+        fsm_state: 'WAIT_SHOT',
+        current_inning: 1,
+        active_player_id: 'P1',
+        is_match_paused: false,
+        match_timer: { elapsed_sec: matchElapsedSec, is_paused: false },
+        shot_timer: { remaining_sec: 40, default_sec: 40, is_paused: false },
+        players: {
+          P1: {
+            name: '1번 선수',
+            score: 0,
+            innings: 1,
+            average: 0.0,
+            high_run: 0,
+            current_run: 0,
+            bank_shots: 0,
+            timeouts_remaining: 2,
+            target_score: 40,
+            cue_ball_color: 'WHITE',
+          },
+          P2: {
+            name: '2번 선수',
+            score: 0,
+            innings: 0,
+            average: 0.0,
+            high_run: 0,
+            current_run: 0,
+            bank_shots: 0,
+            timeouts_remaining: 2,
+            target_score: 40,
+            cue_ball_color: 'YELLOW',
+          },
+        },
+        inning_history: [{ inning: 1, P1: 0, P2: null }],
+        last_shot_result: {
+          shot_type: 'READY',
+          is_scored: false,
+          message: '클라우드 시뮬레이션 모드 (1번 선수 선공 - 흰공 수구)',
+        },
+      };
+    }
+
+    let cloudState = createInitialCloudState();
+
+    function applyLocalCloudAction(action, payload = {}) {
+      const st = lastScoreboardData || cloudState;
+      const activeId = st.active_player_id || 'P1';
+      const activeP = st.players[activeId];
+      if (action === 'SET_RULE_MODE') {
+        st.rule_mode = payload.rule_mode || 'STANDARD';
+      } else if (action === 'ADJUST_SCORE') {
+        const pid = payload.player_id || activeId;
+        const delta = Number(payload.delta) || 0;
+        const p = st.players[pid];
+        p.score = Math.max(0, (p.score || 0) + delta);
+        if (delta >= 2) p.bank_shots = (p.bank_shots || 0) + 1;
+        if (delta > 0) {
+          p.current_run = (p.current_run || 0) + delta;
+          p.high_run = Math.max(p.high_run || 0, p.current_run);
+          st.shot_timer.remaining_sec = st.shot_timer.default_sec;
+          st.last_shot_result = {
+            shot_id: Date.now(),
+            shot_type: delta >= 2 ? 'BANK_SHOT' : 'REGULAR_3C',
+            is_scored: true,
+            immediate_score: true,
+            cue_ball: p.cue_ball_color,
+            message:
+              delta >= 2
+                ? `득점 성공 (뱅크샷 +2점): ${p.name} 수구 유지!`
+                : `득점 성공 (일반 3쿠션 +1점): ${p.name} 수구 유지!`,
+          };
+        }
+        p.average = p.innings > 0 ? p.score / p.innings : 0;
+        const hist = (st.inning_history || []).find((h) => h.inning === st.current_inning);
+        if (hist) hist[pid] = Math.max(0, (Number(hist[pid]) || 0) + delta);
+      } else if (action === 'SWITCH_TURN') {
+        if (activeId === 'P1') {
+          st.active_player_id = 'P2';
+          st.players.P2.innings = Math.max(1, (st.players.P2.innings || 0) + 1);
+          const hist = (st.inning_history || []).find((h) => h.inning === st.current_inning);
+          if (hist && hist.P2 === null) hist.P2 = 0;
+        } else {
+          st.active_player_id = 'P1';
+          st.current_inning += 1;
+          st.players.P1.innings += 1;
+          st.inning_history.push({ inning: st.current_inning, P1: 0, P2: null });
+        }
+        st.shot_timer.remaining_sec = st.shot_timer.default_sec;
+        const nextP = st.players[st.active_player_id];
+        st.last_shot_result = {
+          shot_id: Date.now(),
+          shot_type: 'MISS',
+          is_scored: false,
+          message: `공격권 교대 -> ${nextP.name} (${nextP.cue_ball_color === 'YELLOW' ? '노란공' : '흰공'} 수구)`,
+        };
+      } else if (action === 'USE_TIMEOUT') {
+        if ((activeP.timeouts_remaining || 0) > 0) {
+          activeP.timeouts_remaining -= 1;
+          st.shot_timer.remaining_sec = Math.min(80, (st.shot_timer.remaining_sec || 40) + 40);
+        }
+      }
+      cloudState = st;
+      renderScoreboard(st);
+    }
+
+    function startCloudCanvasFallback() {
+      if (cloudSimActive) return;
+      cloudSimActive = true;
+      const pill = document.getElementById('wsStatusPill');
+      const text = document.getElementById('wsStatusText');
+      if (pill && text) {
+        pill.classList.remove('disconnected');
+        text.textContent = '클라우드 데모 가동 중';
+      }
+      if (!lastScoreboardData) {
+        renderScoreboard(cloudState);
+      }
+
+      cloudSimCanvas = document.createElement('canvas');
+      cloudSimCanvas.width = 640;
+      cloudSimCanvas.height = 360;
+      const ctx = cloudSimCanvas.getContext('2d');
+      const streamImg = document.getElementById('camStreamImg');
+
+      function stepSim() {
+        if (!cloudSimActive) return;
+        ctx.fillStyle = '#072f5f';
+        ctx.fillRect(0, 0, 640, 360);
+        ctx.strokeStyle = '#0ea5e9';
+        ctx.lineWidth = 10;
+        ctx.strokeRect(18, 18, 604, 324);
+
+        const cue = cloudSimBalls[0];
+        cue.x += cue.vx;
+        cue.y += cue.vy;
+        if (cue.x <= 32 || cue.x >= 608) {
+          cue.vx *= -1;
+          cloudCushionCount = (cloudCushionCount % 4) + 1;
+        }
+        if (cue.y <= 32 || cue.y >= 328) {
+          cue.vy *= -1;
+          cloudCushionCount = (cloudCushionCount % 4) + 1;
+        }
+        cloudTrail.push({ x: cue.x, y: cue.y });
+        if (cloudTrail.length > 55) cloudTrail.shift();
+
+        ctx.beginPath();
+        cloudTrail.forEach((pt, idx) => {
+          if (idx === 0) ctx.moveTo(pt.x, pt.y);
+          else ctx.lineTo(pt.x, pt.y);
+        });
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.75)';
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+
+        cloudSimBalls.forEach((b) => {
+          ctx.beginPath();
+          ctx.arc(b.x, b.y, 11, 0, Math.PI * 2);
+          ctx.fillStyle = b.fill;
+          ctx.fill();
+          ctx.strokeStyle = '#0f172a';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        });
+
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.82)';
+        ctx.fillRect(28, 28, 320, 32);
+        ctx.fillStyle = '#38bdf8';
+        ctx.font = 'bold 13px sans-serif';
+        ctx.fillText(
+          `CUE24 AI Vision [Polylines & LAB Hungarian] · 쿠션: ${cloudCushionCount}`,
+          38,
+          49
+        );
+
+        if (streamImg) {
+          streamImg.src = cloudSimCanvas.toDataURL('image/jpeg', 0.82);
+        }
+        setTimeout(stepSim, 100);
+      }
+      stepSim();
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      const streamImg = document.getElementById('camStreamImg');
+      if (streamImg) {
+        streamImg.addEventListener('error', () => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            startCloudCanvasFallback();
+          }
+        });
+      }
+      renderInningSheet([], '1번 선수', '2번 선수', 1);
+      startLocalMatchTimerLoop();
+      initCamInteractiveEvents();
+      connectWebSocket();
+    });
+  </script>
+</body>
+</html>
