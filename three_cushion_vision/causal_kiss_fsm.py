@@ -91,6 +91,7 @@ class ShotResult:
     fail_reason: Optional[str] = None
     event_log: List[str] = field(default_factory=list)
     already_dispatched: bool = False
+    shot_event_tokens: List[str] = field(default_factory=list)
 
     @property
     def cue_ball(self) -> BallColor:
@@ -125,24 +126,27 @@ class CausalKissSafeFSM:
     초단순·고신뢰 3쿠션 판정 유한 상태 머신(FSM)입니다.
     """
 
-    # 원리 1: 수구 출발 및 정지 감지 상수
+    # 원리 1 & 기술 2: 수구 출발 및 정지 스냅샷 대조 상수
     STROKE_START_SPEED: float = 160.0
     STOP_SPEED: float = 18.0
-    MIN_STROKE_DISP_MM: float = 22.0
+    MIN_STROKE_DISP_MM: float = 20.0
     MIN_VALID_SHOT_TRAVEL_MM: float = 120.0
 
-    # 원리 2: cv2.approxPolyDP 폴리라인 쿠션 꼭짓점 상수
+    # 원리 2 & 기술 3: 구간별 선형 회귀(approxPolyDP) + 충돌 평면 광선 교차 쿠션 상수
     POLY_EPSILON_CUSHION_MM: float = 18.0
     POLY_MIN_CUSHION_BEND_DEG: float = 10.0
     RAIL_VERTEX_ZONE_MM: float = 125.0
+    RAIL_KINEMATIC_ZONE: float = 115.0
     RAIL_ENTER_MARGIN: float = 54.0
     SAME_RAIL_DEEP_EXIT_MM: float = 220.0
 
-    # 원리 3: 목적구 위치 이탈 및 얇은 스침 꼭짓점 판정 상수
+    # 원리 3 & 기술 4: 정지 앵커 이탈(증거 A) 및 직선 파괴(Line-Fit RMSE, 증거 B) 상수
     TARGET_APPROACH_ZONE_MM: float = 72.0
-    TARGET_MOVED_DISP_TH_MM: float = 5.5
-    THIN_HIT_MAX_DIST_MM: float = 65.5
-    THIN_HIT_MIN_BEND_DEG: float = 4.2
+    TARGET_MOVED_DISP_TH_MM: float = 5.2
+    TARGET_MIN_DELTA_V_MM_S: float = 42.0
+    THIN_HIT_MAX_DIST_MM: float = 66.5
+    THIN_HIT_MIN_BEND_DEG: float = 4.0
+    THIN_HIT_MIN_LINE_RMSE_MM: float = 1.6
     PAIR_COOLDOWN_SEC: float = 0.08
 
     # 투터치 및 블롭 병합 방어 상수
@@ -182,11 +186,14 @@ class CausalKissSafeFSM:
         self.frame_counter: int = 0
         self.rest_pos: Dict[BallColor, np.ndarray] = {}
         self.idle_anchor_pos: Dict[BallColor, np.ndarray] = self.rest_pos
+        self.target_rest_anchor: Dict[BallColor, np.ndarray] = {}
         self.onset_candidate_time: Dict[BallColor, Optional[float]] = {
             BallColor.WHITE: None,
             BallColor.YELLOW: None,
         }
+        self.onset_time: Dict[BallColor, Optional[float]] = self.onset_candidate_time
         self.first_mover_from_idle: Optional[BallColor] = None
+        self.shot_event_tokens: List[str] = []
         self._reset_shot()
 
     def _reset_shot(self) -> None:
@@ -237,11 +244,16 @@ class CausalKissSafeFSM:
         self.centroid_clamp_cooldown: Dict[BallColor, int] = {c: 0 for c in BallColor}
         self._pending_immediate_result: Optional[ShotResult] = None
         self.rest_pos.clear()
+        self.target_rest_anchor.clear()
         self.onset_candidate_time = {
             BallColor.WHITE: None,
             BallColor.YELLOW: None,
         }
+        self.onset_time = self.onset_candidate_time
         self.first_mover_from_idle = None
+        self.shot_event_tokens = []
+        self._kiss_token_count: int = 0
+        self.last_hit_rail: Optional[Rail] = None
 
     @staticmethod
     def _angle_between_deg(v1: np.ndarray, v2: np.ndarray) -> float:

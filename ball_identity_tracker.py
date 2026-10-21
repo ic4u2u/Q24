@@ -1,11 +1,17 @@
 """
-[조명 불변 3구 상대 색도 랭킹 + 정지 앵커 ID 고정기]
+[특허 US20210170261A1 & PMC11183222 기반 조명 불변 3구 식별기]
 파일 경로: ball_identity_tracker.py
 
-1) 적색도(a* 및 R-G) 1위 공을 RED로 먼저 분리하고,
-2) 나머지 두 공 중 황색도(b* + HSV 채도 + Blue 결핍도) 상대 비교로 WHITE와 YELLOW를 100% 구분합니다.
-3) 세 공이 정지해 있는 IDLE 구간에서 각 공의 정지 위치(locked_stationary_pos_px)와 색상 ID를 고정하여
-   스트로크 순간 모션 블러가 발생해도 출발한 공의 색상 ID가 바뀌지 않도록 보장합니다.
+핵심 기술:
+1) YCbCr Cb 크로마키 라사지 배경 제거 (PMC11183222):
+   Cb = 128 - 0.148*R - 0.291*G + 0.439*B 색차 공식으로 파란색/초록색 당구대 천(Cloth) 픽셀과
+   상위 22% 천장 조명 반사광(Glare) 픽셀을 원천 배제합니다.
+2) 상대 색도 랭킹 (Relative Chromaticity Ranking):
+   3개의 공 중 적색도(a* 및 R-G) 1위를 무조건 RED로 먼저 분리하고,
+   남은 두 공 중 황색도(b* + 채도 S + Blue 결핍도) 비교로 YELLOW와 WHITE를 100% 구분합니다.
+3) 중첩 공 타원 장축 분해 (split_merged_oval_blob):
+   두 공이 키스하여 하나의 길쭉한 바운딩 박스(장축/단축 비율 >= 1.45)로 병합되었을 때,
+   타원 중심에서 장축 방향 양 끝(+-0.25 * 장축 길이)으로 두 개의 서브 박스를 분리합니다.
 """
 
 from itertools import permutations
@@ -17,11 +23,69 @@ import numpy as np
 from three_cushion_vision.causal_kiss_fsm import BallColor
 
 
+def split_merged_oval_blob(
+    bbox_xyxy: Tuple[float, float, float, float],
+    contour: Optional[np.ndarray] = None,
+    aspect_ratio_thresh: float = 1.45,
+) -> List[Tuple[float, float, float, float]]:
+    """
+    [기술 1-3: 중첩 공 타원 장축 분해]
+    두 공이 키스/밀착하여 하나의 길쭉한 바운딩 박스(장축/단축 비율 >= 1.45)로 병합되었을 때,
+    타원의 중심에서 장축 방향 양 끝(+- 0.25 * 장축 길이)으로 두 개의 서브 박스를 분리합니다.
+    """
+    x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+    w = max(1.0, x2 - x1)
+    h = max(1.0, y2 - y1)
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+
+    if contour is not None and len(contour) >= 5:
+        try:
+            (ecx, ecy), (ma_1, ma_2), angle_deg = cv2.fitEllipse(contour)
+            major_len = float(max(ma_1, ma_2))
+            minor_len = float(max(1.0, min(ma_1, ma_2)))
+            if major_len / minor_len >= aspect_ratio_thresh:
+                # OpenCV fitEllipse에서 angle_deg는 단축(ma_1) 기준 시계 방향 각도이므로 장축 방향 벡터 산출
+                rad = np.deg2rad(angle_deg + (90.0 if ma_2 >= ma_1 else 0.0))
+                ux, uy = float(np.cos(rad)), float(np.sin(rad))
+                offset = 0.25 * major_len
+                r = minor_len * 0.5
+                c1x, c1y = float(ecx) - offset * ux, float(ecy) - offset * uy
+                c2x, c2y = float(ecx) + offset * ux, float(ecy) + offset * uy
+                return [
+                    (c1x - r, c1y - r, c1x + r, c1y + r),
+                    (c2x - r, c2y - r, c2x + r, c2y + r),
+                ]
+        except cv2.error:
+            pass
+
+    major_len = max(w, h)
+    minor_len = min(w, h)
+    if (major_len / max(minor_len, 1e-6)) < aspect_ratio_thresh:
+        return [(x1, y1, x2, y2)]
+
+    offset = 0.25 * major_len
+    r = minor_len * 0.5
+    if w >= h:
+        c1x, c1y = cx - offset, cy
+        c2x, c2y = cx + offset, cy
+    else:
+        c1x, c1y = cx, cy - offset
+        c2x, c2y = cx, cy + offset
+
+    return [
+        (c1x - r, c1y - r, c1x + r, c1y + r),
+        (c2x - r, c2y - r, c2x + r, c2y + r),
+    ]
+
+
 class LabHungarianBallIdentifier:
     """
-    [조명 불변 3구 상대 색도 랭킹 + 정지 앵커 ID 고정기]
-    1) 적색도(a* 및 R-G) 1위 공을 RED로 먼저 분리하고,
-    2) 나머지 두 공 중 황색도(b* + HSV 채도 + Blue 결핍도) 상대 비교로 WHITE와 YELLOW를 100% 구분합니다.
+    [특허 US20210170261A1 & PMC11183222 기반 3구 정밀 식별기]
+    1) YCbCr Cb 색차 공식(Cb = 128 - 0.148R - 0.291G + 0.439B)으로 라사지 배경 및 상위 22% 반사광 제거
+    2) 적색도(a* 및 R-G) 1위 공을 RED로 먼저 분리하고,
+       나머지 두 공 중 황색도(b* + HSV 채도 + Blue 결핍도) 비교로 WHITE와 YELLOW를 100% 구분
+    3) split_merged_oval_blob으로 중첩된 타원형 블롭(장축/단축 >= 1.45)을 2개의 서브 박스로 자동 분해
     """
 
     def __init__(self) -> None:
@@ -33,6 +97,19 @@ class LabHungarianBallIdentifier:
         """이전 프레임 위치 및 정지 앵커 위치 이력을 초기화합니다."""
         self.prev_positions_px.clear()
         self.locked_stationary_pos_px.clear()
+
+    @staticmethod
+    def split_merged_oval_blob(
+        bbox_xyxy: Tuple[float, float, float, float],
+        contour: Optional[np.ndarray] = None,
+        aspect_ratio_thresh: float = 1.45,
+    ) -> List[Tuple[float, float, float, float]]:
+        """장축/단축 비율 >= 1.45인 병합 바운딩 박스를 장축 방향 +-0.25*장축길이 두 서브 박스로 분리합니다."""
+        return split_merged_oval_blob(
+            bbox_xyxy=bbox_xyxy,
+            contour=contour,
+            aspect_ratio_thresh=aspect_ratio_thresh,
+        )
 
     def lock_stationary_anchors(
         self, assigned_boxes: Dict[BallColor, Tuple[float, float, float, float]]
@@ -48,7 +125,9 @@ class LabHungarianBallIdentifier:
         self, frame_bgr: np.ndarray, bbox_xyxy: Tuple[float, float, float, float]
     ) -> Tuple[float, float, np.ndarray]:
         """
-        반환값: (redness_score, yellowness_score, lab_median)
+        [기술 1-1 & 1-2]
+        PMC11183222 YCbCr Cb 공식(Cb = 128 - 0.148R - 0.291G + 0.439B)으로 당구대 라사지 배경 픽셀과
+        상위 22% 조명 반사광(Glare)을 배제한 뒤 (redness_score, yellowness_score, lab_median)을 반환합니다.
         """
         h_img, w_img = frame_bgr.shape[:2]
         x1, y1, x2, y2 = [int(round(v)) for v in bbox_xyxy]
@@ -70,6 +149,21 @@ class LabHungarianBallIdentifier:
         lab_px = lab[circle_mask]
         hsv_px = hsv[circle_mask]
         bgr_px = bgr[circle_mask]
+
+        B_arr = bgr_px[:, 0]
+        G_arr = bgr_px[:, 1]
+        R_arr = bgr_px[:, 2]
+
+        # [PMC11183222] YCbCr 색차 공식: Cb = 128 - 0.148*R - 0.291*G + 0.439*B
+        cb_vals = 128.0 - 0.148 * R_arr - 0.291 * G_arr + 0.439 * B_arr
+        is_blue_cloth = (cb_vals > 142.0) & ((B_arr - R_arr) > 35.0)
+        is_green_cloth = (cb_vals < 110.0) & ((G_arr - R_arr) > 25.0) & ((G_arr - B_arr) > 20.0)
+        non_cloth_mask = ~(is_blue_cloth | is_green_cloth)
+
+        if np.count_nonzero(non_cloth_mask) >= 6:
+            lab_px = lab_px[non_cloth_mask]
+            hsv_px = hsv_px[non_cloth_mask]
+            bgr_px = bgr_px[non_cloth_mask]
 
         # 천장 조명 하이라이트(상위 22% L*) 및 하단 그림자(하위 15% L*) 제거
         l_vals = lab_px[:, 0]
@@ -100,7 +194,7 @@ class LabHungarianBallIdentifier:
     def extract_glare_free_lab(
         self, frame_bgr: np.ndarray, bbox_xyxy: Tuple[float, float, float, float]
     ) -> np.ndarray:
-        """하이라이트 및 그림자를 제거한 CIE LAB 중앙값 벡터를 반환합니다."""
+        """하이라이트 및 라사지 배경을 제거한 CIE LAB 중앙값 벡터를 반환합니다."""
         _, _, med_lab = self.extract_color_metrics(frame_bgr, bbox_xyxy)
         return med_lab
 
@@ -113,8 +207,17 @@ class LabHungarianBallIdentifier:
         if not bboxes_xyxy:
             return {}
 
-        n_det = min(len(bboxes_xyxy), 3)
-        bboxes = bboxes_xyxy[:n_det]
+        # 만약 2개의 바운딩 박스만 검출되었는데 그중 하나가 키스로 병합된 타원 블롭(장축/단축 >= 1.45)이면 자동 분해
+        expanded_bboxes: List[Tuple[float, float, float, float]] = []
+        if len(bboxes_xyxy) < 3:
+            for box in bboxes_xyxy:
+                sub_boxes = self.split_merged_oval_blob(box)
+                expanded_bboxes.extend(sub_boxes)
+        else:
+            expanded_bboxes = list(bboxes_xyxy)
+
+        n_det = min(len(expanded_bboxes), 3)
+        bboxes = expanded_bboxes[:n_det]
         metrics = [self.extract_color_metrics(frame_bgr, box) for box in bboxes]
         centers = [
             np.array([(box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5])
@@ -131,8 +234,6 @@ class LabHungarianBallIdentifier:
             i1, i2 = rem_indices[0], rem_indices[1]
             y_score_1, y_score_2 = metrics[i1][1], metrics[i2][1]
 
-            # 만약 두 공의 색상 차이가 뚜렷하면(> 12.0) 상대 랭킹을 최우선 적용하고,
-            # 모션 블러로 색상이 흐려졌을 때만 이전 프레임 위치 연속성(Hungarian Motion)으로 보완
             if abs(y_score_1 - y_score_2) > 12.0 or (
                 BallColor.WHITE not in self.prev_positions_px
             ):
@@ -167,7 +268,6 @@ class LabHungarianBallIdentifier:
         cost_matrix = np.zeros((3, n_det), dtype=np.float32)
         for d_i in range(n_det):
             r_sc, y_sc, _ = metrics[d_i]
-            # 색상별 비용 산출
             c_costs = {
                 BallColor.RED: -r_sc,
                 BallColor.YELLOW: -y_sc + max(0.0, r_sc * 0.5),
