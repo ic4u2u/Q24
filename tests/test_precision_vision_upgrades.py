@@ -315,9 +315,122 @@ def test_literature_5_algorithms_integration() -> None:
     )
 
 
+def test_micro_contact_4factor_forensics_vs_near_miss() -> None:
+    """
+    5. [4중 교차 초미세 접촉 감식기 (Micro-Contact Forensics Engine) 극한 벤치마크]
+    - Case A (진짜 0.3mm 초미세 스침 득점):
+      제2적구(YELLOW)가 충돌 법선 방향으로 단 1.4mm 밀려나고 수구가 반대 법선 방향으로 2.2도 국소 굴절된 경우 -> 100% 득점(scored=True) 인식!
+    - Case B (종이 한 장 차이 불발 + 카메라 지터 2.0mm):
+      수구가 d_min=62.5mm로 아슬아슬하게 스쳐 지나가고, 마침 그 순간 제2적구 바운딩 박스가 카메라 노이즈로 2.0mm(수구 쪽으로 끌려오거나 1프레임 스파이크 후 복귀) 튄 경우 -> 100% 불발(scored=False) 차단!
+    - Case C (수구 스핀 커브 + 허공 스침 불발):
+      수구가 매 프레임 2.3도씩 완만하게 휘어지는 회전(스핀) 커브로 제2적구 옆 63.0mm를 지나가고 제2적구에 미세 진동(1.5mm 비법선 지터)이 섞인 경우 -> 100% 불발(scored=False) 차단!
+    """
+    from cue24.core.scoring_engine import ScoringEngine
+
+    def _build_base_3c_prefix():
+        return [
+            (0.00, (400.0, 700.0),  (2100.0, 500.0), (700.0, 700.0)),
+            (0.03, (560.0, 700.0),  (2100.0, 500.0), (700.0, 700.0)),
+            (0.06, (655.0, 695.0),  (2100.0, 500.0), (700.0, 700.0)),  # 제1적구(RED) 타격
+            (0.09, (840.0, 420.0),  (2100.0, 500.0), (760.0, 745.0)),
+            (0.12, (1050.0, 45.0),  (2100.0, 500.0), (795.0, 770.0)),  # 1쿠션(TOP)
+            (0.15, (1650.0, 380.0), (2100.0, 500.0), (810.0, 780.0)),
+            (0.18, (2350.0, 780.0), (2100.0, 500.0), (815.0, 785.0)),
+            (0.21, (2802.0, 1080.0),(2100.0, 500.0), (815.0, 785.0)),  # 2쿠션(RIGHT)
+            (0.24, (2450.0, 1382.0),(2100.0, 500.0), (815.0, 785.0)),  # 3쿠션(BOTTOM)
+            (0.27, (2300.0, 960.0), (2100.0, 500.0), (815.0, 785.0)),
+            (0.30, (2230.0, 760.0), (2100.0, 500.0), (815.0, 785.0)),
+        ]
+
+    # ------------------------------------------------------------------
+    # Case A: 진짜 0.3mm 초미세 스침 (제2적구가 법선 방향(-x)으로 1.45mm 밀려나고 유지, 수구는 +x 쪽으로 2.3도 반작용 굴절)
+    # ------------------------------------------------------------------
+    fsm_a = CausalKissSafeFSM(fps=30.0, assigned_cue_ball=BallColor.WHITE)
+    eng_a = ScoringEngine()
+    eng_a.reset_shot(cue_ball_id=1, object_ball_ids=[2, 3])
+
+    # 수구가 (2161.2, 500.0)을 지나며 제2적구(2100.0, 500.0)의 오른쪽 옆구리를 0.3mm 두께로 얇게 스침!
+    # 충돌 법선 n_xy = (-1.0, 0.0) -> 제2적구는 왼쪽(-x)으로 1.45mm 밀려나고(2098.55, 500.0), 수구는 오른쪽(+x)으로 2.3도 굴절!
+    frames_a = _build_base_3c_prefix() + [
+        (0.33, (2195.6, 630.0), (2100.0, 500.0),   (815.0, 785.0)),
+        (0.36, (2161.2, 500.0), (2100.0, 500.0),   (815.0, 785.0)),  # 초미세 접촉 시점 (d_min = 61.2mm)
+        (0.39, (2132.2, 370.0), (2098.6, 499.8),   (815.0, 785.0)),  # 수구 +x 반작용 굴절(2.3도) & 제2적구 -x 법선 밀림 1.41mm
+        (0.42, (2103.2, 240.0), (2098.5, 499.7),   (815.0, 785.0)),  # 단방향 관성 지속 유지 (1.53mm)
+    ]
+
+    res_a = None
+    for idx_f, (t, w_p, y_p, r_p) in enumerate(frames_a):
+        out = fsm_a.update(t, {BallColor.WHITE: w_p, BallColor.YELLOW: y_p, BallColor.RED: r_p})
+        if out is not None and not out.already_dispatched:
+            res_a = out
+        eng_a.update_frame(idx_f + 1, {1: w_p, 2: y_p, 3: r_p})
+
+    eval_a = eng_a.evaluate_shot()
+    assert res_a is not None and res_a.scored is True, "Case A 실패: 진짜 0.3mm 초미세 스침(1.45mm 법선 밀림)이 득점으로 인식되지 않았습니다!"
+    assert eval_a["is_scored"] is True, f"Case A ScoringEngine 실패: {eval_a}"
+
+    # ------------------------------------------------------------------
+    # Case B: 아슬아슬한 불발(d_min=62.5mm) + 카메라 지터 2.1mm (수구 쪽인 +x로 끌려오거나 엉뚱한 방향 스파이크 후 원위치 복귀)
+    # ------------------------------------------------------------------
+    fsm_b = CausalKissSafeFSM(fps=30.0, assigned_cue_ball=BallColor.WHITE)
+    eng_b = ScoringEngine()
+    eng_b.reset_shot(cue_ball_id=1, object_ball_ids=[2, 3])
+
+    frames_b = _build_base_3c_prefix() + [
+        (0.33, (2196.2, 630.0), (2100.0, 500.0),   (815.0, 785.0)),
+        (0.36, (2162.5, 500.0), (2100.0, 500.0),   (815.0, 785.0)),  # 종이 한 장 차이 불발 (d_min = 62.5mm)
+        (0.39, (2133.5, 370.0), (2102.1, 500.4),   (815.0, 785.0)),  # 카메라 지터로 오히려 수구 쪽(+x)으로 2.14mm 튐! (비인과적 방향)
+        (0.42, (2104.5, 240.0), (2100.1, 500.0),   (815.0, 785.0)),  # 다음 프레임 다시 원위치로 복귀 (1프레임 스파이크)
+    ]
+
+    res_b = None
+    for idx_f, (t, w_p, y_p, r_p) in enumerate(frames_b):
+        out = fsm_b.update(t, {BallColor.WHITE: w_p, BallColor.YELLOW: y_p, BallColor.RED: r_p})
+        if out is not None and not out.already_dispatched:
+            res_b = out
+        eng_b.update_frame(idx_f + 1, {1: w_p, 2: y_p, 3: r_p})
+
+    eval_b = eng_b.evaluate_shot()
+    assert res_b is None, f"Case B 실패: 비인과적 카메라 지터(2.1mm)에 의한 허공 스침이 득점으로 오인되었습니다! ({res_b})"
+    assert eval_b["is_scored"] is False, f"Case B ScoringEngine 실패: {eval_b}"
+
+    # ------------------------------------------------------------------
+    # Case C: 수구 스핀 커브(매 프레임 2.5도 균일 휨) + 허공 스침 불발
+    # ------------------------------------------------------------------
+    fsm_c = CausalKissSafeFSM(fps=30.0, assigned_cue_ball=BallColor.WHITE)
+    eng_c = ScoringEngine()
+    eng_c.reset_shot(cue_ball_id=1, object_ball_ids=[2, 3])
+
+    frames_c = _build_base_3c_prefix() + [
+        (0.33, (2192.0, 630.0), (2100.0, 500.0),   (815.0, 785.0)),  # 이미 전 구간부터 2.5도씩 휘어지는 스핀 커브
+        (0.36, (2163.0, 500.0), (2100.0, 500.0),   (815.0, 785.0)),  # 제2적구 옆 63.0mm 통과 (접촉 없음)
+        (0.39, (2139.5, 370.0), (2099.4, 501.5),   (815.0, 785.0)),  # 동일 곡률로 계속 휘어짐 + 수직 방향 미세 노이즈
+        (0.42, (2121.5, 240.0), (2099.8, 500.2),   (815.0, 785.0)),
+    ]
+
+    res_c = None
+    for idx_f, (t, w_p, y_p, r_p) in enumerate(frames_c):
+        out = fsm_c.update(t, {BallColor.WHITE: w_p, BallColor.YELLOW: y_p, BallColor.RED: r_p})
+        if out is not None and not out.already_dispatched:
+            res_c = out
+        eng_c.update_frame(idx_f + 1, {1: w_p, 2: y_p, 3: r_p})
+
+    eval_c = eng_c.evaluate_shot()
+    assert res_c is None, f"Case C 실패: 수구 스핀 커브에 의한 허공 통과가 미세접촉 득점으로 오인되었습니다! ({res_c})"
+    assert eval_c["is_scored"] is False, f"Case C ScoringEngine 실패: {eval_c}"
+
+    print(
+        "[PASS] Test 5 (4중 교차 초미세 접촉 감식기): "
+        "Case A(0.3mm 스침 1.45mm 법선밀림 -> 득점 확정) / "
+        "Case B(2.1mm 비인과 지터 불발 -> 100% 기각) / "
+        "Case C(스핀 커브 불발 -> 100% 기각) 완벽 통과!"
+    )
+
+
 if __name__ == "__main__":
     test_3d_ray_plane_vs_2d_homography()
     test_subpixel_phase_correlate_0_1px_kiss()
     test_motion_streak_v_apex_detection()
     test_literature_5_algorithms_integration()
+    test_micro_contact_4factor_forensics_vs_near_miss()
     print("\n=== 4대 고성능 비전 판독 기술 + 문헌 기반 5대 핵심 알고리즘 통합 검증 전체 PASS 완료! ===")

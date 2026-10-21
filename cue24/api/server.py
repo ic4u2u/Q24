@@ -129,8 +129,8 @@ class LiveStreamReader:
     VISION_START_DISP_MM: float = 14.0
     MOTION_BLUR_CIRC_TH: float = 0.42
     # 테스트 녹화 영상(J:\내 드라이브\L-billiard.mp4)에서 경기 초기화/화면 리플레시 즉시 3구 색상 잠금 ->
-    # 1이닝 선공(흰공) 초구 브레이크샷 -> 1이닝 후공(노란공) 쓰리뱅크샷 득점 -> 연속 경기가 이어지는 시작 프레임
-    ACTIVE_SHOT_START_FRAME: int = 620
+    # 선공(흰공) 5쿠션 즉시 득점 -> 후공(노란공) 3쿠션 즉시 득점 -> 선공(흰공) 5쿠션 뱅크샷 즉시 득점이 이어지는 시작 프레임
+    ACTIVE_SHOT_START_FRAME: int = 7920
 
     def __init__(
         self,
@@ -1517,17 +1517,6 @@ class LiveStreamReader:
                         }
                         cue_origin = rest_vpos[shooter_vcol].copy()
                         self.causal_kiss_fsm.stroke_origin_pos = cue_origin
-                        self.causal_kiss_fsm.cue_path = [
-                            (float(cue_origin[0]), float(cue_origin[1]))
-                        ]
-                        cur_cue_pt = np.array(
-                            [float(cue_state.position[0]), float(cue_state.position[1])],
-                            dtype=np.float64,
-                        )
-                        stroke_vec = cur_cue_pt - cue_origin
-                        s_norm = float(np.linalg.norm(stroke_vec))
-                        if s_norm > 1e-6:
-                            self.causal_kiss_fsm.initial_stroke_dir = stroke_vec / s_norm
                     self.causal_kiss_fsm.update(
                         t=t_init,
                         coords_mm=init_vpos,
@@ -1741,32 +1730,40 @@ class LiveStreamReader:
                         int(maybe_causal.cushions_at_second_hit)
                         if maybe_causal is not None
                         else int(self.causal_kiss_fsm.cushions_at_second_hit),
-                        int(self.scoring_engine.total_cushion_count),
                     )
                 else:
-                    cush_before_1st = max(
-                        int(self.scoring_engine.cushion_count_before_first_hit),
-                        int(maybe_causal.cushions_before_first_hit)
-                        if maybe_causal is not None
-                        else int(self.causal_kiss_fsm.cushions_before_first_hit),
-                    )
+                    if self.causal_kiss_fsm.first_target_ball is not None or maybe_causal is not None:
+                        cush_before_1st = (
+                            int(maybe_causal.cushions_before_first_hit)
+                            if maybe_causal is not None
+                            else int(self.causal_kiss_fsm.cushions_before_first_hit)
+                        )
+                    else:
+                        cush_before_1st = int(self.scoring_engine.cushion_count_before_first_hit)
                     is_bank = bool(cush_before_1st >= 1)
                     cush_at_2nd = max(
+                        3,
                         int(self.scoring_engine.cushion_count_before_second_hit),
                         int(maybe_causal.cushions_at_second_hit) if maybe_causal is not None else 3,
                     )
                 tot_cush = cush_at_2nd
-                bank_tag = "뱅크샷 " if is_bank else ""
+                if is_bank:
+                    if cush_before_1st >= cush_at_2nd:
+                        seq_msg = f"{cush_at_2nd}쿠션 ⇒ 1적구 ⇒ 2적구 ⇒ 뱅크샷성공"
+                    else:
+                        seq_msg = f"{cush_before_1st}쿠션 ⇒ 1적구 ⇒ {cush_at_2nd}쿠션 ⇒ 2적구 ⇒ 뱅크샷성공"
+                else:
+                    seq_msg = f"1적구 ⇒ {cush_at_2nd}쿠션 ⇒ 2적구 ⇒ 득점성공"
                 immediate_eval = {
                     "is_scored": True,
                     "shot_type": "BANK_SHOT" if is_bank else "REGULAR_3C",
                     "reason_code": "IMMEDIATE_SECOND_BALL_HIT",
-                    "message": (
-                        f"⚡ 제2적구 충돌 즉시 득점! ({bank_tag}{cush_at_2nd}쿠션 충족 실시간 +1 반영)"
-                    ),
+                    "message": seq_msg,
                     "cushions_before_first_hit": cush_before_1st,
                     "cushions_before_second_hit": cush_at_2nd,
                     "total_cushions": tot_cush,
+                    "first_ball_hit": True,
+                    "second_ball_hit": True,
                 }
                 imm_transition = self.match_manager.on_immediate_second_ball_hit(
                     immediate_eval
@@ -1780,29 +1777,51 @@ class LiveStreamReader:
                 or len(self.scoring_engine.events) != prev_events_count
                 or len(self.causal_kiss_fsm.event_log) != prev_causal_events_count
             ):
-                hit1 = (
-                    "접촉완료"
-                    if (
-                        self.causal_kiss_fsm.first_target_ball is not None
-                        or self.scoring_engine.first_object_ball_id is not None
-                    )
-                    else "대기"
+                b1_done = bool(
+                    self.causal_kiss_fsm.first_target_ball is not None
+                    or self.scoring_engine.first_object_ball_id is not None
                 )
-                hit2 = (
-                    "접촉완료"
-                    if (
-                        self.causal_kiss_fsm.second_target_ball is not None
-                        or self.scoring_engine.second_object_ball_id is not None
+                b2_done = bool(
+                    self.causal_kiss_fsm.second_target_ball is not None
+                    or self.scoring_engine.second_object_ball_id is not None
+                )
+                if self.causal_kiss_fsm.first_target_ball is not None:
+                    c_before_now = int(self.causal_kiss_fsm.cushions_before_first_hit)
+                elif require_rest_displacement:
+                    c_before_now = int(self.causal_kiss_fsm.cushions_before_first_hit)
+                else:
+                    c_before_now = max(
+                        int(self.causal_kiss_fsm.cushions_before_first_hit),
+                        int(self.scoring_engine.cushion_count_before_first_hit),
                     )
-                    else "대기"
+                tot_c_now = (
+                    int(self.causal_kiss_fsm.cushion_count)
+                    if require_rest_displacement
+                    else max(
+                        int(self.scoring_engine.total_cushion_count),
+                        int(self.causal_kiss_fsm.cushion_count),
+                    )
                 )
                 fsm_val = self.scoring_engine.fsm_state.value
                 if fsm_val == "VALID_SCORE_PENDING" or self.causal_kiss_fsm.score_dispatched:
-                    fsm_ko = "즉시득점완료(3쿠션충족)"
+                    fsm_ko = "즉시득점완료"
                 elif fsm_val == "NO_SCORE_LOCKED":
-                    fsm_ko = "노카운트잠금(조기키스)"
+                    fsm_ko = "조기키스잠금"
                 else:
                     fsm_ko = "진행중"
+
+                if c_before_now >= 1:
+                    if not b1_done:
+                        live_seq = f"{tot_c_now}쿠션 ⇒ 1적구(대기) ⇒ 2적구(대기)"
+                    elif tot_c_now > c_before_now:
+                        live_seq = f"{c_before_now}쿠션 ⇒ 1적구 ⇒ {tot_c_now}쿠션 ⇒ 2적구({'접촉' if b2_done else '대기'})"
+                    else:
+                        live_seq = f"{c_before_now}쿠션 ⇒ 1적구 ⇒ 2적구({'접촉' if b2_done else '대기'})"
+                else:
+                    if not b1_done:
+                        live_seq = f"1적구(대기) ⇒ {tot_c_now}쿠션 ⇒ 2적구(대기)"
+                    else:
+                        live_seq = f"1적구 ⇒ {tot_c_now}쿠션 ⇒ 2적구({'접촉' if b2_done else '대기'})"
 
                 if not self.match_manager.score_dispatched_for_current_shot:
                     self.match_manager.last_shot_result = {
@@ -1811,15 +1830,15 @@ class LiveStreamReader:
                         "shot_type": "IN_PROGRESS",
                         "reason_code": "TRACKING",
                         "fsm_state": fsm_val,
-                        "message": (
-                            f"실시간 추적 중[{fsm_ko}]: {self.scoring_engine.total_cushion_count}쿠션 "
-                            f"| 제1적구({hit1}) / 제2적구({hit2})"
-                        ),
+                        "message": f"실시간 추적 중[{fsm_ko}]: {live_seq}",
+                        "cushions_before_first_hit": c_before_now,
                         "cushions_before_second_hit": max(
                             int(self.scoring_engine.cushion_count_before_second_hit),
                             int(self.causal_kiss_fsm.cushions_at_second_hit),
                         ),
-                        "total_cushions": int(self.scoring_engine.total_cushion_count),
+                        "total_cushions": tot_c_now,
+                        "first_ball_hit": b1_done,
+                        "second_ball_hit": b2_done,
                     }
                 await self.ws_manager.broadcast_event(
                     "SCORE_UPDATED", self.match_manager.get_match_payload()
@@ -1893,6 +1912,16 @@ class LiveStreamReader:
                     shot_eval["cushions_before_first_hit"] = int(causal_res.cushions_before_first_hit)
                     shot_eval["cushions_before_second_hit"] = int(causal_res.cushions_at_second_hit)
                     shot_eval["total_cushions"] = final_tot_cush
+                    shot_eval["first_ball_hit"] = bool(
+                        self.causal_kiss_fsm.first_target_ball is not None
+                        or self.scoring_engine.first_object_ball_id is not None
+                        or is_valid_causal
+                    )
+                    shot_eval["second_ball_hit"] = bool(
+                        self.causal_kiss_fsm.second_target_ball is not None
+                        or self.scoring_engine.second_object_ball_id is not None
+                        or is_valid_causal
+                    )
                     if is_valid_causal:
                         is_bank_final = bool(
                             causal_res.is_bank_shot or causal_res.cushions_before_first_hit >= 1
@@ -1901,14 +1930,17 @@ class LiveStreamReader:
                         shot_eval["reason_code"] = (
                             "VALID_BANK_SHOT" if is_bank_final else "VALID_REGULAR_3C"
                         )
-                        c_b2 = max(3, int(causal_res.cushions_at_second_hit), final_tot_cush)
+                        c_b1_final = int(causal_res.cushions_before_first_hit) if is_bank_final else 0
+                        c_b2 = max(3, int(causal_res.cushions_at_second_hit))
                         shot_eval["cushions_before_second_hit"] = c_b2
                         shot_eval["total_cushions"] = c_b2
-                        shot_eval["message"] = (
-                            f"득점 인정 (뱅크 샷): 총 {c_b2}쿠션 후 제2적구 충돌 성공!"
-                            if is_bank_final
-                            else f"득점 인정 (일반 3쿠션): 총 {c_b2}쿠션 후 제2적구 충돌 성공!"
-                        )
+                        if is_bank_final:
+                            if c_b1_final >= c_b2:
+                                shot_eval["message"] = f"{c_b2}쿠션 ⇒ 1적구 ⇒ 2적구 ⇒ 뱅크샷성공"
+                            else:
+                                shot_eval["message"] = f"{c_b1_final}쿠션 ⇒ 1적구 ⇒ {c_b2}쿠션 ⇒ 2적구 ⇒ 뱅크샷성공"
+                        else:
+                            shot_eval["message"] = f"1적구 ⇒ {c_b2}쿠션 ⇒ 2적구 ⇒ 득점성공"
                     elif causal_res.double_hit_foul or has_double_touch_foul:
                         shot_eval["shot_type"] = "FOUL"
                         shot_eval["reason_code"] = "DOUBLE_HIT_FOUL"

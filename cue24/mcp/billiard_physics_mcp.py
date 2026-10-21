@@ -148,6 +148,9 @@ class LocalPhysics3CushionAI:
         contact_threshold_mm: float = 64.0,
         is_first_object_hit_Done: bool = False,
         cue_deflection_deg: float = 0.0,
+        target_normal_push_cos: Optional[float] = None,
+        cue_recoil_normal: Optional[float] = None,
+        pre_cue_bend_deg: float = 0.0,
     ) -> bool:
         """
         [물리 법칙 3: 오디오 센서를 완벽 대체하는 순수 비전 초미세 스침(0.5mm 키스) 및 직접 타격 판독기]
@@ -157,7 +160,8 @@ class LocalPhysics3CushionAI:
         개선 핵심 (오디오 없이 순수 비전+물리로 0.5mm 미세 접촉 판별):
         1. 서브프레임 스플라인 최단 거리(min_cue_to_target_dist_mm) <= contact_threshold_mm(64.0mm)이면 직접 접촉 확정.
         2. 0.5mm 초미세 스침(Feather-thin Kiss): 스플라인 최근접 거리가 <= 78.0mm 이내로 스쳐 지나가면서
-           수구 진행 각도가 미세하게 굴절(cue_deflection_deg >= 2.2도)되고 목적구가 1.5mm 이상 움찔한 경우 즉시 타격으로 인정.
+           수구 진행 각도가 미세하게 굴절(cue_deflection_deg >= 2.0도)되고 목적구가 충돌 법선 방향(target_normal_push_cos >= 0.55)으로
+           1.3mm 이상 밀려났으며, 균일 스핀 커브(cue_deflection_deg <= pre_cue_bend_deg * 1.15)가 아닌 경우에만 타격으로 인정!
         3. 18~22mm 사각지대(Dead Zone) 제거: 15.0mm 이상 정지 위치 이탈 또는 3.8mm 이상 스텝 이동 시 타격 확정.
         """
         # 제1적구 타격 전: 당구대 위에 움직이는 공은 수구뿐이므로 중심 중첩(<=contact_threshold_mm) 또는 정지 위치 이탈로 판정
@@ -202,11 +206,6 @@ class LocalPhysics3CushionAI:
             and (
                 curr_init_disp_mm >= 5.2
                 or target_step_move_mm >= 3.5
-                or (
-                    min_cue_to_target_dist_mm <= 56.0
-                    and curr_init_disp_mm == 0.0
-                    and target_step_move_mm == 0.0
-                )
             )
         ):
             return True
@@ -217,11 +216,21 @@ class LocalPhysics3CushionAI:
         ):
             return True
 
-        # 증거 2: 0.5mm 초미세 스침(Feather-thin Kiss) - 최근접 거리 <= 78.0mm 내에서 수구가 2.2도 이상 굴절되고 목적구가 1.5mm 이상 움찔한 경우
+        # 증거 2: 0.1~1.0mm 초미세 스침(Feather-thin Kiss) 4중 교차 감식
+        # - 최근접 거리 <= 78.0mm 내에서 수구가 1.9도 이상 국소 굴절되고(스핀 커브가 아님),
+        # - 목적구가 1.3mm 이상 움직였되 반드시 수구->목적구 충돌 법선 방향(target_normal_push_cos >= 0.55)으로 밀려났으며,
+        # - 수구 반작용이 목적구 쪽으로 휘어 들어간 경우가 아닐 때(cue_recoil_normal <= 0.5)만 인정!
+        is_causal_push = (target_normal_push_cos is None) or (target_normal_push_cos >= 0.55)
+        is_valid_recoil = (cue_recoil_normal is None) or (cue_recoil_normal <= 0.5)
+        is_sharp_hinge = (pre_cue_bend_deg <= 0.5) or (cue_deflection_deg >= pre_cue_bend_deg * 1.25)
+
         if (
             min_cue_to_target_dist_mm <= 78.0
-            and cue_deflection_deg >= 2.2
-            and (curr_init_disp_mm >= 1.5 or target_step_move_mm >= 1.5)
+            and cue_deflection_deg >= 1.9
+            and (curr_init_disp_mm >= 1.3 or target_step_move_mm >= 1.3)
+            and is_causal_push
+            and is_valid_recoil
+            and is_sharp_hinge
         ):
             return True
 
@@ -229,6 +238,7 @@ class LocalPhysics3CushionAI:
             min_cue_to_target_dist_mm <= 115.0
             and cue_deflection_deg >= 5.5
             and (curr_init_disp_mm >= 5.5 or target_step_move_mm >= 3.5)
+            and is_causal_push
         ):
             return True
 
@@ -325,8 +335,15 @@ class LocalPhysics3CushionAI:
                     if d_r >= exit_hysteresis or travel_from_last >= min_same_rail_travel:
                         rail_armed[r_name] = True
 
+            # 고속 타구로 인해 프레임 사이(Sub-frame)에 쿠션을 찍고 나와 샘플링 위치가 145mm~225mm 대역에 찍힌 경우를 위해
+            # 법선 속도가 큰 경우 유효 반사 대역을 동적으로 확장합니다.
+            dyn_eff_left = max(eff_left, min(225.0, 75.0 + 0.85 * max(abs(prev_vx), abs(vx))))
+            dyn_eff_right = min(eff_right, settings.TABLE_WIDTH_MM - min(225.0, 75.0 + 0.85 * max(abs(prev_vx), abs(vx))))
+            dyn_eff_top = max(eff_top, min(225.0, 75.0 + 0.85 * max(abs(prev_vy), abs(vy))))
+            dyn_eff_bottom = min(eff_bottom, settings.TABLE_HEIGHT_MM - min(225.0, 75.0 + 0.85 * max(abs(prev_vy), abs(vy))))
+
             # LEFT
-            if x <= eff_left:
+            if x <= dyn_eff_left:
                 if vx < -0.5 or prev_vx < -0.5:
                     approaching["LEFT"] = True
                 if approaching["LEFT"] and vx > 0.5:
@@ -334,13 +351,13 @@ class LocalPhysics3CushionAI:
                     _try_register("LEFT", idx, apex, prev_vel, curr_vel)
                     approaching["LEFT"] = False
             else:
-                if approaching["LEFT"] and vx > 0.5 and min(x, x_prev) <= eff_left + 25.0:
+                if (approaching["LEFT"] or prev_vx < -15.0) and vx > 0.5 and min(x, x_prev) <= dyn_eff_left + 25.0:
                     apex = (x_prev, y_prev) if x_prev < x else (x, y)
                     _try_register("LEFT", idx, apex, prev_vel, curr_vel)
                 approaching["LEFT"] = False
 
             # RIGHT
-            if x >= eff_right:
+            if x >= dyn_eff_right:
                 if vx > 0.5 or prev_vx > 0.5:
                     approaching["RIGHT"] = True
                 if approaching["RIGHT"] and vx < -0.5:
@@ -348,13 +365,13 @@ class LocalPhysics3CushionAI:
                     _try_register("RIGHT", idx, apex, prev_vel, curr_vel)
                     approaching["RIGHT"] = False
             else:
-                if approaching["RIGHT"] and vx < -0.5 and max(x, x_prev) >= eff_right - 25.0:
+                if (approaching["RIGHT"] or prev_vx > 15.0) and vx < -0.5 and max(x, x_prev) >= dyn_eff_right - 25.0:
                     apex = (x_prev, y_prev) if x_prev > x else (x, y)
                     _try_register("RIGHT", idx, apex, prev_vel, curr_vel)
                 approaching["RIGHT"] = False
 
             # TOP
-            if y <= eff_top:
+            if y <= dyn_eff_top:
                 if vy < -0.5 or prev_vy < -0.5:
                     approaching["TOP"] = True
                 if approaching["TOP"] and vy > 0.5:
@@ -362,13 +379,13 @@ class LocalPhysics3CushionAI:
                     _try_register("TOP", idx, apex, prev_vel, curr_vel)
                     approaching["TOP"] = False
             else:
-                if approaching["TOP"] and vy > 0.5 and min(y, y_prev) <= eff_top + 25.0:
+                if (approaching["TOP"] or prev_vy < -15.0) and vy > 0.5 and min(y, y_prev) <= dyn_eff_top + 25.0:
                     apex = (x_prev, y_prev) if y_prev < y else (x, y)
                     _try_register("TOP", idx, apex, prev_vel, curr_vel)
                 approaching["TOP"] = False
 
             # BOTTOM
-            if y >= eff_bottom:
+            if y >= dyn_eff_bottom:
                 if vy > 0.5 or prev_vy > 0.5:
                     approaching["BOTTOM"] = True
                 if approaching["BOTTOM"] and vy < -0.5:
@@ -376,7 +393,7 @@ class LocalPhysics3CushionAI:
                     _try_register("BOTTOM", idx, apex, prev_vel, curr_vel)
                     approaching["BOTTOM"] = False
             else:
-                if approaching["BOTTOM"] and vy < -0.5 and max(y, y_prev) >= eff_bottom - 25.0:
+                if (approaching["BOTTOM"] or prev_vy > 15.0) and vy < -0.5 and max(y, y_prev) >= dyn_eff_bottom - 25.0:
                     apex = (x_prev, y_prev) if y_prev > y else (x, y)
                     _try_register("BOTTOM", idx, apex, prev_vel, curr_vel)
                 approaching["BOTTOM"] = False
@@ -501,10 +518,33 @@ class LocalPhysics3CushionAI:
             inferred_first_id = early_ids[1]
 
         t1_step = max(1, min(first_move_step[early_ids[0]], first_move_step[early_ids[1]]))
+        # 제1적구가 물리적으로 타격된 실제 스텝(t1_contact_step)을 수구-제1적구 최근접 프레임으로 보정하여,
+        # 제1적구가 16mm 굴러가기 전에 수구가 먼저 쿠션을 맞혀 선쿠션(뱅크샷)으로 오인되는 현상을 차단합니다.
+        if cue_ball_id is not None and cue_ball_id in ball_trajectories and inferred_first_id in initial_positions:
+            c_traj = ball_trajectories[cue_ball_id]
+            t1_init_pos = initial_positions[inferred_first_id]
+            search_limit = min(len(c_traj), t1_step + 3)
+            for idx_c in range(1, search_limit):
+                d_c1 = math.hypot(c_traj[idx_c][0] - t1_init_pos[0], c_traj[idx_c][1] - t1_init_pos[1])
+                if d_c1 <= 78.0:
+                    t1_step = min(t1_step, idx_c)
+                    break
 
-        # 제2적구(inferred_second_id)가 움직인 t2_step 직전(t2_step - 3 ~ t2_step + 2)에
-        # 나머지 두 공(early_ids) 중 제2적구에 실제로 근접(<= 240mm)하여 타격한 주행 공(carrier_id) 확인
+        def _seg_pt_dist(a: Point2D, b: Point2D, p: Point2D) -> float:
+            abx, aby = b[0] - a[0], b[1] - a[1]
+            apx, apy = p[0] - a[0], p[1] - a[1]
+            ab_sq = abx * abx + aby * aby
+            if ab_sq <= 1e-9:
+                return math.hypot(apx, apy)
+            t_proj = max(0.0, min(1.0, (apx * abx + apy * aby) / ab_sq))
+            cx, cy = a[0] + t_proj * abx, a[1] + t_proj * aby
+            return math.hypot(p[0] - cx, p[1] - cy)
+
+        # 제2적구(inferred_second_id)가 움직인 t2_step 직전(t2_step - 4 ~ t2_step + 2)에
+        # 나머지 두 공(early_ids) 중 제2적구에 실제로 물리적 접촉 반경(선분 거리 <= 78mm, 점 거리 <= 115mm) 내로 근접하여
+        # 타격한 주행 공(carrier_id)이 존재하는지 엄격히 검증합니다. (기존 240mm 원거리 유령 타격 복원 제거)
         t2_init_pt = initial_positions[inferred_second_id]
+        t2_traj = ball_trajectories.get(inferred_second_id, [])
         best_carrier_id: Optional[int] = None
         min_carrier_dist = 9999.0
 
@@ -513,15 +553,24 @@ class LocalPhysics3CushionAI:
             w_start = max(0, t2_step - 4)
             w_end = min(len(cand_traj) - 1, t2_step + 2)
             for idx in range(w_start, w_end + 1):
-                d = math.hypot(
-                    cand_traj[idx][0] - t2_init_pt[0],
-                    cand_traj[idx][1] - t2_init_pt[1],
+                t2_ref = t2_traj[idx] if idx < len(t2_traj) else t2_init_pt
+                d_pt = math.hypot(
+                    cand_traj[idx][0] - t2_ref[0],
+                    cand_traj[idx][1] - t2_ref[1],
                 )
+                d_seg = (
+                    _seg_pt_dist(cand_traj[idx - 1], cand_traj[idx], t2_ref)
+                    if idx >= 1
+                    else d_pt
+                )
+                d = min(d_pt, d_seg)
                 if d < min_carrier_dist:
                     min_carrier_dist = d
                     best_carrier_id = cand_id
 
-        if best_carrier_id is None or min_carrier_dist > 240.0:
+        # 제1적구 충돌 후 3쿠션을 돌고 제2적구를 맞히지 못한 공타(Miss)가 뱅크샷/일반 득점으로 둔갑하지 않도록
+        # 실제 근접 거리 상한을 82.0mm(점 대 선분 최단거리 기준)로 엄격히 제한합니다.
+        if best_carrier_id is None or min_carrier_dist > 82.0:
             return result
 
         # 수구(또는 충돌 직후 ID가 스왑되어 수구 역할을 이어받은 carrier 공)의 t2_step 이전 유효 쿠션 수 계산

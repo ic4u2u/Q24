@@ -194,8 +194,18 @@ class SubPixelPhaseImpactDetector:
         self.window_mask = self.hann_win * self.inner_circle_mask
 
     def detect_subpixel_impulse(
-        self, prev_gray_roi: np.ndarray, curr_gray_roi: np.ndarray
+        self,
+        prev_gray_roi: np.ndarray,
+        curr_gray_roi: np.ndarray,
+        expected_push_dir: Optional[Tuple[float, float]] = None,
     ) -> SubPixelImpactEvidence:
+        """
+        푸리에 위상 상관법(cv2.phaseCorrelate) 및 반구형 안전 마스킹(Safe-Hemisphere Masking)을 통해
+        수구 옆그림자/헤일로 간섭을 배제하고 제2적구 자체의 0.05픽셀 미세 충격만을 추출합니다.
+        - expected_push_dir (nx, ny): 수구 중심에서 목적구 중심을 향하는 충돌 법선 단위벡터.
+          주어질 경우 수구가 스쳐 지나가는 쪽(-expected_push_dir) 가장자리를 차폐하고,
+          추출된 서브픽셀 이동 방향이 밀려나는 방향(expected_push_dir)과 부합하는지 교차 검증합니다.
+        """
         if prev_gray_roi.shape != (self.patch_size, self.patch_size):
             prev_gray_roi = cv2.resize(
                 prev_gray_roi, (self.patch_size, self.patch_size)
@@ -208,13 +218,30 @@ class SubPixelPhaseImpactDetector:
         raw1 = prev_gray_roi.astype(np.float64)
         raw2 = curr_gray_roi.astype(np.float64)
 
+        active_window_mask = self.window_mask
+        active_inner_mask = self.inner_circle_mask
+        push_unit: Optional[Tuple[float, float]] = None
+
+        if expected_push_dir is not None:
+            p_norm = float(np.hypot(expected_push_dir[0], expected_push_dir[1]))
+            if p_norm > 1e-6:
+                nx, ny = float(expected_push_dir[0] / p_norm), float(expected_push_dir[1] / p_norm)
+                push_unit = (nx, ny)
+                yy, xx = np.ogrid[: self.patch_size, : self.patch_size]
+                center = (self.patch_size - 1) * 0.5
+                proj = (xx - center) * nx + (yy - center) * ny
+                # 수구가 접근하는 쪽(-0.12 * patch_size 이하 영역)의 그림자/모션블러 유입 원천 차폐
+                hemi_gate = np.clip((proj + 0.12 * self.patch_size) / (0.20 * self.patch_size), 0.0, 1.0)
+                active_inner_mask = self.inner_circle_mask * hemi_gate
+                active_window_mask = self.hann_win * active_inner_mask
+
         # 1) 저주파 구체 조명(DC Dome)이 고정 윈도우 경계와 곱해져 위상 이동량을 0으로 끌어당기는 현상을 막기 위해
-        #    고주파 표면 성분(High-Pass Texture/Spot)을 추출한 뒤 해닝·원형 윈도우 적용 및 cv2.phaseCorrelate 수행
+        #    고주파 표면 성분(High-Pass Texture/Spot)을 추출한 뒤 해닝·반구형 윈도우 적용 및 cv2.phaseCorrelate 수행
         hp1 = raw1 - cv2.GaussianBlur(raw1, (9, 9), 2.0)
         hp2 = raw2 - cv2.GaussianBlur(raw2, (9, 9), 2.0)
 
-        f1 = hp1 * self.window_mask
-        f2 = hp2 * self.window_mask
+        f1 = hp1 * active_window_mask
+        f2 = hp2 * active_window_mask
 
         (dx_pc, dy_pc), response = cv2.phaseCorrelate(f1, f2)
 
@@ -224,7 +251,7 @@ class SubPixelPhaseImpactDetector:
         gy = cv2.Scharr(raw1, cv2.CV_64F, 0, 1) / 32.0
         it = raw2 - raw1
 
-        w = self.window_mask
+        w = active_window_mask
         ix_w = (gx * w).ravel()
         iy_w = (gy * w).ravel()
         it_w = (it * w).ravel()
@@ -246,12 +273,22 @@ class SubPixelPhaseImpactDetector:
             shift_mag = pc_mag
 
         # 내부 픽셀 밝기 변화(회전으로 인한 하이라이트/적구 점 이동) 에너지 보조 측정
-        diff_energy = float(np.mean(np.abs((raw2 - raw1) * self.inner_circle_mask)))
+        mask_sum = max(float(np.sum(active_inner_mask)), 1.0)
+        diff_energy = float(np.sum(np.abs((raw2 - raw1) * active_inner_mask)) / mask_sum)
 
-        is_hit = (
-            self.min_shift_px <= shift_mag <= self.max_valid_shift_px
-            and response > 0.15
-        ) or (diff_energy > 2.5 and shift_mag >= self.min_shift_px * 0.5)
+        # 법선 방향 정합성 검증: expected_push_dir가 주어진 경우 반대 방향(수구 쪽으로 끌려감) 위상 노이즈 차단
+        dir_ok = True
+        if push_unit is not None and shift_mag > 1e-5:
+            cos_dir = (dx * push_unit[0] + dy * push_unit[1]) / shift_mag
+            dir_ok = cos_dir >= 0.35
+
+        is_hit = dir_ok and (
+            (
+                self.min_shift_px <= shift_mag <= self.max_valid_shift_px
+                and response > 0.15
+            )
+            or (diff_energy > 2.5 and shift_mag >= self.min_shift_px * 0.5)
+        )
         return SubPixelImpactEvidence(
             is_impacted=bool(is_hit),
             phase_shift_px=shift_mag,

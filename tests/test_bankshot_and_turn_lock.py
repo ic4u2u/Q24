@@ -5,7 +5,18 @@
 파일 경로: tests/test_bankshot_and_turn_lock.py
 """
 
-from scoring_fsm import BallColor, CausalKissSafeFSM, ShotResult
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(
+    0,
+    os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "three_cushion_vision")
+    ),
+)
+
+from three_cushion_vision.causal_kiss_fsm import BallColor, CausalKissSafeFSM, ShotResult
 
 
 def test_1_cushion_and_2_cushion_bankshot_exact_count() -> None:
@@ -387,6 +398,194 @@ def test_rule1_to_rule4_cue_identification_and_1cushion_bankshot() -> None:
     print("[PASS] Test 6 (규칙 1~4: 3구 상대 색도 랭킹 + First-Mover 수구 결정 + 1쿠션 넣어치기 원뱅크 득점 + 득점유지/실패교체) 통과!")
 
 
+def test_user_reported_3_critical_errors_regression() -> None:
+    """
+    [테스트 7: 사용자 제보 3대 치명적 오류 완벽 해결 회귀 검증]
+    1. 오류 1: 수구가 레일 근처에서 출발하거나 쿠션 앞 제1적구를 먼저 맞힌 일반 3쿠션인데 뱅크샷으로 오인하는 현상 차단
+    2. 오류 2: 공이 매우 빠른 경우(초고속 타구: 프레임 사이 Sub-frame 반사 및 사다리꼴 평탄 정점) 쿠션 터치 인식을 놓치는 현상 복원
+    3. 오류 3: 제1적구 충돌 후 3쿠션 후 제2적구에 충돌하지 않아 득점 실패(Miss)인데 뱅크샷 득점으로 오인하는 현상 차단
+    """
+    from cue24.core.scoring_engine import ScoringEngine
+
+    # ----------------------------------------------------------------------
+    # 시나리오 A (오류 1 해결 검증):
+    # 수구(WHITE)가 하단 레일 근처(y=52mm)에 서 있다가 테이블 안쪽의 제1적구(RED: 650, 220)를 먼저 직접 타격한 뒤
+    # TOP -> RIGHT -> BOTTOM 3쿠션을 돌고 제2적구(YELLOW: 2100, 950)를 맞히는 '일반 3쿠션(REGULAR_3C)'
+    # (과거 버그: 출발 위치가 y=52mm(<=58mm)여서 기하학적 원뱅크 복원이 잘못 켜지거나, 1적구 직후 반사가 선쿠션으로 잡혀 뱅크샷으로 오판됨)
+    # ----------------------------------------------------------------------
+    fsm_a = CausalKissSafeFSM(fps=30.0, assigned_cue_ball=BallColor.WHITE)
+    eng_a = ScoringEngine()
+    eng_a.reset_shot(cue_ball_id=1, object_ball_ids=[2, 3])
+
+    frames_a = [
+        (0.00, (300.0, 52.0),  (2100.0, 950.0), (650.0, 220.0)),
+        (0.03, (420.0, 110.0), (2100.0, 950.0), (650.0, 220.0)),
+        (0.06, (540.0, 168.0), (2100.0, 950.0), (650.0, 220.0)),
+        (0.09, (620.0, 208.0), (2100.0, 950.0), (650.0, 220.0)),  # 제1적구(RED) 직접 먼저 타격!
+        (0.12, (740.0, 130.0), (2100.0, 950.0), (695.0, 260.0)),  # RED 밀려남, WHITE는 TOP 레일로 진행
+        (0.15, (880.0, 44.0),  (2100.0, 950.0), (725.0, 285.0)),  # 1쿠션 (TOP: 제1적구 타격 후!)
+        (0.18, (1350.0, 240.0),(2100.0, 950.0), (745.0, 300.0)),
+        (0.21, (1900.0, 470.0),(2100.0, 950.0), (755.0, 310.0)),
+        (0.24, (2400.0, 680.0),(2100.0, 950.0), (760.0, 315.0)),
+        (0.27, (2802.0, 860.0),(2100.0, 950.0), (760.0, 315.0)),  # 2쿠션 (RIGHT)
+        (0.30, (2520.0, 1120.0),(2100.0, 950.0),(760.0, 315.0)),
+        (0.33, (2260.0, 1384.0),(2100.0, 950.0),(760.0, 315.0)),  # 3쿠션 (BOTTOM)
+        (0.36, (2180.0, 1170.0),(2100.0, 950.0),(760.0, 315.0)),
+        (0.39, (2112.0, 990.0), (2100.0, 950.0),(760.0, 315.0)),  # 제2적구(YELLOW) 타격!
+        (0.42, (2060.0, 890.0), (2070.0, 880.0),(760.0, 315.0)),
+        (0.45, (2020.0, 820.0), (2040.0, 820.0),(760.0, 315.0)),
+    ]
+
+    res_a = None
+    for idx_f, (t, w_p, y_p, r_p) in enumerate(frames_a):
+        out = fsm_a.update(t, {BallColor.WHITE: w_p, BallColor.YELLOW: y_p, BallColor.RED: r_p})
+        if out is not None and not out.already_dispatched:
+            res_a = out
+        eng_a.update_frame(idx_f + 1, {1: w_p, 2: y_p, 3: r_p})
+
+    eval_a = eng_a.evaluate_shot()
+    assert res_a is not None and res_a.scored is True, "시나리오 A: 일반 3쿠션 득점이 인식되지 않았습니다!"
+    assert res_a.is_bank_shot is False, f"시나리오 A 오류: 일반 3쿠션이 뱅크샷으로 오인되었습니다! (c_before={res_a.cushions_before_first_hit})"
+    assert res_a.cushions_before_first_hit == 0, f"시나리오 A 오류: 선쿠션 수가 0이어야 합니다 ({res_a.cushions_before_first_hit})"
+    assert eval_a["is_scored"] is True and eval_a["shot_type"] == "REGULAR_3C", f"시나리오 A ScoringEngine 오류: {eval_a}"
+
+    # ----------------------------------------------------------------------
+    # 시나리오 B (오류 2 해결 검증):
+    # 초고속 강타로 인해 수구가 프레임 사이(Sub-frame)에 레일을 찍고 나와서
+    # 샘플링된 좌표가 레일에서 165mm~185mm 떨어져 있거나(기존 125mm/145mm 대역 밖),
+    # 인접 두 프레임이 사다리꼴 평탄 정점(y=52 -> y=52)을 형성하는 초고속 3쿠션 득점
+    # ----------------------------------------------------------------------
+    fsm_b = CausalKissSafeFSM(fps=30.0, assigned_cue_ball=BallColor.WHITE)
+    eng_b = ScoringEngine()
+    eng_b.reset_shot(cue_ball_id=1, object_ball_ids=[2, 3])
+
+    frames_b = [
+        (0.00, (400.0, 700.0),  (2200.0, 500.0), (650.0, 680.0)),
+        (0.03, (580.0, 685.0),  (2200.0, 500.0), (650.0, 680.0)),
+        (0.06, (625.0, 680.0),  (2200.0, 500.0), (650.0, 680.0)),  # 제1적구(RED) 타격
+        (0.09, (820.0, 430.0),  (2200.0, 500.0), (720.0, 740.0)),
+        # 1쿠션(TOP): 초고속 사다리꼴 평탄 정점 (두 프레임 연속 y=52.0mm)
+        (0.12, (1010.0, 52.0),  (2200.0, 500.0), (760.0, 770.0)),
+        (0.15, (1190.0, 52.0),  (2200.0, 500.0), (780.0, 785.0)),
+        (0.18, (1480.0, 310.0), (2200.0, 500.0), (790.0, 790.0)),
+        (0.21, (1820.0, 610.0), (2200.0, 500.0), (790.0, 790.0)),
+        (0.24, (2200.0, 940.0), (2200.0, 500.0), (790.0, 790.0)),
+        # 2쿠션(BOTTOM): 초고속 서브프레임 반사로 인해 프레임 샘플이 y=1248mm (레일 거리 174mm > 125mm!)에서 찍힘
+        (0.27, (2490.0, 1248.0),(2200.0, 500.0), (790.0, 790.0)),
+        (0.30, (2670.0, 980.0), (2200.0, 500.0), (790.0, 790.0)),
+        # 3쿠션(RIGHT): 초고속 서브프레임 반사로 인해 프레임 샘플이 x=2668mm (레일 거리 174mm > 125mm!)에서 찍힘
+        (0.33, (2668.0, 730.0), (2200.0, 500.0), (790.0, 790.0)),
+        (0.36, (2410.0, 600.0), (2200.0, 500.0), (790.0, 790.0)),
+        (0.39, (2230.0, 515.0), (2200.0, 500.0), (790.0, 790.0)),  # 제2적구(YELLOW) 타격!
+        (0.42, (2120.0, 480.0), (2140.0, 465.0), (790.0, 790.0)),
+        (0.45, (2050.0, 460.0), (2090.0, 435.0), (790.0, 790.0)),
+    ]
+
+    res_b = None
+    for idx_f, (t, w_p, y_p, r_p) in enumerate(frames_b):
+        out = fsm_b.update(t, {BallColor.WHITE: w_p, BallColor.YELLOW: y_p, BallColor.RED: r_p})
+        if out is not None and not out.already_dispatched:
+            res_b = out
+        eng_b.update_frame(idx_f + 1, {1: w_p, 2: y_p, 3: r_p})
+
+    eval_b = eng_b.evaluate_shot()
+    assert res_b is not None and res_b.scored is True, f"시나리오 B 오류: 초고속 쿠션 반사가 누락되어 득점 실패했습니다! (cushions={fsm_b.cushion_count})"
+    assert res_b.total_cushions == 3 and res_b.is_bank_shot is False, f"시나리오 B 쿠션/뱅크샷 오류: {res_b}"
+    assert eval_b["is_scored"] is True and eval_b["shot_type"] == "REGULAR_3C", f"시나리오 B ScoringEngine 오류: {eval_b}"
+
+    # ----------------------------------------------------------------------
+    # 시나리오 C (오류 3 해결 검증):
+    # 제1적구(RED) 충돌 후 3쿠션을 돌고 제2적구(YELLOW: 2100, 95.0) 근처 레일(y=68mm)을 맞고 튕겨 나갔으나
+    # 제2적구에는 닿지 않은 득점 실패(Miss) 상황 (제2적구에 미세한 트래커 지터 1.8mm 발생 포함)
+    # -> 절대 뱅크샷 득점이나 일반 득점으로 인식되면 안 됨!
+    # ----------------------------------------------------------------------
+    fsm_c = CausalKissSafeFSM(fps=30.0, assigned_cue_ball=BallColor.WHITE)
+    eng_c = ScoringEngine()
+    eng_c.reset_shot(cue_ball_id=1, object_ball_ids=[2, 3])
+
+    frames_c = [
+        (0.00, (400.0, 700.0),  (2100.0, 95.0), (700.0, 700.0)),
+        (0.03, (560.0, 700.0),  (2100.0, 95.0), (700.0, 700.0)),
+        (0.06, (655.0, 695.0),  (2100.0, 95.0), (700.0, 700.0)),  # 제1적구(RED) 충돌
+        (0.09, (840.0, 420.0),  (2100.0, 95.0), (760.0, 745.0)),
+        (0.12, (1050.0, 45.0),  (2100.0, 95.0), (795.0, 770.0)),  # 1쿠션(TOP)
+        (0.15, (1550.0, 380.0), (2100.0, 95.0), (810.0, 780.0)),
+        (0.18, (2150.0, 780.0), (2100.0, 95.0), (815.0, 785.0)),
+        (0.21, (2802.0, 1120.0),(2100.0, 95.0), (815.0, 785.0)),  # 2쿠션(RIGHT)
+        (0.24, (2480.0, 1382.0),(2100.0, 95.0), (815.0, 785.0)),  # 3쿠션(BOTTOM)
+        (0.27, (2280.0, 750.0), (2100.0, 95.0), (815.0, 785.0)),
+        # 4쿠션(TOP: x=2152, y=68) -> 제2적구(2100, 95)와의 거리가 58.5mm로 가깝지만,
+        # 실제로는 TOP 쿠션을 맞고 아래로 튕겨 나간 것이며 제2적구는 맞지 않음(지터 1.5mm만 존재)!
+        (0.30, (2152.0, 68.0),  (2100.0, 95.0), (815.0, 785.0)),
+        (0.33, (2040.0, 320.0), (2101.2, 94.2), (815.0, 785.0)),
+        (0.36, (1920.0, 580.0), (2101.0, 94.5), (815.0, 785.0)),
+    ]
+
+    imm_c = None
+    for idx_f, (t, w_p, y_p, r_p) in enumerate(frames_c):
+        out = fsm_c.update(t, {BallColor.WHITE: w_p, BallColor.YELLOW: y_p, BallColor.RED: r_p})
+        if out is not None and not out.already_dispatched:
+            imm_c = out
+        eng_c.update_frame(idx_f + 1, {1: w_p, 2: y_p, 3: r_p})
+
+    final_c = None
+    for s in range(1, 45):
+        t = 0.36 + s / 30.0
+        out = fsm_c.update(t, {BallColor.WHITE: (1920.0, 580.0), BallColor.YELLOW: (2101.0, 94.5), BallColor.RED: (815.0, 785.0)})
+        if out is not None:
+            final_c = out
+
+    eval_c = eng_c.evaluate_shot()
+    assert imm_c is None, f"시나리오 C 오류: 제2적구 미충돌(Miss)인데 실시간 득점이 발생했습니다! ({imm_c})"
+    assert final_c is not None and final_c.scored is False, f"시나리오 C 오류: 최종 결과가 득점 실패(False)여야 합니다! ({final_c})"
+    assert eval_c["is_scored"] is False, f"시나리오 C ScoringEngine 오류: {eval_c}"
+
+    # ----------------------------------------------------------------------
+    # 시나리오 D (초고속 수구 1적구 선타격 -> 직후 쿠션 반사 순서 역전 방지 검증):
+    # 수구(WHITE)가 빠르게(첫 스텝 210mm+) 이동하여 레일 근처 제1적구(RED: 620, 78)를 얇게 먼저 치고(impact_param ≈ 48mm),
+    # 바로 다음 프레임(f_post1)에 뒤쪽 TOP 쿠션(y=42mm)을 맞힌 뒤 RIGHT -> BOTTOM 3쿠션 후 제2적구(YELLOW) 득점!
+    # (과거 버그: 2프레임 후행 컨텍스트 중 TOP 쿠션 y=42mm가 min_rail_dist_before_first_hit에 먼저 기록되어
+    #  '1쿠션 => 1적구' 뱅크샷으로 순서가 뒤집히던 현상 완벽 차단 검증)
+    # ----------------------------------------------------------------------
+    fsm_d = CausalKissSafeFSM(fps=30.0, assigned_cue_ball=BallColor.WHITE)
+    eng_d = ScoringEngine()
+    eng_d.reset_shot(cue_ball_id=1, object_ball_ids=[2, 3])
+
+    frames_d = [
+        (0.00, (360.0, 240.0), (2100.0, 750.0), (620.0, 78.0)),
+        (0.03, (575.0, 118.0), (2100.0, 750.0), (620.0, 78.0)),  # 초고속 접근 후 제1적구(RED: 620, 78) 얇은 두께 선타격!
+        (0.06, (665.0, 42.0),  (2100.0, 750.0), (655.0, 102.0)), # 직후 프레임에 뒤쪽 TOP 레일(y=42mm) 1쿠션 도달 & RED 밀려남!
+        (0.09, (1120.0, 210.0),(2100.0, 750.0), (685.0, 120.0)),
+        (0.12, (1680.0, 430.0),(2100.0, 750.0), (705.0, 132.0)),
+        (0.15, (2260.0, 660.0),(2100.0, 750.0), (715.0, 138.0)),
+        (0.18, (2802.0, 880.0),(2100.0, 750.0), (720.0, 140.0)),  # 2쿠션(RIGHT)
+        (0.21, (2520.0, 1140.0),(2100.0, 750.0),(720.0, 140.0)),
+        (0.24, (2260.0, 1384.0),(2100.0, 750.0),(720.0, 140.0)),  # 3쿠션(BOTTOM)
+        (0.27, (2175.0, 1050.0),(2100.0, 750.0),(720.0, 140.0)),
+        (0.30, (2112.0, 790.0), (2100.0, 750.0),(720.0, 140.0)),  # 제2적구(YELLOW) 충돌!
+        (0.33, (2060.0, 660.0), (2065.0, 690.0),(720.0, 140.0)),
+        (0.36, (2010.0, 540.0), (2035.0, 640.0),(720.0, 140.0)),
+    ]
+
+    res_d = None
+    for idx_f, (t, w_p, y_p, r_p) in enumerate(frames_d):
+        out = fsm_d.update(t, {BallColor.WHITE: w_p, BallColor.YELLOW: y_p, BallColor.RED: r_p})
+        if out is not None and not out.already_dispatched:
+            res_d = out
+        eng_d.update_frame(idx_f + 1, {1: w_p, 2: y_p, 3: r_p})
+
+    eval_d = eng_d.evaluate_shot()
+    assert res_d is not None and res_d.scored is True, "시나리오 D: 고속 일반 3쿠션 득점이 인식되지 않았습니다!"
+    assert res_d.cushions_before_first_hit == 0 and res_d.is_bank_shot is False, (
+        f"시나리오 D 오류: 고속 수구가 1적구를 먼저 맞혔는데 쿠션 먼저(뱅크샷)로 오인됨! (c_before={res_d.cushions_before_first_hit})"
+    )
+    assert res_d.total_cushions == 3, f"시나리오 D 쿠션 수 오류: {res_d.total_cushions}"
+    assert eval_d["is_scored"] is True and eval_d["shot_type"] == "REGULAR_3C" and eval_d["cushions_before_first_hit"] == 0, (
+        f"시나리오 D ScoringEngine 오류: {eval_d}"
+    )
+    print("[PASS] Test 7 (고속 수구 1적구 선타격->쿠션 순서 역전 방지 포함 4대 시나리오 전수 검증) 통과!")
+
+
 if __name__ == "__main__":
     test_1_cushion_and_2_cushion_bankshot_exact_count()
     test_order_reversal_prevents_false_bankshot()
@@ -394,4 +593,5 @@ if __name__ == "__main__":
     test_opponent_ball_noise_never_hijacks_turn_or_scores()
     test_residual_rolling_after_immediate_score_never_flips_turn()
     test_rule1_to_rule4_cue_identification_and_1cushion_bankshot()
+    test_user_reported_3_critical_errors_regression()
     print("\n=== ALL BANKSHOT & TURN-LOCK INTEGRATION TESTS PASSED! ===")

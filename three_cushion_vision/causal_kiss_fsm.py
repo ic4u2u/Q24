@@ -581,34 +581,72 @@ class CausalKissSafeFSM:
             len_in = float(np.linalg.norm(vec_in))
             len_out = float(np.linalg.norm(vec_out))
 
-            min_seg_len = 8.0 if (k == 1 or k == len(approx) - 2) else 16.0
+            min_seg_len = 8.0 if (k == 1 or k == len(approx) - 2) else 14.0
             if len_in < min_seg_len or len_out < min_seg_len:
                 continue
 
-            bend_deg = self._angle_between_deg(vec_in, vec_out)
+            # 꼭짓점 전후 2프레임 윈도우 내 유효 입사/반사 벡터 보강
+            # (초고속 타구 시 프레임 중간 반사로 인해 인접 2프레임이 평행한 사다리꼴 정점을 형성하는 현상 복원)
+            w_lo = max(0, idx_curr - 1)
+            w_hi = min(len(path) - 1, idx_curr + 1)
+            w_lo2 = max(0, idx_curr - 2)
+            w_hi2 = min(len(path) - 1, idx_curr + 2)
+
+            local_vec_in = path[idx_curr].pos - path[w_lo2].pos
+            local_vec_out = path[w_hi2].pos - path[idx_curr].pos
+
+            bend_deg = max(
+                self._angle_between_deg(vec_in, vec_out),
+                self._angle_between_deg(local_vec_in, local_vec_out)
+                if (
+                    float(np.linalg.norm(local_vec_in)) >= 12.0
+                    and float(np.linalg.norm(local_vec_out)) >= 12.0
+                )
+                else 0.0,
+            )
             if bend_deg < self.POLY_MIN_CUSHION_BEND_DEG:
                 continue
 
-            # 꼭짓점 전후 1프레임 윈도우 내 최소 레일 거리 및 프레임 내 V자 반사 여부 확인
-            w_lo = max(0, idx_curr - 1)
-            w_hi = min(len(path) - 1, idx_curr + 1)
+            # 꼭짓점 전후 윈도우 내 최소 레일 거리 및 고속 이동 시 서브프레임 광선 교차 대역 계산
             has_v_bounce = any(path[i].intra_frame_v_bounce for i in range(w_lo, w_hi + 1))
-            max_rail_zone = 135.0 if has_v_bounce else self.RAIL_VERTEX_ZONE_MM
+            base_rail_zone = 135.0 if has_v_bounce else self.RAIL_VERTEX_ZONE_MM
+
+            step_dx_max = max(
+                abs(float(path[idx_curr].pos[0] - path[w_lo].pos[0])),
+                abs(float(path[w_hi].pos[0] - path[idx_curr].pos[0])),
+            )
+            step_dy_max = max(
+                abs(float(path[idx_curr].pos[1] - path[w_lo].pos[1])),
+                abs(float(path[w_hi].pos[1] - path[idx_curr].pos[1])),
+            )
+            # 목적구와 충분히 떨어져(>= 85mm) 허공에서 법선 속도가 급반전된 고속 타구의 경우,
+            # 프레임 사이(Sub-frame)에 레일을 찍고 나온 이동 거리를 반영하여 감지 대역을 동적으로 확장합니다.
+            if pt_info.min_dist_to_targets >= 85.0:
+                max_rail_zone_x = min(240.0, max(base_rail_zone, 75.0 + 0.90 * step_dx_max))
+                max_rail_zone_y = min(240.0, max(base_rail_zone, 75.0 + 0.90 * step_dy_max))
+            else:
+                max_rail_zone_x = base_rail_zone
+                max_rail_zone_y = base_rail_zone
 
             d_left = min(float(path[i].pos[0]) for i in range(w_lo, w_hi + 1))
             d_right = min(float(TABLE_W - path[i].pos[0]) for i in range(w_lo, w_hi + 1))
             d_top = min(float(path[i].pos[1]) for i in range(w_lo, w_hi + 1))
             d_bottom = min(float(TABLE_H - path[i].pos[1]) for i in range(w_lo, w_hi + 1))
 
+            in_x = vec_in[0] if abs(float(vec_in[0])) >= 1.5 else float(local_vec_in[0])
+            out_x = vec_out[0] if abs(float(vec_out[0])) >= 1.5 else float(local_vec_out[0])
+            in_y = vec_in[1] if abs(float(vec_in[1])) >= 1.5 else float(local_vec_in[1])
+            out_y = vec_out[1] if abs(float(vec_out[1])) >= 1.5 else float(local_vec_out[1])
+
             # 해당 꼭짓점에서 실제 반사가 일어난 레일 후보 탐색
             rail_candidates: List[Tuple[float, Rail]] = []
-            if d_left <= max_rail_zone and vec_in[0] < -1.5 and vec_out[0] > 1.5:
+            if d_left <= max_rail_zone_x and in_x < -1.5 and out_x > 1.5:
                 rail_candidates.append((d_left, Rail.LEFT))
-            if d_right <= max_rail_zone and vec_in[0] > 1.5 and vec_out[0] < -1.5:
+            if d_right <= max_rail_zone_x and in_x > 1.5 and out_x < -1.5:
                 rail_candidates.append((d_right, Rail.RIGHT))
-            if d_top <= max_rail_zone and vec_in[1] < -1.5 and vec_out[1] > 1.5:
+            if d_top <= max_rail_zone_y and in_y < -1.5 and out_y > 1.5:
                 rail_candidates.append((d_top, Rail.TOP))
-            if d_bottom <= max_rail_zone and vec_in[1] > 1.5 and vec_out[1] < -1.5:
+            if d_bottom <= max_rail_zone_y and in_y > 1.5 and out_y < -1.5:
                 rail_candidates.append((d_bottom, Rail.BOTTOM))
 
             if not rail_candidates:
@@ -618,26 +656,52 @@ class CausalKissSafeFSM:
             d_rail_min, hit_rail = rail_candidates[0]
 
             # 목적구 충돌 꼭짓점과 쿠션 반사 꼭짓점 분리:
-            # 1) 만약 꼭짓점 시점이 제1적구 최초 충돌 시점과 겹치는 경우:
-            #    일반 샷(Test 2: 레일 앞 제1적구를 직접 먼저 맞혀 꺾인 경우)은 쿠션에서 배제하되,
-            #    1쿠션 넣어치기(Test 6: 초기 스트로크 방향이 제1적구 중심을 비껴나 쿠션을 먼저 찍은 경우)는 선행 쿠션으로 보존!
+            # 1) 꼭짓점 시점이 제1적구 최초 충돌 시점과 겹치는 경우(전후 2프레임 이내):
+            #    - 일반 샷에서 레일 앞 제1적구를 직접 먼저 맞혀 꺾인 경우(min_dist_to_targets < 85mm)는 쿠션에서 배제!
+            #    - 반대로 제1적구 타격 직후 1~2프레임 만에 실제 레일(d_rail_min <= 65mm)을 찍고 반사된 경우는
+            #      제1적구 충돌 이후의 정상 쿠션(is_before_first_hit = False)으로 보존!
+            #    - 1쿠션 넣어치기(기하학적 원뱅크 복원)는 출발점->쿠션 거리가 출발점->1적구 거리보다 짧은 선행 반사일 때만 선쿠션으로 보존!
             is_before_first_hit = (
                 self.first_target_hit_path_idx is None
                 or idx_curr < self.first_target_hit_path_idx
             )
             if (
                 self.first_target_hit_path_idx is not None
-                and abs(idx_curr - self.first_target_hit_path_idx) <= 1
+                and abs(idx_curr - self.first_target_hit_path_idx) <= 2
             ):
-                if self._geom_one_bank_recovered:
+                t1_ref_v = (
+                    self.initial_positions.get(self.first_target_ball)
+                    if self.first_target_ball is not None
+                    else None
+                )
+                is_vertex_past_t1 = False
+                if self.stroke_origin_pos is not None and t1_ref_v is not None:
+                    d_orig_v = float(np.linalg.norm(p_curr - self.stroke_origin_pos))
+                    d_orig_t1 = float(np.linalg.norm(t1_ref_v - self.stroke_origin_pos))
+                    if d_orig_v >= d_orig_t1 - 5.0:
+                        is_vertex_past_t1 = True
+
+                if (
+                    self._geom_one_bank_recovered
+                    and d_rail_min <= 58.0
+                    and idx_curr <= self.first_target_hit_path_idx
+                    and not is_vertex_past_t1
+                ):
                     is_before_first_hit = True
+                elif (
+                    (idx_curr > self.first_target_hit_path_idx or is_vertex_past_t1)
+                    and d_rail_min <= 65.0
+                    and (pt_info.min_dist_to_targets >= 64.0 or is_vertex_past_t1)
+                ):
+                    is_before_first_hit = False
                 else:
                     continue
 
-            # 2) 제1적구 충돌 이후 구간에서 꼭짓점 반경 72.0mm 이내에 목적구가 있고
-            #    레일 밀착(<= 42.0mm) 반사가 아니라면 목적구 재키스/충돌 꼭짓점이므로 배제
-            if not is_before_first_hit:
-                if pt_info.min_dist_to_targets < 72.0 and d_rail_min > 42.0:
+            # 2) 목적구 반경 72.0mm 이내에서 꺾인 꼭짓점이면서 실제 레일 밀착(<= 42.0mm) 반사가 아니라면,
+            #    제1적구 충돌 전이라도(아직 충돌 확정되기 직전 프레임의 1적구 타격 굴절 포함)
+            #    원뱅크 넣어치기가 아닌 이상 목적구 충돌 꼭짓점이므로 쿠션에서 배제!
+            if pt_info.min_dist_to_targets < 72.0 and d_rail_min > 42.0:
+                if not (is_before_first_hit and self._geom_one_bank_recovered and d_rail_min <= 58.0):
                     continue
 
             # 3) 동일 레일 슬라이딩 중복 카운트 차단:
@@ -669,22 +733,128 @@ class CausalKissSafeFSM:
             last_rail = hit_rail
             last_vertex_path_idx = idx_curr
 
+        # [초고속 서브프레임 쿠션 반사 보강]
+        # 수구가 초고속으로 레일을 얇게 스치거나 프레임 정중앙에서 튕겨 나와 approxPolyDP(epsilon=18.0mm)에서
+        # 꼭짓점이 평탄화되어 누락된 경우, 목적구와 충분히 떨어진(>= 85mm) 상태에서 법선 방향 이동량이
+        # 명확히 부호 반전된 지점을 스캔하여 누락된 쿠션을 복구합니다.
+        existing_indices = set()
+        for f_v, _, _, _ in valid_vertices:
+            for p_i, pt_p in enumerate(path):
+                if pt_p.frame_idx == f_v:
+                    existing_indices.add(p_i)
+
+        for idx_s in range(1, len(path) - 1):
+            if any(abs(idx_s - ex_i) <= 2 for ex_i in existing_indices):
+                continue
+            pt_s = path[idx_s]
+            if pt_s.min_dist_to_targets < 85.0:
+                continue
+            if (
+                self.first_target_hit_path_idx is not None
+                and abs(idx_s - self.first_target_hit_path_idx) <= 2
+                and not (idx_s > self.first_target_hit_path_idx and float( min(pt_s.pos[0], TABLE_W - pt_s.pos[0], pt_s.pos[1], TABLE_H - pt_s.pos[1]) ) <= 65.0)
+            ):
+                continue
+
+            w_lo_s = max(0, idx_s - 2)
+            w_hi_s = min(len(path) - 1, idx_s + 2)
+            v_in_s = path[idx_s].pos - path[w_lo_s].pos
+            v_out_s = path[w_hi_s].pos - path[idx_s].pos
+            if float(np.linalg.norm(v_in_s)) < 25.0 or float(np.linalg.norm(v_out_s)) < 25.0:
+                continue
+            if self._angle_between_deg(v_in_s, v_out_s) < self.POLY_MIN_CUSHION_BEND_DEG:
+                continue
+
+            dx_step = max(
+                abs(float(path[idx_s].pos[0] - path[idx_s - 1].pos[0])),
+                abs(float(path[idx_s + 1].pos[0] - path[idx_s].pos[0])),
+            )
+            dy_step = max(
+                abs(float(path[idx_s].pos[1] - path[idx_s - 1].pos[1])),
+                abs(float(path[idx_s + 1].pos[1] - path[idx_s].pos[1])),
+            )
+            zone_x = min(230.0, max(self.RAIL_VERTEX_ZONE_MM, 75.0 + 0.85 * dx_step))
+            zone_y = min(230.0, max(self.RAIL_VERTEX_ZONE_MM, 75.0 + 0.85 * dy_step))
+
+            d_l = float(pt_s.pos[0])
+            d_r = float(TABLE_W - pt_s.pos[0])
+            d_t = float(pt_s.pos[1])
+            d_b = float(TABLE_H - pt_s.pos[1])
+
+            sub_cands: List[Tuple[float, Rail]] = []
+            if d_l <= zone_x and v_in_s[0] < -12.0 and v_out_s[0] > 12.0 and pt_s.pos[0] <= path[idx_s - 1].pos[0] and pt_s.pos[0] <= path[idx_s + 1].pos[0]:
+                sub_cands.append((d_l, Rail.LEFT))
+            if d_r <= zone_x and v_in_s[0] > 12.0 and v_out_s[0] < -12.0 and pt_s.pos[0] >= path[idx_s - 1].pos[0] and pt_s.pos[0] >= path[idx_s + 1].pos[0]:
+                sub_cands.append((d_r, Rail.RIGHT))
+            if d_t <= zone_y and v_in_s[1] < -12.0 and v_out_s[1] > 12.0 and pt_s.pos[1] <= path[idx_s - 1].pos[1] and pt_s.pos[1] <= path[idx_s + 1].pos[1]:
+                sub_cands.append((d_t, Rail.TOP))
+            if d_b <= zone_y and v_in_s[1] > 12.0 and v_out_s[1] < -12.0 and pt_s.pos[1] >= path[idx_s - 1].pos[1] and pt_s.pos[1] >= path[idx_s + 1].pos[1]:
+                sub_cands.append((d_b, Rail.BOTTOM))
+
+            if sub_cands:
+                sub_cands.sort(key=lambda item: item[0])
+                _, sub_rail = sub_cands[0]
+                valid_vertices.append((pt_s.frame_idx, pt_s.t, sub_rail, pt_s.pos.copy()))
+                existing_indices.add(idx_s)
+
+        valid_vertices.sort(key=lambda item: item[0])
+
+        # 제1적구가 정지 위치에서 실제로 밀려나기 시작한 최초 시각(t_b1_moved) 산출:
+        # 물리적 인과율에 의해 제1적구가 이미 움직인 시각 이후의 쿠션은 절대 선쿠션(c_before)이 될 수 없습니다.
+        t_b1_moved: Optional[float] = None
+        t1_init_pos: Optional[np.ndarray] = None
+        if self.first_target_ball is not None:
+            t1_init_pos = self.initial_positions.get(self.first_target_ball)
+            if t1_init_pos is not None:
+                for _, t_b, p_b in self.all_ball_paths.get(self.first_target_ball, []):
+                    if float(np.linalg.norm(p_b - t1_init_pos)) >= 8.0:
+                        t_b1_moved = t_b
+                        break
+
         c_before = 0
         c_after = 0
-        for f_idx, t_v, r_v, _ in valid_vertices:
-            if (
+        for f_idx, t_v, r_v, v_pos in valid_vertices:
+            is_pre_hit = (
                 self.first_target_hit_time is None
                 or t_v < self.first_target_hit_time - 0.005
-            ):
+            )
+            # 고속 타구에서 쿠션 꼭짓점과 제1적구 충돌 시각이 인접한 경우(전후 0.05초 이내):
+            # 1) 제1적구가 이미 움직이기 시작한 이후이거나,
+            # 2) 출발점(stroke_origin_pos)에서 쿠션 꼭짓점까지의 거리가 출발점에서 제1적구까지의 거리 이상이면
+            #    수구가 제1적구를 먼저 치고 그 뒤의 쿠션을 맞힌 것(O -> T1 -> C)이므로 후행 쿠션(c_after)으로 확정!
+            if is_pre_hit and self.first_target_hit_time is not None:
+                if t_b1_moved is not None and t_v >= t_b1_moved - 0.005:
+                    is_pre_hit = False
+                elif (
+                    abs(t_v - self.first_target_hit_time) <= 0.055
+                    and self.stroke_origin_pos is not None
+                    and t1_init_pos is not None
+                ):
+                    d_orig_c = float(np.linalg.norm(v_pos - self.stroke_origin_pos))
+                    d_orig_t1 = float(np.linalg.norm(t1_init_pos - self.stroke_origin_pos))
+                    if d_orig_c >= d_orig_t1 - 5.0:
+                        is_pre_hit = False
+
+            if is_pre_hit:
                 c_before += 1
             else:
                 c_after += 1
 
         if self._geom_one_bank_recovered and c_before == 0:
-            if c_after > 0 and self.first_target_hit_time is not None:
-                # 첫 쿠션 꼭짓점이 제1적구 충돌 직후 1프레임에 걸친 경우 선쿠션으로 전환
+            if c_after > 0 and self.first_target_hit_time is not None and valid_vertices:
                 first_v_t = valid_vertices[0][1]
-                if abs(first_v_t - self.first_target_hit_time) <= 0.04:
+                first_v_pos = valid_vertices[0][3]
+                can_convert_first_v = abs(first_v_t - self.first_target_hit_time) <= 0.04
+                if (
+                    can_convert_first_v
+                    and self.stroke_origin_pos is not None
+                    and t1_init_pos is not None
+                ):
+                    if float(np.linalg.norm(first_v_pos - self.stroke_origin_pos)) >= float(
+                        np.linalg.norm(t1_init_pos - self.stroke_origin_pos)
+                    ) - 5.0:
+                        can_convert_first_v = False
+                if can_convert_first_v:
                     c_before = 1
                     c_after = max(0, c_after - 1)
                 else:
@@ -747,8 +917,7 @@ class CausalKissSafeFSM:
         self.cushions_before_first_hit = c_before
         self.cushions_after_first_hit = c_after
         self.cushion_count = c_before + c_after
-        if self.cushions_before_first_hit >= 1:
-            self.is_bank_shot = True
+        self.is_bank_shot = bool(self.cushions_before_first_hit >= 1)
         self._sync_shot_event_tokens()
 
         for f_idx, t_v, rail, pos_v in vertices:
@@ -825,6 +994,121 @@ class CausalKissSafeFSM:
         )
         return is_valid_kink, best_bend, line_rmse
 
+    def _verify_micro_feather_contact(
+        self,
+        ball_x: BallColor,
+        ball_y: BallColor,
+        d_min: float,
+        n_xy: np.ndarray,
+        f_pre2: FrameSnapshot,
+        f_prev: FrameSnapshot,
+        f_curr: FrameSnapshot,
+        f_post2: FrameSnapshot,
+        cue_bend_deg: float,
+        line_rmse: float,
+        subpixel_phase_hit: bool = False,
+    ) -> Tuple[bool, float, str]:
+        """
+        [4중 교차 물리·비전 감식기 (Micro-Contact Forensics Engine)]
+        0.1mm ~ 1.0mm 초미세 스침(Feather-thin Kiss) 득점과 아슬아슬한 불발(Near-Miss + 카메라 노이즈/스핀 커브)을
+        4가지 직교 물리 증거로 교차 감식합니다.
+        1) 증거 1 (인과적 법선 반발 코사인 게이트):
+           - 목적구 미세 이동 벡터(delta_p_y)가 수구->목적구 충돌 법선(n_xy) 방향(밀려나는 방향, cos >= 0.55)과 일치하는지 검증
+           - 동시에 수구의 속도 변화 벡터(delta_v_x)가 반작용 방향(dot(delta_v_x, n_xy) < 0)인지 검증
+        2) 증거 2 (사전 정지 노이즈 대비 SNR 및 2프레임 단방향 지속성):
+           - 충돌 직전 히스토리에서 목적구의 정지 떨림 표준편차(sigma_rest)를 측정하여 SNR >= 2.8 검증
+           - 노이즈처럼 다음 프레임에 원위치로 복귀하지 않고 법선 밀림이 유지/증가(proj_post2 >= proj_post1 * 0.75)하는지 검증
+        3) 증거 3 (Piecewise Linear Hinging - 국소 꺾임 vs 스핀 커브 분리):
+           - 접근 구간(pre2->curr) 대비 충돌 지점(curr)에서 국소 꺾임(>= 1.8도)이 집중되었는지 검증
+        4) 증거 4 (서브픽셀 위상 상관 충격 결합):
+           - subpixel_phase_hit가 동반된 경우 미세 변위(0mm)에서도 즉시 확정
+        """
+        if subpixel_phase_hit and d_min <= 95.0:
+            return True, 0.98, "SUBPIXEL_PHASE_IMPACT"
+
+        if d_min > 76.0:
+            return False, 0.0, "OUT_OF_MICRO_RANGE"
+
+        f_post1 = self.history[-2] if len(self.history) >= 2 else f_post2
+        p_y_anchor = 0.5 * (f_pre2.pos[ball_y] + f_prev.pos[ball_y])
+        disp_vec_post1 = f_post1.pos[ball_y] - p_y_anchor
+        disp_vec_post2 = f_post2.pos[ball_y] - p_y_anchor
+        net_disp_y = float(np.linalg.norm(disp_vec_post2))
+
+        if net_disp_y < 1.1:
+            return False, 0.0, "ZERO_TARGET_DISPLACEMENT"
+
+        # [증거 1] 인과적 법선 반발 코사인 검증 (Push-Only Physics)
+        normal_proj_post1 = float(np.dot(disp_vec_post1, n_xy))
+        normal_proj_post2 = float(np.dot(disp_vec_post2, n_xy))
+        cos_push = normal_proj_post2 / max(net_disp_y, 1e-6)
+
+        # 목적구가 수구 쪽으로 끌려오거나(normal_proj < 0) 충돌 법선에서 56도 이상 벗어난 엉뚱한 방향이면 100% 카메라 지터!
+        if normal_proj_post2 < 0.75 or cos_push < 0.55:
+            return False, 0.0, f"REJECT_NON_CAUSAL_PUSH_DIR(cos={cos_push:.2f})"
+
+        # 수구의 반작용 법선 충격 검증: 수구는 목적구를 밀어낸 반대 방향(-n_xy)으로 꺾여야 함
+        dt_pre = max(f_curr.t - f_pre2.t, 1e-4)
+        dt_post = max(f_post2.t - f_curr.t, 1e-4)
+        v_x_in = (f_curr.pos[ball_x] - f_pre2.pos[ball_x]) / dt_pre
+        v_x_out = (f_post2.pos[ball_x] - f_curr.pos[ball_x]) / dt_post
+        delta_v_x = v_x_out - v_x_in
+        cue_recoil_normal = float(np.dot(delta_v_x, n_xy))
+
+        # [증거 2] 사전 정지 노이즈 바닥(Pre-Impact Jitter Baseline) 대비 SNR & 단방향 지속성
+        pre_snaps = list(self.history)[:-3][-5:]
+        if len(pre_snaps) >= 2:
+            pre_pts = np.array([s.pos[ball_y] for s in pre_snaps], dtype=np.float64)
+            pre_mean = np.mean(pre_pts, axis=0)
+            sigma_rest = float(np.mean(np.linalg.norm(pre_pts - pre_mean, axis=1)))
+        else:
+            sigma_rest = 0.35
+
+        # 만약 충돌 후 원위치로 되돌아오는 1프레임 스파이크(post2 법선 변위가 post1의 65% 미만으로 급감)라면 노이즈로 기각!
+        if normal_proj_post1 >= 0.8 and normal_proj_post2 < normal_proj_post1 * 0.65:
+            return False, 0.0, "REJECT_TRANSIENT_JITTER_SPIKE"
+
+        snr = net_disp_y / max(sigma_rest, 0.35)
+        if snr < 2.6:
+            return False, 0.0, f"REJECT_LOW_SNR({snr:.2f})"
+
+        # [증거 3] 국소 꼭짓점 꺾임(Piecewise Hinging) vs 균일 스핀 커브 분리
+        bend_pre = self._angle_between_deg(
+            f_prev.pos[ball_x] - f_pre2.pos[ball_x],
+            f_curr.pos[ball_x] - f_prev.pos[ball_x],
+        )
+        bend_at_impact = max(
+            cue_bend_deg,
+            self._angle_between_deg(
+                f_curr.pos[ball_x] - f_prev.pos[ball_x],
+                f_post2.pos[ball_x] - f_curr.pos[ball_x],
+            ),
+        )
+        # 스핀 커브는 충돌 전(bend_pre)부터 똑같이 휘어지지만, 진짜 미세접촉은 충돌 지점에서 꺾임이 유의미하게 발생함
+        is_sharp_hinge = (bend_at_impact >= 1.8) and (
+            bend_at_impact >= bend_pre * 1.25 or line_rmse >= 1.15
+        )
+        if not is_sharp_hinge:
+            return False, 0.0, f"REJECT_SMOOTH_SPIN_CURVE(bend={bend_at_impact:.2f})"
+
+        # 종합 신뢰도 점수 계산 (0.0 ~ 1.0)
+        score = 0.0
+        if cos_push >= 0.55 and normal_proj_post2 >= 0.75:
+            score += 0.35
+        if cue_recoil_normal < -2.0 or bend_at_impact >= 2.2:
+            score += 0.25
+        if snr >= 2.8 and normal_proj_post2 >= max(0.75, normal_proj_post1 * 0.75):
+            score += 0.25
+        if is_sharp_hinge:
+            score += 0.15
+
+        is_micro_hit = score >= 0.75
+        detail = (
+            f"MICRO_HIT_CONFIRMED(score={score:.2f}, d_min={d_min:.1f}mm, "
+            f"disp={net_disp_y:.2f}mm, cos={cos_push:.2f}, SNR={snr:.1f}, bend={bend_at_impact:.1f}deg)"
+        )
+        return is_micro_hit, score, detail
+
     def _verify_pair_collision(
         self,
         ball_x: BallColor,
@@ -852,9 +1136,19 @@ class CausalKissSafeFSM:
         if (t_eval - self.pair_last_hit_time.get(pair_key, -999.0)) < self.PAIR_COOLDOWN_SEC:
             return False
 
-        d_min, _, n_xy = self._subframe_ccd(
+        d_min_pre, _, n_xy_pre = self._subframe_ccd(
             f_prev.pos[ball_x], f_curr.pos[ball_x], f_prev.pos[ball_y], f_curr.pos[ball_y]
         )
+        d_min_post, _, n_xy_post = self._subframe_ccd(
+            f_curr.pos[ball_x], f_post2.pos[ball_x], f_curr.pos[ball_y], f_post2.pos[ball_y]
+        )
+        if self.first_target_ball is None and not is_object_ball_kiss_check and d_min_post < d_min_pre:
+            d_min = d_min_post
+            n_xy = n_xy_post
+        else:
+            d_min = d_min_pre
+            n_xy = n_xy_pre
+
         # 30fps 고속 샷에서 프레임 사이(Mid-Frame) 정지 적구를 타격하고 튕겨나간 경우 최대 135mm까지 스냅샷 이격이 발생할 수 있음
         if d_min > 135.0:
             return False
@@ -925,13 +1219,17 @@ class CausalKissSafeFSM:
         phenomenon_a_hit = False
         if speed_y_before < 45.0 and not recent_ob_kiss:
             # 목적구가 정지해 있었고 직전 적구 간 키스가 없었던 경우:
-            # 1) 일반 근접(d_min <= 68.5mm): 5.2mm 이상 이동 & ||Delta v_Y|| >= 42.0mm/s
-            # 2) 30fps 프레임 사이 고속 반발(68.5mm < d_min <= 135.0mm):
+            # 1) 일반 근접(d_min <= 72.0mm, 제1적구 최초 타격 시에는 82.0mm): 5.2mm 이상 이동 & ||Delta v_Y|| >= 42.0mm/s
+            # 2) 30fps 프레임 사이 고속 반발(72.0mm < d_min <= 135.0mm):
             #    관성의 법칙에 따라 정지해 있던 적구가 스스로 움직일 수 없으므로,
             #    정지 적구가 15.0mm 이상 강하게 튀어나가고(||Delta v_Y|| >= 140mm/s) 제3의 공 Z가 멀리(> 85mm) 있을 때 인정!
+            #    단, 제2적구 판정 시 72mm 초과 원거리에서는 수구 자체도 반작용 굴절(has_cue_vertex)이 동반되어야 허공 오탐을 막음!
             net_disp_y = float(np.linalg.norm(p_y_after - p_y_before))
             step_after_hit = float(np.linalg.norm(p_y_after - f_curr.pos[ball_y]))
-            if d_min <= self.TARGET_APPROACH_ZONE_MM:
+            eff_approach_zone = (
+                82.0 if self.first_target_ball is None else self.TARGET_APPROACH_ZONE_MM
+            )
+            if d_min <= eff_approach_zone:
                 if (
                     net_disp_y >= self.TARGET_MOVED_DISP_TH_MM
                     and step_after_hit >= 1.5
@@ -945,6 +1243,10 @@ class CausalKissSafeFSM:
                 and delta_v_y_mag >= 140.0
                 and d_y_other > 85.0
                 and d_x_other > d_min
+                and (
+                    self.first_target_ball is None
+                    or (has_cue_vertex and cue_bend_deg >= 4.0 and float(np.dot(delta_v_x, delta_v_y)) < 0.0)
+                )
             ):
                 phenomenon_a_hit = True
         elif d_min <= self.TARGET_APPROACH_ZONE_MM:
@@ -971,17 +1273,20 @@ class CausalKissSafeFSM:
         if subpixel_phase_hit and d_min <= 95.0 and d_y_other > 72.0:
             phenomenon_b_hit = True
         elif not phenomenon_a_hit and not recent_ob_kiss:
-            # 수구가 현재 레일 쿠션 반사 중인지 확인 (쿠션 옆 목적구 비접촉 반사 착시 Test 3 / Illusion 3 차단)
+            # 수구가 현재 레일 쿠션 반사 중인지 확인 (쿠션 옆 목적구 비접촉 반사 착시 완벽 차단)
             px, py = float(f_curr.pos[ball_x][0]), float(f_curr.pos[ball_x][1])
             d_rail_now = min(px, TABLE_W - px, py, TABLE_H - py)
-            is_bouncing_on_rail = d_rail_now <= self.RAIL_ENTER_MARGIN
+            rail_normal_flipped = (
+                (px <= 125.0 and v_x_before[0] < -15.0 and v_x_after[0] > 15.0)
+                or (TABLE_W - px <= 125.0 and v_x_before[0] > 15.0 and v_x_after[0] < -15.0)
+                or (py <= 125.0 and v_x_before[1] < -15.0 and v_x_after[1] > 15.0)
+                or (TABLE_H - py <= 125.0 and v_x_before[1] > 15.0 and v_x_after[1] < -15.0)
+            )
+            is_bouncing_on_rail = (d_rail_now <= self.RAIL_ENTER_MARGIN) or rail_normal_flipped
 
             other_moved = float(np.linalg.norm(f_post2.pos[other_ball] - f_pre2.pos[other_ball])) >= 5.2
 
             # [기술 4-2 핵심 방어: 2적구 위치에서의 1적구 재충돌 운동량 흡수 차단]
-            # 만약 제1적구(Z=other_ball)가 수구(A) 근방(<= 74.0mm)에 있으면서
-            # 반작용 운동량을 흡수(||Delta v_Z|| >= 28.0 mm/s 및 ||Delta v_A + Delta v_Z|| < ||Delta v_A + Delta v_Y||)했다면,
-            # 수구(A)를 꺾이게 만든 범인은 제2적구(Y)가 아니라 제1적구(Z)이므로 증거 B를 즉시 무효화합니다!
             first_ball_absorbed_momentum = False
             if self.first_target_ball is not None and ball_y != self.first_target_ball:
                 res_az = float(np.linalg.norm(delta_v_x + delta_v_z))
@@ -1002,25 +1307,48 @@ class CausalKissSafeFSM:
                 ):
                     phenomenon_b_hit = True
             elif not first_ball_absorbed_momentum:
-                # 제2적구 얇은 스침 시:
+                # 제2적구 얇은 스침(0.1mm ~ 1.0mm 초미세 접촉) vs 아슬아슬한 불발(Near-Miss) 4중 교차 감식:
                 net_disp_y = float(np.linalg.norm(p_y_after - p_y_before))
+                normal_disp_y = float(np.dot(p_y_after - p_y_before, n_xy))
                 y_bend_deg = (
                     self._angle_between_deg(v_y_before, v_y_after)
                     if speed_y_before >= 40.0
                     else 999.0
                 )
+                micro_ok, _, micro_detail = self._verify_micro_feather_contact(
+                    ball_x=ball_x,
+                    ball_y=ball_y,
+                    d_min=d_min,
+                    n_xy=n_xy,
+                    f_pre2=f_pre2,
+                    f_prev=f_prev,
+                    f_curr=f_curr,
+                    f_post2=f_post2,
+                    cue_bend_deg=cue_bend_deg,
+                    line_rmse=line_rmse,
+                    subpixel_phase_hit=subpixel_phase_hit,
+                )
                 if (
-                    d_min <= self.THIN_HIT_MAX_DIST_MM
-                    and has_cue_vertex
-                    and cue_bend_deg >= self.THIN_HIT_MIN_BEND_DEG
-                    and line_rmse >= self.THIN_HIT_MIN_LINE_RMSE_MM
-                    and not is_bouncing_on_rail
+                    not is_bouncing_on_rail
                     and d_x_other > 72.0
                     and not other_moved
-                    and net_disp_y >= 1.5
                     and y_bend_deg >= 3.5
+                    and (
+                        micro_ok
+                        or (
+                            d_min <= self.THIN_HIT_MAX_DIST_MM
+                            and has_cue_vertex
+                            and cue_bend_deg >= self.THIN_HIT_MIN_BEND_DEG
+                            and line_rmse >= self.THIN_HIT_MIN_LINE_RMSE_MM
+                            and net_disp_y >= 1.5
+                            and normal_disp_y >= 0.8
+                            and float(np.dot(p_y_after - p_y_before, n_xy)) / max(net_disp_y, 1e-6) >= 0.55
+                        )
+                    )
                 ):
                     phenomenon_b_hit = True
+                    if micro_ok:
+                        self.event_log.append(f"[{t_eval:.2f}s] [초미세 접촉 4중 감식 확정] {ball_y.name}: {micro_detail}")
                 else:
                     # 수구가 고속(>= 400mm/s)으로 목적구 중심 거리 56.0mm 이내까지 정면 진입한 뒤
                     # 통과하지 못하고 목적구 앞에서 급감속 정지(Stop-Shot)한 경우 충돌 인정
@@ -1058,35 +1386,107 @@ class CausalKissSafeFSM:
         """
         if self.first_target_ball is None:
             self.first_target_ball = target_color
-            self.first_target_hit_time = t
-            self.first_target_hit_path_idx = max(0, len(self.cue_path) - 3)
             self.first_target_normal = n_ab
 
+            # cue_path 내 최근 5프레임 중 목적구(target_color)가 아직 정지 위치에서 밀려나기 전(disp < 8.0mm)이면서
+            # 실제 제1적구와 가장 가까웠던 충돌 프레임 인덱스를 역산하여,
+            # 제1적구 타격 직후 발생한 첫 쿠션이 선쿠션(뱅크샷)으로 오분류되는 현상을 원천 차단합니다.
+            default_hit_idx = max(0, len(self.cue_path) - 3)
+            best_hit_idx = default_hit_idx
+            t1_ref_pos = self.initial_positions.get(target_color, f_curr.pos[target_color])
+            t1_path = self.all_ball_paths.get(target_color, [])
+            search_lo = max(0, len(self.cue_path) - 5)
+            best_d_t1 = float("inf")
+            for idx_cand in range(search_lo, len(self.cue_path)):
+                if idx_cand > default_hit_idx and idx_cand < len(t1_path):
+                    t1_disp_at_cand = float(np.linalg.norm(t1_path[idx_cand][2] - t1_ref_pos))
+                    if t1_disp_at_cand >= 8.0:
+                        # 이미 제1적구가 8mm 이상 밀려난 이후의 프레임(예: 타격 후 뒤쪽 쿠션 도달 프레임)은 충돌 시점 후보에서 배제
+                        continue
+                d_c = float(np.linalg.norm(self.cue_path[idx_cand].pos - t1_ref_pos))
+                if d_c < best_d_t1:
+                    best_d_t1 = d_c
+                    best_hit_idx = idx_cand
+
+            t_hit_exact = self.cue_path[best_hit_idx].t if self.cue_path else t
+            if best_hit_idx >= 1 and len(self.cue_path) > best_hit_idx:
+                p_prev_c = self.cue_path[best_hit_idx - 1].pos
+                p_curr_c = self.cue_path[best_hit_idx].pos
+                seg_v = p_curr_c - p_prev_c
+                seg_len_sq = float(np.dot(seg_v, seg_v))
+                if seg_len_sq > 1e-4:
+                    t_star = float(
+                        np.clip(np.dot(t1_ref_pos - p_prev_c, seg_v) / seg_len_sq, 0.0, 1.0)
+                    )
+                    seg_closest = p_prev_c + t_star * seg_v
+                    if float(np.linalg.norm(t1_ref_pos - seg_closest)) <= 72.0 and t_star < 0.90:
+                        t_prev_c = self.cue_path[best_hit_idx - 1].t
+                        t_curr_c = self.cue_path[best_hit_idx].t
+                        t_hit_exact = t_prev_c + t_star * (t_curr_c - t_prev_c)
+
+            self.first_target_hit_path_idx = best_hit_idx
+            self.first_target_hit_time = t_hit_exact
+
+            # 제1적구 도달 이전(idx < best_hit_idx 이고 출발점 거리가 제1적구보다 짧은 구간)의
+            # 순수 선행 레일 접근 거리만 재집계하여, 2프레임 후행 컨텍스트(f_post1/f_post2)에서
+            # 제1적구 타격 후 맞은 쿠션이 선쿠션으로 둔갑하는 현상을 완벽히 방지합니다.
+            t1_init = self.initial_positions.get(target_color, f_curr.pos[target_color])
+            pre_hit_min_rail = 9999.0
+            if self.stroke_origin_pos is not None:
+                d_orig_t1 = float(np.linalg.norm(t1_init - self.stroke_origin_pos))
+                for idx_pre in range(0, best_hit_idx):
+                    p_pre = self.cue_path[idx_pre].pos
+                    disp_orig = float(np.linalg.norm(p_pre - self.stroke_origin_pos))
+                    if 18.0 <= disp_orig < d_orig_t1 - 5.0:
+                        d_r_pre = min(
+                            float(p_pre[0]),
+                            float(TABLE_W - p_pre[0]),
+                            float(p_pre[1]),
+                            float(TABLE_H - p_pre[1]),
+                        )
+                        if d_r_pre < pre_hit_min_rail:
+                            pre_hit_min_rail = d_r_pre
+            self.min_rail_dist_before_first_hit = pre_hit_min_rail
+
             # 1쿠션 넣어치기(원뱅크 걸어치기) 기하학적 보장:
-            # 제1적구 접촉 전 수구가 쿠션 대역(<= 130.0mm)에 진입한 적이 있고,
-            # 초기 스트로크 방향 직선이 제1적구 중심을 비껴나(impact_param > 45.0mm 또는 굴절 >= 8.0도)
-            # 쿠션을 먼저 맞고 들어온 궤적이면 선쿠션 1회를 보장합니다.
+            # 1) 수구가 제1적구 도달 이전에 출발 위치보다 레일 쪽으로 최소 15.0mm 이상 실제로 다가간 뒤 레일 밀착 대역(<= 58.0mm)을 찍었고,
+            # 2) 초기 스트로크 방향 직선이 제1적구 중심을 비껴나(impact_param > 38.0mm)
+            #    쿠션 반사 없이는 제1적구를 맞힐 수 없는 궤적일 때만 선쿠션 1회를 복원합니다.
             cue_c = self.active_cue_ball or self.assigned_cue_ball
             if (
                 cue_c is not None
                 and self.stroke_origin_pos is not None
                 and self.initial_stroke_dir is not None
-                and self.min_rail_dist_before_first_hit <= 130.0
+                and self.min_rail_dist_before_first_hit <= 58.0
             ):
-                t1_init = self.initial_positions.get(target_color, f_curr.pos[target_color])
+                origin_rail_dist = min(
+                    float(self.stroke_origin_pos[0]),
+                    float(TABLE_W - self.stroke_origin_pos[0]),
+                    float(self.stroke_origin_pos[1]),
+                    float(TABLE_H - self.stroke_origin_pos[1]),
+                )
+                actually_approached_rail = (
+                    origin_rail_dist - self.min_rail_dist_before_first_hit
+                ) >= 15.0
+
                 to_t1 = t1_init - self.stroke_origin_pos
                 proj_s = float(np.dot(to_t1, self.initial_stroke_dir))
                 perp_vec = to_t1 - proj_s * self.initial_stroke_dir
                 impact_param = float(np.linalg.norm(perp_vec)) if proj_s > 0.0 else 999.0
 
                 vec_to_hit = f_curr.pos[cue_c] - self.stroke_origin_pos
-                deflect_init = self._angle_between_deg(self.initial_stroke_dir, vec_to_hit)
-                if deflect_init >= 8.0 or impact_param > 45.0:
+                deflect_init = max(
+                    self._angle_between_deg(self.initial_stroke_dir, vec_to_hit),
+                    self._angle_between_deg(self.initial_stroke_dir, to_t1),
+                )
+                if actually_approached_rail and (
+                    (impact_param > 38.0 and deflect_init >= 8.0) or impact_param > 72.0
+                ):
                     self._geom_one_bank_recovered = True
 
-            self._update_polyline_cushion_counts(self.first_target_hit_path_idx)
-            if self.cushions_before_first_hit >= 1:
-                self.is_bank_shot = True
+            # 제1적구 충돌 직후 반사 벡터가 형성될 수 있도록 전체 현재 cue_path(f_post2 포함)를 기준으로 평가
+            self._update_polyline_cushion_counts()
+            self.is_bank_shot = bool(self.cushions_before_first_hit >= 1)
 
             self.event_log.append(
                 f"[{t:.2f}s] 제1적구 접촉 ({target_color.name}, 선쿠션: {self.cushions_before_first_hit}, 총쿠션: {self.cushion_count})"
@@ -1272,10 +1672,9 @@ class CausalKissSafeFSM:
                 f"[{t_eval:.2f}s] [적구 간 키스 감지] {b1.name} <-> {b2.name} (앵커 갱신 완료)"
             )
 
-        # [Step 2] 폴리라인 꼭짓점 쿠션 카운트 최신화
-        self._update_polyline_cushion_counts()
-
-        # [Step 3] 수구-목적구 충돌 감지 (원리 3: 목적구 위치 이탈 OR 확실한 꼭짓점 굴절)
+        # [Step 2] 수구-목적구 충돌 감지 (원리 3: 목적구 위치 이탈 OR 확실한 꼭짓점 굴절)
+        # 쿠션 카운트 갱신 전에 제1적구/제2적구 충돌을 먼저 판정하여,
+        # 제1적구 충돌 직후의 반사나 굴절이 제1적구 충돌 전 쿠션(뱅크샷)으로 오인되는 현상을 원천 차단합니다.
         sorted_targets = sorted(
             other_balls,
             key=lambda c: 0 if c == self.first_target_ball else 1,
@@ -1305,6 +1704,10 @@ class CausalKissSafeFSM:
                 self._register_cue_target_hit(
                     t_eval, target_color, n_ab, f_prev, f_curr, f_post2
                 )
+
+        # [Step 3] 폴리라인 꼭짓점 쿠션 카운트 최신화
+        if not self.score_dispatched:
+            self._update_polyline_cushion_counts()
 
         # [Step 4] 투터치 파울 검사
         if not self.score_dispatched:
@@ -1522,13 +1925,15 @@ class CausalKissSafeFSM:
                 other_cs = [c for c in BallColor if c != cue]
                 for s_h in self.history:
                     p_h = s_h.pos[cue]
+                    disp_from_origin = float(np.linalg.norm(p_h - self.stroke_origin_pos))
                     d_r_h = min(
                         float(p_h[0]),
                         float(TABLE_W - p_h[0]),
                         float(p_h[1]),
                         float(TABLE_H - p_h[1]),
                     )
-                    if d_r_h < self.min_rail_dist_before_first_hit:
+                    # 정지 상태(출발 원점 부근)에서 원래 레일에 붙어 있던 거리는 선행 쿠션 접근 거리에서 제외합니다.
+                    if disp_from_origin >= 18.0 and d_r_h < self.min_rail_dist_before_first_hit:
                         self.min_rail_dist_before_first_hit = d_r_h
                     min_d_t = min(
                         float(np.linalg.norm(p_h - s_h.pos[oc])) for oc in other_cs

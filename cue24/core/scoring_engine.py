@@ -257,23 +257,25 @@ class ScoringEngine:
             and 0 <= (frame_idx - self._first_hit_frame) <= 2
             and self._stroke_origin_pos is not None
             and self._initial_stroke_dir is not None
-            and self._min_rail_dist_before_first_hit <= 115.0
+            and self._min_rail_dist_before_first_hit <= 58.0
         ):
-            # [규칙 4: 1쿠션 넣어치기(원뱅크)에서 쿠션 바로 앞 제1적구와 반사 프레임이 1~2프레임 겹친 경우]
-            # 초기 스트로크 방향 직선이 제1적구 중심에서 36.0mm 이상 비껴나 쿠션을 먼저 향한 궤적이라면
-            # 이 반사는 제1적구 접촉 직전에 일어난 선쿠션(1쿠션 뱅크)으로 분류합니다.
+            # [규칙 4: 1쿠션 넣어치기(원뱅크)에서 쿠션 바로 앞 제1적구와 반사 프레임이 겹친 경우]
+            # 반드시 출발점(ox, oy)에서 쿠션 충돌점(cue_pos)까지의 거리가 출발점에서 제1적구(t1_pos)까지의 거리보다 짧고(선행 반사),
+            # 초기 스트로크 직선이 제1적구 중심에서 36.0mm 이상 비껴난 궤적일 때만 선쿠션(1쿠션 뱅크)으로 분류합니다.
             ox, oy = self._stroke_origin_pos
             dx_i, dy_i = self._initial_stroke_dir
             t1_pos = self._initial_ball_positions.get(self.first_object_ball_id, cue_pos)
             tx_v = t1_pos[0] - ox
             ty_v = t1_pos[1] - oy
+            dist_o_t1 = math.hypot(tx_v, ty_v)
+            dist_o_c = math.hypot(cue_pos[0] - ox, cue_pos[1] - oy)
             proj_l = tx_v * dx_i + ty_v * dy_i
             imp_p = (
                 math.hypot(tx_v - proj_l * dx_i, ty_v - proj_l * dy_i)
                 if proj_l > 0.0
                 else 999.0
             )
-            if imp_p > 36.0:
+            if imp_p > 36.0 and dist_o_c < dist_o_t1 - 5.0:
                 self.cushion_count_before_first_hit += 1
             else:
                 self.cushion_count_after_first_hit += 1
@@ -337,11 +339,24 @@ class ScoringEngine:
             ):
                 continue
 
+            # 고속 주행 시 프레임 사이(Sub-frame)에 레일을 찍고 나와서 샘플링 좌표가 145mm~230mm에 찍힌 경우를 위해
+            # 목적구와 충분히 떨어진(>= 85mm) 상태에서 법선 속도가 큰 경우 감지 대역을 동적으로 확장합니다.
+            dyn_zone_x = (
+                min(230.0, max(145.0, 75.0 + 0.85 * max(abs(v_prev[0]), abs(v_curr[0]))))
+                if min_target_d >= 85.0
+                else 145.0
+            )
+            dyn_zone_y = (
+                min(230.0, max(135.0, 75.0 + 0.85 * max(abs(v_prev[1]), abs(v_curr[1]))))
+                if min_target_d >= 85.0
+                else 135.0
+            )
+
             rail_checks = [
-                ("LEFT", p_curr[0], -v_prev[0], v_curr[0], 145.0),
-                ("RIGHT", self.table_width_mm - p_curr[0], v_prev[0], -v_curr[0], 145.0),
-                ("TOP", p_curr[1], -v_prev[1], v_curr[1], 135.0),
-                ("BOTTOM", self.table_height_mm - p_curr[1], v_prev[1], -v_curr[1], 135.0),
+                ("LEFT", p_curr[0], -v_prev[0], v_curr[0], dyn_zone_x),
+                ("RIGHT", self.table_width_mm - p_curr[0], v_prev[0], -v_curr[0], dyn_zone_x),
+                ("TOP", p_curr[1], -v_prev[1], v_curr[1], dyn_zone_y),
+                ("BOTTOM", self.table_height_mm - p_curr[1], v_prev[1], -v_curr[1], dyn_zone_y),
             ]
             for r_name, dist_r, v_in, v_out, max_zone in rail_checks:
                 if dist_r <= max_zone and v_in > 1.2 and v_out > 1.0:
@@ -377,19 +392,73 @@ class ScoringEngine:
             self._approaching_rail[r_k] = False
 
         if self.first_object_ball_id is None:
+            t1_origin = self._initial_ball_positions.get(target_ball_id, cue_pos)
+            # 고속 수구가 제1적구를 먼저 맞히고 직후(또는 동일 구간) 쿠션을 맞혔는데
+            # 제1적구 위치 변위 확정보다 쿠션 반사가 1프레임 먼저 감지된 경우 역전 복원 (O -> T1 -> C 기하 검증)
+            if (
+                self.cushion_count_before_first_hit == 1
+                and self._stroke_origin_pos is not None
+                and self._last_cushion_hit_pos is not None
+            ):
+                ox_c, oy_c = self._stroke_origin_pos
+                cx_last, cy_last = self._last_cushion_hit_pos
+                d_o_t1 = math.hypot(t1_origin[0] - ox_c, t1_origin[1] - oy_c)
+                d_o_c = math.hypot(cx_last - ox_c, cy_last - oy_c)
+                d_c_t1 = math.hypot(cx_last - t1_origin[0], cy_last - t1_origin[1])
+                d_rail_last = min(
+                    cx_last,
+                    self.table_width_mm - cx_last,
+                    cy_last,
+                    self.table_height_mm - cy_last,
+                )
+                if d_o_c >= d_o_t1 - 5.0 and d_c_t1 <= 140.0:
+                    self.cushion_count_before_first_hit = 0
+                    if d_rail_last <= 58.0:
+                        self.cushion_count_after_first_hit += 1
+                    else:
+                        self.total_cushion_count = max(0, self.total_cushion_count - 1)
+                        self.cushion_count_before_second_hit = max(
+                            0, self.cushion_count_before_second_hit - 1
+                        )
+
             # [규칙 4: 1쿠션 넣어치기(원뱅크 걸어치기) 기하학적 1쿠션 보장 검증]
-            # 수구가 출발 후 제1적구에 닿기 전까지 아직 선쿠션이 0으로 찍혀 있더라도,
-            # 1) 수구가 4면 쿠션 경계(130.0mm 이내)에 접근한 적이 있고,
-            # 2) 수구 초기 스트로크 방향 벡터(_initial_stroke_dir)로부터 출발점->충돌점 벡터가 8.0도 이상 꺾였거나,
-            #    초기 스트로크 직선에서 제1적구 중심까지의 수직 거리(Impact Parameter)가 72.0mm를 초과하여
-            #    쿠션 반사 없이는 물리적으로 제1적구를 맞힐 수 없는 궤적이라면 1쿠션 뱅크샷으로 100% 복원!
+            # 수구가 출발 후 제1적구에 도달하기 이전(d_o_pt < d_o_t1 - 5.0) 구간에서 실제로 레일 밀착 대역(<= 58.0mm)을 찍었고,
+            # 초기 스트로크 직선에서 제1적구 중심까지의 수직 거리(Impact Parameter)가 42.0mm를 초과하며
+            # 출발점->충돌점 벡터가 8.0도 이상 꺾였을 때만 1쿠션 뱅크샷으로 복원!
+            pre_t1_min_rail = 9999.0
+            if self._stroke_origin_pos is not None:
+                ox, oy = self._stroke_origin_pos
+                d_o_t1_ref = math.hypot(t1_origin[0] - ox, t1_origin[1] - oy)
+                for _, pt_log, _, _ in self._cue_trajectory_log:
+                    d_o_pt = math.hypot(pt_log[0] - ox, pt_log[1] - oy)
+                    if 20.0 <= d_o_pt < d_o_t1_ref - 5.0:
+                        r_pt = min(
+                            pt_log[0],
+                            self.table_width_mm - pt_log[0],
+                            pt_log[1],
+                            self.table_height_mm - pt_log[1],
+                        )
+                        if r_pt < pre_t1_min_rail:
+                            pre_t1_min_rail = r_pt
+                self._min_rail_dist_before_first_hit = pre_t1_min_rail
+
             if (
                 self.cushion_count_before_first_hit == 0
                 and self._stroke_origin_pos is not None
                 and self._initial_stroke_dir is not None
-                and self._min_rail_dist_before_first_hit <= 130.0
+                and self._min_rail_dist_before_first_hit <= 58.0
             ):
                 ox, oy = self._stroke_origin_pos
+                origin_rail_dist = min(
+                    ox,
+                    self.table_width_mm - ox,
+                    oy,
+                    self.table_height_mm - oy,
+                )
+                actually_approached_rail = (
+                    self._min_rail_dist_before_first_hit <= 48.0
+                    or (origin_rail_dist - self._min_rail_dist_before_first_hit) >= 15.0
+                )
                 dx_init, dy_init = self._initial_stroke_dir
                 vx_hit = cue_pos[0] - ox
                 vy_hit = cue_pos[1] - oy
@@ -401,7 +470,6 @@ class ScoringEngine:
                         min(1.0, (dx_init * vx_hit + dy_init * vy_hit) / dist_hit),
                     )
                     deflection_from_init = math.degrees(math.acos(cos_a))
-                t1_origin = self._initial_ball_positions.get(target_ball_id, cue_pos)
                 tx_vec = t1_origin[0] - ox
                 ty_vec = t1_origin[1] - oy
                 proj_len = tx_vec * dx_init + ty_vec * dy_init
@@ -412,7 +480,11 @@ class ScoringEngine:
                 else:
                     impact_param = 999.0
 
-                if deflection_from_init >= 8.0 or impact_param > 72.0:
+                if (
+                    actually_approached_rail
+                    and impact_param > 42.0
+                    and (deflection_from_init >= 8.0 or impact_param > 72.0)
+                ):
                     self.cushion_count_before_first_hit = 1
                     self.total_cushion_count = max(1, self.total_cushion_count)
                     self.cushion_count_before_second_hit = max(
@@ -539,10 +611,15 @@ class ScoringEngine:
             "TOP": prev_y,
             "BOTTOM": self.table_height_mm - prev_y,
         }
-        if self.first_object_ball_id is None:
-            min_r_now = min(min(rail_dists.values()), min(prev_rail_dists.values()))
-            if min_r_now < self._min_rail_dist_before_first_hit:
-                self._min_rail_dist_before_first_hit = min_r_now
+        if self.first_object_ball_id is None and self._stroke_origin_pos is not None:
+            disp_origin = math.hypot(
+                x - self._stroke_origin_pos[0],
+                y - self._stroke_origin_pos[1],
+            )
+            if disp_origin >= 20.0:
+                min_r_now = min(min(rail_dists.values()), min(prev_rail_dists.values()))
+                if min_r_now < self._min_rail_dist_before_first_hit:
+                    self._min_rail_dist_before_first_hit = min_r_now
 
         near_rails_count = sum(1 for d_r in rail_dists.values() if d_r <= 120.0)
         if near_rails_count == 0:
@@ -554,6 +631,15 @@ class ScoringEngine:
             "TOP": self.top_bound + 25.0,
             "BOTTOM": (self.table_height_mm - self.bottom_bound) + 25.0,
         }
+        # 목적구와 충분히 떨어진(>= 85mm) 상태에서 고속 주행 중 프레임 사이(Sub-frame)에 레일을 찍고 나온 경우,
+        # 법선 방향 이동 속도 크기에 비례하여 유효 반사 대역을 최대 230mm까지 동적으로 확장합니다.
+        if min_dist_to_targets >= 85.0:
+            dyn_x = min(230.0, 75.0 + 0.85 * max(abs(prev_vx), abs(vx)))
+            dyn_y = min(230.0, 75.0 + 0.85 * max(abs(prev_vy), abs(vy)))
+            rail_max_zones["LEFT"] = max(rail_max_zones["LEFT"], dyn_x)
+            rail_max_zones["RIGHT"] = max(rail_max_zones["RIGHT"], dyn_x)
+            rail_max_zones["TOP"] = max(rail_max_zones["TOP"], dyn_y)
+            rail_max_zones["BOTTOM"] = max(rail_max_zones["BOTTOM"], dyn_y)
 
         # [4대 업그레이드 ①] 슈미트 트리거 히스테리시스 재무장(Re-arm) 및 동일 레일 심층 이탈(220mm) 잠금 해제:
         travel_from_last = (
@@ -613,13 +699,14 @@ class ScoringEngine:
                 ) and (not just_hit_target or is_one_cushion_entry or d_rail <= 42.0):
                     return True, clear_rev, apex_pt
                 return False, clear_rev, apex_pt
-            # 광역 궤적 반사 대역(54.0mm ~ 경계)에서는 제1적구 접촉 전이거나 목적구와 85mm 이상 떨어져 있을 때 쿠션 반사로 인정
+            # 광역 궤적 반사 대역(54.0mm ~ 경계)에서는 목적구 충돌 굴절이 쿠션으로 오인되지 않도록 목적구와 충분히 분리된 경우만 인정
             if (
-                self.first_object_ball_id is None
+                (self.first_object_ball_id is None and min_dist_to_targets >= 74.0)
                 or (
                     just_hit_target
                     and self.cushion_count_before_first_hit == 0
                     and self._min_rail_dist_before_first_hit <= 54.0
+                    and min_dist_to_targets >= 74.0
                 )
                 or min_dist_to_targets >= 85.0
             ):
@@ -627,7 +714,8 @@ class ScoringEngine:
             return False, clear_rev, apex_pt
 
         # 1. LEFT 레일 검사
-        if x <= self.left_bound:
+        eff_left_bound = max(self.left_bound, rail_max_zones["LEFT"] - 25.0)
+        if x <= eff_left_bound:
             if vx < -1e-4 or prev_vx < -1e-4:
                 self._approaching_rail["LEFT"] = True
             if self._approaching_rail["LEFT"] and vx > 1e-4:
@@ -637,7 +725,7 @@ class ScoringEngine:
                         triggered_rails.append("LEFT")
                 self._approaching_rail["LEFT"] = False
         else:
-            if self._approaching_rail["LEFT"] and vx > 1e-4:
+            if (self._approaching_rail["LEFT"] or prev_vx < -15.0) and vx > 1e-4:
                 ok_zone, clear_rev, apex_pt = _can_accept_in_zone("LEFT", -prev_vx, vx)
                 if ok_zone and physics_ai_engine.verify_cushion_impulse("LEFT", apex_pt, prev_vel_tuple, cue_vel):
                     if self.record_cushion_touch("LEFT", frame_idx, apex_pt, clear_rev):
@@ -645,7 +733,8 @@ class ScoringEngine:
             self._approaching_rail["LEFT"] = False
 
         # 2. RIGHT 레일 검사
-        if x >= self.right_bound:
+        eff_right_bound = min(self.right_bound, self.table_width_mm - (rail_max_zones["RIGHT"] - 25.0))
+        if x >= eff_right_bound:
             if vx > 1e-4 or prev_vx > 1e-4:
                 self._approaching_rail["RIGHT"] = True
             if self._approaching_rail["RIGHT"] and vx < -1e-4:
@@ -655,7 +744,7 @@ class ScoringEngine:
                         triggered_rails.append("RIGHT")
                 self._approaching_rail["RIGHT"] = False
         else:
-            if self._approaching_rail["RIGHT"] and vx < -1e-4:
+            if (self._approaching_rail["RIGHT"] or prev_vx > 15.0) and vx < -1e-4:
                 ok_zone, clear_rev, apex_pt = _can_accept_in_zone("RIGHT", prev_vx, -vx)
                 if ok_zone and physics_ai_engine.verify_cushion_impulse("RIGHT", apex_pt, prev_vel_tuple, cue_vel):
                     if self.record_cushion_touch("RIGHT", frame_idx, apex_pt, clear_rev):
@@ -663,7 +752,8 @@ class ScoringEngine:
             self._approaching_rail["RIGHT"] = False
 
         # 3. TOP 레일 검사
-        if y <= self.top_bound:
+        eff_top_bound = max(self.top_bound, rail_max_zones["TOP"] - 25.0)
+        if y <= eff_top_bound:
             if vy < -1e-4 or prev_vy < -1e-4:
                 self._approaching_rail["TOP"] = True
             if self._approaching_rail["TOP"] and vy > 1e-4:
@@ -673,7 +763,7 @@ class ScoringEngine:
                         triggered_rails.append("TOP")
                 self._approaching_rail["TOP"] = False
         else:
-            if self._approaching_rail["TOP"] and vy > 1e-4:
+            if (self._approaching_rail["TOP"] or prev_vy < -15.0) and vy > 1e-4:
                 ok_zone, clear_rev, apex_pt = _can_accept_in_zone("TOP", -prev_vy, vy)
                 if ok_zone and physics_ai_engine.verify_cushion_impulse("TOP", apex_pt, prev_vel_tuple, cue_vel):
                     if self.record_cushion_touch("TOP", frame_idx, apex_pt, clear_rev):
@@ -681,7 +771,8 @@ class ScoringEngine:
             self._approaching_rail["TOP"] = False
 
         # 4. BOTTOM 레일 검사
-        if y >= self.bottom_bound:
+        eff_bottom_bound = min(self.bottom_bound, self.table_height_mm - (rail_max_zones["BOTTOM"] - 25.0))
+        if y >= eff_bottom_bound:
             if vy > 1e-4 or prev_vy > 1e-4:
                 self._approaching_rail["BOTTOM"] = True
             if self._approaching_rail["BOTTOM"] and vy < -1e-4:
@@ -691,7 +782,7 @@ class ScoringEngine:
                         triggered_rails.append("BOTTOM")
                 self._approaching_rail["BOTTOM"] = False
         else:
-            if self._approaching_rail["BOTTOM"] and vy < -1e-4:
+            if (self._approaching_rail["BOTTOM"] or prev_vy > 15.0) and vy < -1e-4:
                 ok_zone, clear_rev, apex_pt = _can_accept_in_zone("BOTTOM", prev_vy, -vy)
                 if ok_zone and physics_ai_engine.verify_cushion_impulse("BOTTOM", apex_pt, prev_vel_tuple, cue_vel):
                     if self.record_cushion_touch("BOTTOM", frame_idx, apex_pt, clear_rev):
@@ -739,18 +830,23 @@ class ScoringEngine:
             dx0 = cue_pos[0] - self._stroke_origin_pos[0]
             dy0 = cue_pos[1] - self._stroke_origin_pos[1]
             d0 = math.hypot(dx0, dy0)
-            if 20.0 <= d0 <= 180.0:
+            if 20.0 <= d0 <= 450.0:
                 self._initial_stroke_dir = (dx0 / d0, dy0 / d0)
 
-        if self.first_object_ball_id is None:
-            min_r_init = min(
-                cue_pos[0],
-                self.table_width_mm - cue_pos[0],
-                cue_pos[1],
-                self.table_height_mm - cue_pos[1],
+        if self.first_object_ball_id is None and self._stroke_origin_pos is not None:
+            disp_origin = math.hypot(
+                cue_pos[0] - self._stroke_origin_pos[0],
+                cue_pos[1] - self._stroke_origin_pos[1],
             )
-            if min_r_init < self._min_rail_dist_before_first_hit:
-                self._min_rail_dist_before_first_hit = min_r_init
+            if disp_origin >= 20.0:
+                min_r_init = min(
+                    cue_pos[0],
+                    self.table_width_mm - cue_pos[0],
+                    cue_pos[1],
+                    self.table_height_mm - cue_pos[1],
+                )
+                if min_r_init < self._min_rail_dist_before_first_hit:
+                    self._min_rail_dist_before_first_hit = min_r_init
 
         if cue_velocity is None:
             if self._prev_cue_pos is None:
@@ -848,6 +944,19 @@ class ScoringEngine:
             step_move = 0.0
             prev_init_disp = 0.0
             curr_init_disp = 0.0
+            target_normal_push_cos: Optional[float] = None
+            cue_recoil_normal: Optional[float] = None
+            pre_cue_bend_deg = 0.0
+
+            if len(self._cue_trajectory_log) >= 3:
+                _, _, v_pre2, _ = self._cue_trajectory_log[-3]
+                _, _, v_pre1, _ = self._cue_trajectory_log[-2]
+                n1 = math.hypot(v_pre2[0], v_pre2[1])
+                n2 = math.hypot(v_pre1[0], v_pre1[1])
+                if n1 >= 2.5 and n2 >= 2.5:
+                    c_pre = max(-1.0, min(1.0, (v_pre2[0] * v_pre1[0] + v_pre2[1] * v_pre1[1]) / (n1 * n2)))
+                    pre_cue_bend_deg = math.degrees(math.acos(c_pre))
+
             if bid in self._initial_ball_positions:
                 init_t = self._initial_ball_positions[bid]
                 curr_init_disp = math.hypot(pos[0] - init_t[0], pos[1] - init_t[1])
@@ -860,6 +969,26 @@ class ScoringEngine:
                     prev_t[0] - init_t[0], prev_t[1] - init_t[1]
                 )
 
+                # 수구->목적구 최근접 시점의 충돌 법선 단위벡터(nx, ny) 및 목적구 미세 이동 코사인 유사도 계산
+                ref_cue = self._prev_cue_pos if (self._prev_cue_pos is not None and math.hypot(self._prev_cue_pos[0] - prev_t[0], self._prev_cue_pos[1] - prev_t[1]) < dist) else cue_pos
+                nx_raw = prev_t[0] - ref_cue[0]
+                ny_raw = prev_t[1] - ref_cue[1]
+                n_len = math.hypot(nx_raw, ny_raw)
+                if n_len > 1e-6:
+                    nx_u, ny_u = nx_raw / n_len, ny_raw / n_len
+                    if step_move >= 0.5:
+                        dx_t = pos[0] - prev_t[0]
+                        dy_t = pos[1] - prev_t[1]
+                        target_normal_push_cos = (dx_t * nx_u + dy_t * ny_u) / step_move
+                    elif curr_init_disp >= 0.5:
+                        dx_t = pos[0] - init_t[0]
+                        dy_t = pos[1] - init_t[1]
+                        target_normal_push_cos = (dx_t * nx_u + dy_t * ny_u) / curr_init_disp
+                    if self._prev_cue_vel is not None:
+                        dvx_c = cue_vel[0] - self._prev_cue_vel[0]
+                        dvy_c = cue_vel[1] - self._prev_cue_vel[1]
+                        cue_recoil_normal = dvx_c * nx_u + dvy_c * ny_u
+
             is_direct_hit = physics_ai_engine.verify_direct_cue_hit(
                 min_cue_to_target_dist_mm=min_approach_dist,
                 target_step_move_mm=step_move,
@@ -869,6 +998,9 @@ class ScoringEngine:
                 contact_threshold_mm=self.ball_contact_th,
                 is_first_object_hit_Done=(self.first_object_ball_id is not None),
                 cue_deflection_deg=cue_deflection_deg,
+                target_normal_push_cos=target_normal_push_cos,
+                cue_recoil_normal=cue_recoil_normal,
+                pre_cue_bend_deg=pre_cue_bend_deg,
             )
 
             # [4대 업그레이드 ④] 0쿠션 초반 회색지대 조기 키스 오탐 방지:
