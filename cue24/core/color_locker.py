@@ -148,22 +148,61 @@ class ColorLocker:
         # 3순위: 그 외는 백구(WHITE)
         return "WHITE"
 
+    def extract_relative_color_scores(
+        self, bgr_crop: np.ndarray
+    ) -> Tuple[float, float, float, float]:
+        """
+        단일 공의 BGR 패치에서 천장 조명 반사광(상위 20% 밝기)과 그림자(하위 15% 밝기)를 제거한 뒤,
+        적색도(Redness)와 황색도(YellowScore = 1.8*(b*-128) + 1.2*S_hsv + ((R+G)*0.5 - B))를 계산합니다.
+
+        Returns:
+            (redness_score, yellow_score, mean_a, mean_b)
+        """
+        if bgr_crop is None or bgr_crop.ndim != 3 or bgr_crop.shape[2] != 3 or bgr_crop.size == 0:
+            return (0.0, 0.0, 128.0, 128.0)
+
+        crop_resized = cv2.resize(bgr_crop, (24, 24), interpolation=cv2.INTER_LINEAR)
+        lab = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2LAB).astype(np.float32)
+        hsv = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2HSV).astype(np.float32)
+        bgr = crop_resized.astype(np.float32)
+
+        yy, xx = np.ogrid[:24, :24]
+        circle_mask = ((xx - 11.5) ** 2 + (yy - 11.5) ** 2) <= (8.5 ** 2)
+        lab_px = lab[circle_mask]
+        hsv_px = hsv[circle_mask]
+        bgr_px = bgr[circle_mask]
+
+        l_vals = lab_px[:, 0]
+        low_p, high_p = np.percentile(l_vals, [15, 80])
+        valid = (l_vals >= low_p) & (l_vals <= high_p)
+        if not np.any(valid):
+            valid = np.ones_like(l_vals, dtype=bool)
+
+        med_lab = np.median(lab_px[valid], axis=0)
+        med_hsv = np.median(hsv_px[valid], axis=0)
+        med_bgr = np.median(bgr_px[valid], axis=0)
+
+        L_val, a_val, b_val = float(med_lab[0]), float(med_lab[1]), float(med_lab[2])
+        S_val = float(med_hsv[1])
+        B_ch, G_ch, R_ch = float(med_bgr[0]), float(med_bgr[1]), float(med_bgr[2])
+
+        redness_score = 2.2 * (a_val - 128.0) + 1.0 * (R_ch - G_ch) - 0.3 * L_val
+        yellow_score = (
+            1.8 * (b_val - 128.0)
+            + 1.2 * S_val
+            + 1.0 * ((R_ch + G_ch) * 0.5 - B_ch)
+        )
+        return (redness_score, yellow_score, a_val, b_val)
+
     def classify_balls(
         self, ball_crops: Dict[int, np.ndarray], use_temporal_smoothing: bool = False
     ) -> Dict[int, str]:
         """
         정지 상태의 공 3개 BGR 크롭 영상 딕셔너리({ball_id: bgr_crop})를 입력받아,
-        각 공의 색상을 "WHITE", "YELLOW", "RED"로 100% 확정하여 반환합니다.
-
-        기본 임계값 판정을 수행하되, 만약 극단적인 색온도 변화로 인해 3개 공의 색상이 중복될 경우
-        a*, b* 상대 크기 순위를 기반으로 3개 공을 각각 RED, YELLOW, WHITE로 상호 배타적 보정합니다.
-
-        Args:
-            ball_crops: {공 ID(int): BGR 크롭 영상(np.ndarray)} 형태의 딕셔너리 (총 3개 공)
-            use_temporal_smoothing: 다중 프레임 지수 이동 평균(EMA) 누적 투표를 사용할지 여부
-
-        Returns:
-            classifications: {공 ID(int): 색상 문자열("WHITE" | "YELLOW" | "RED")}
+        3구 상대 색도 랭킹(Relative Chromaticity Ranking)으로 각 공의 색상을 "WHITE", "YELLOW", "RED"로 100% 확정합니다:
+        - 1단계: 적색도(a* 및 R-G)가 가장 높은 공 1개를 무조건 RED로 먼저 확정합니다.
+        - 2단계: 남은 2개 공 중 황색도 및 채도 지수(YellowScore)가 더 높은 공을 무조건 YELLOW,
+                 더 낮은 공(파란 채널 B가 높고 채도가 낮은 공)을 무조건 WHITE로 상대 비교 할당합니다.
         """
         if self.is_color_locked_for_shot and len(self.locked_ball_colors) == 3:
             return self.locked_ball_colors.copy()
@@ -173,45 +212,37 @@ class ColorLocker:
                 f"3쿠션 판독을 위해 정확히 3개의 공 크롭 영상이 필요합니다. (입력된 개수: {len(ball_crops)})"
             )
 
-        ab_stats: Dict[int, Tuple[float, float]] = {}
-        classifications: Dict[int, str] = {}
+        color_scores: Dict[int, Tuple[float, float]] = {}
 
         for ball_id, crop in ball_crops.items():
-            mean_a, mean_b = self.extract_lab_ab_mean(crop)
+            red_sc, yel_sc, _, _ = self.extract_relative_color_scores(crop)
             if use_temporal_smoothing and ball_id in self._ab_ema_history:
-                prev_a, prev_b = self._ab_ema_history[ball_id]
-                mean_a = prev_a * 0.70 + mean_a * 0.30
-                mean_b = prev_b * 0.70 + mean_b * 0.30
+                prev_r, prev_y = self._ab_ema_history[ball_id]
+                red_sc = prev_r * 0.70 + red_sc * 0.30
+                yel_sc = prev_y * 0.70 + yel_sc * 0.30
             if use_temporal_smoothing:
-                self._ab_ema_history[ball_id] = (mean_a, mean_b)
+                self._ab_ema_history[ball_id] = (red_sc, yel_sc)
 
-            ab_stats[ball_id] = (mean_a, mean_b)
-            if mean_a >= self.red_a_th:
-                classifications[ball_id] = "RED"
-            elif mean_b >= self.yellow_b_th:
-                classifications[ball_id] = "YELLOW"
-            else:
-                classifications[ball_id] = "WHITE"
+            color_scores[ball_id] = (red_sc, yel_sc)
 
-        # 3개 공이 모두 서로 다른 색상(RED, YELLOW, WHITE)으로 분류되었는지 검증
-        expected_set = {"RED", "YELLOW", "WHITE"}
-        if set(classifications.values()) != expected_set:
-            # 조명 편차로 중복 발생 시: a*가 가장 높은 공을 RED, 남은 2개 중 b*가 높은 공을 YELLOW, 나머지를 WHITE로 확정
-            sorted_by_a = sorted(
-                ab_stats.keys(), key=lambda bid: ab_stats[bid][0], reverse=True
-            )
-            red_id = sorted_by_a[0]
-            remaining_ids = sorted_by_a[1:]
-            if ab_stats[remaining_ids[0]][1] >= ab_stats[remaining_ids[1]][1]:
-                yellow_id, white_id = remaining_ids[0], remaining_ids[1]
-            else:
-                yellow_id, white_id = remaining_ids[1], remaining_ids[0]
+        # 1단계: 적색도(redness_score)가 가장 높은 공 1개를 무조건 RED로 확정
+        sorted_by_red = sorted(
+            color_scores.keys(), key=lambda bid: color_scores[bid][0], reverse=True
+        )
+        red_id = sorted_by_red[0]
+        remaining_ids = sorted_by_red[1:]
 
-            classifications = {
-                red_id: "RED",
-                yellow_id: "YELLOW",
-                white_id: "WHITE",
-            }
+        # 2단계: 남은 2개의 공 중 황색도(yellow_score)가 더 높은 공을 무조건 YELLOW, 더 낮은 공을 WHITE로 확정
+        if color_scores[remaining_ids[0]][1] >= color_scores[remaining_ids[1]][1]:
+            yellow_id, white_id = remaining_ids[0], remaining_ids[1]
+        else:
+            yellow_id, white_id = remaining_ids[1], remaining_ids[0]
+
+        classifications: Dict[int, str] = {
+            red_id: "RED",
+            yellow_id: "YELLOW",
+            white_id: "WHITE",
+        }
 
         self.locked_ball_colors = classifications.copy()
         return classifications

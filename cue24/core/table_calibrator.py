@@ -139,6 +139,19 @@ class TableCalibrator:
             self.update_corners(corners)
             return corners
 
+        # 방송 로고(예: 좌상단 파란색 CUESCO 마크 등)가 당구대 테두리에 닿아 외곽 박스가 부풀어 오르는 현상을 방지하기 위해
+        # 행별·열별 파란색 픽셀 밀도 프로파일(> 0.35)로 당구대 본체 외곽 사각형을 정밀 산출합니다.
+        mask_bool = blue_mask > 0
+        col_ratio = mask_bool.mean(axis=0)
+        row_ratio = mask_bool.mean(axis=1)
+        valid_cols = np.where(col_ratio > 0.35)[0]
+        valid_rows = np.where(row_ratio > 0.35)[0]
+        if len(valid_cols) >= int(w_img * 0.4) and len(valid_rows) >= int(h_img * 0.4):
+            x_box = int(valid_cols[0])
+            w_box = int(valid_cols[-1] - valid_cols[0])
+            y_box = int(valid_rows[0])
+            h_box = int(valid_rows[-1] - valid_rows[0])
+
         # 실제 탑뷰 카메라 영상: 파란색 외곽 사각형에서 상/하/좌/우 고무 쿠션 턱 두께를 안쪽으로 보정하여 내경 산출
         left_x = float(x_box) + float(w_box) * 0.018
         right_x = float(x_box + w_box) - float(w_box) * 0.018

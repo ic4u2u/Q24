@@ -53,11 +53,12 @@ class ScoringEngine:
     3쿠션 국제 규칙에 따른 득점 여부(일반 3C / 뱅크샷) 및 상세 공타 사유를 판정하는 클래스입니다.
     """
 
-    # 4대 쿠션 알고리즘 고도화 상수 (슈미트 트리거 3단계 대역 + 코너 핑퐁 차단 + 최소 이동거리 잠금)
+    # 4대 쿠션 알고리즘 고도화 상수 (슈미트 트리거 3단계 대역 + 코너 핑퐁 차단 + 최소 이동거리 잠금 + 동일레일 220mm 심층이탈 잠금)
     BALL_R: float = 30.75
     RAIL_ENTER_MARGIN: float = 54.0         # BALL_R + 23.25 (근접 진입 대역)
     RAIL_KINEMATIC_ZONE: float = 115.0      # BALL_R + 84.25 (광역 궤적 반사 대역)
     RAIL_EXIT_HYSTERESIS: float = 92.0      # BALL_R + 61.25 (동일 레일 재무장 이탈 경계)
+    SAME_RAIL_DEEP_EXIT_MM: float = 220.0   # 다른 쿠션/목적구를 안 맞고 동일 레일 재카운트되려면 벗어나야 하는 최소 거리
     MIN_RAIL_TRAVEL_DIST: float = 80.0      # 동일 레일 재카운트 최소 이동 변위 (mm)
     CORNER_MIN_TRAVEL_DIST: float = 22.0    # 코너 타 레일 연속 타격 시 최소 이동 변위 (mm)
     PER_RAIL_COOLDOWN_FRAMES: int = 9       # 레일별 개별 쿨타임 (30fps 기준 0.30초 = 9프레임)
@@ -122,6 +123,7 @@ class ScoringEngine:
         self._first_hit_frame: Optional[int] = None
 
         self.cushion_count_before_first_hit: int = 0
+        self.cushion_count_after_first_hit: int = 0
         self.cushion_count_before_second_hit: int = 0
         self.total_cushion_count: int = 0
         self.cue_travel_distance_mm: float = 0.0
@@ -148,6 +150,14 @@ class ScoringEngine:
             "TOP": True,
             "BOTTOM": True,
         }
+        # 동일 레일 연속 중복 카운트 잠금 (다른 쿠션/목적구를 맞거나 220mm 이상 심층 이탈 시에만 해제)
+        self._same_rail_locked: Dict[str, bool] = {
+            "LEFT": False,
+            "RIGHT": False,
+            "TOP": False,
+            "BOTTOM": False,
+        }
+        self._corner_bounce_count_in_zone: int = 0
         # 쿠션 마진 내부에서 아직 반전 카운트가 처리되지 않은 접근 상태 기록
         self._approaching_rail: Dict[str, bool] = {
             "LEFT": False,
@@ -159,6 +169,10 @@ class ScoringEngine:
         self._cue_trajectory_log: List[Tuple[int, Point2D, Point2D, float]] = []
         # 동일 목적구 연속 프레임 중복 접촉 방지용 플래그
         self._in_contact_with_ball: Dict[int, bool] = {}
+        # [규칙 4] 1쿠션 넣어치기(원뱅크 걸어치기) 기하학적 검증용 초기 스트로크 방향 및 레일 최단 접근 거리
+        self._stroke_origin_pos: Optional[Point2D] = None
+        self._initial_stroke_dir: Optional[Point2D] = None
+        self._min_rail_dist_before_first_hit: float = 9999.0
 
     def record_cushion_touch(
         self,
@@ -168,20 +182,26 @@ class ScoringEngine:
         has_clear_reversal: bool = True,
     ) -> bool:
         """
-        유효 1쿠션 접촉(법선 속도 반전 + 슈미트 트리거 히스테리시스 + 코너 핑퐁 방어 완료)을 기록합니다.
-        - 이미 득점 확정 대기 상태(VALID_SCORE_PENDING)인 경우 사후 쿠션을 절대 카운트하지 않고 동결합니다.
-        - 한 번 카운트된 레일은 슈미트 트리거에 의해 즉시 잠기며(_rail_armed=False),
-          해당 레일에서 92.0mm 이상 이탈하거나 마지막 쿠션 타격점으로부터 80.0mm 이상 이동해야만 재활성화됩니다.
-        - 코너 인접 타 레일 연속 타격 시에도 최소 22.0mm 이상 이동 또는 명확한 법선 속도 반전이 있어야만 인정합니다.
+        유효 1쿠션 접촉(법선 속도 반전 + 슈미트 트리거 히스테리시스 + 동일 레일 220mm 심층 잠금 + 코너 2회 상한)을 기록합니다.
         """
         # [4대 업그레이드 ④] 제2적구 충돌로 득점이 인정된 이후 굴러가며 맞은 사후 쿠션은 즉시 동결!
         if self.fsm_state == ShotFSMState.VALID_SCORE_PENDING:
             return False
 
-        # [4대 업그레이드 ①] 직전 타격 레일과 동일한 레일 연속 카운트 차단 + 슈미트 트리거 무장 상태 확인
+        # [4대 업그레이드 ①] 직전 타격 레일과 동일한 레일 연속 카운트 차단 + 슈미트 트리거/동일레일 잠금 확인
         if self._last_rail_hit == rail_name:
             return False
-        if not self._rail_armed.get(rail_name, True):
+        if not self._rail_armed.get(rail_name, True) or self._same_rail_locked.get(rail_name, False):
+            return False
+
+        rail_dists = {
+            "LEFT": cue_pos[0],
+            "RIGHT": self.table_width_mm - cue_pos[0],
+            "TOP": cue_pos[1],
+            "BOTTOM": self.table_height_mm - cue_pos[1],
+        }
+        near_rails_count = sum(1 for d_r in rail_dists.values() if d_r <= 120.0)
+        if near_rails_count >= 2 and self._corner_bounce_count_in_zone >= 2:
             return False
 
         # [4대 업그레이드 ②] 레일별 개별 쿨타임 검사 (동일 레일 0.30초 / 9프레임 이내 중복 차단)
@@ -189,7 +209,7 @@ class ScoringEngine:
         if last_f >= 0 and (frame_idx - last_f) < self.PER_RAIL_COOLDOWN_FRAMES:
             return False
 
-        # 직전 이벤트(FIRST_HIT 또는 CUSHION)로부터 비물리적 순간이동(예: 10프레임 이내 1100mm 반대편 점프) 차단
+        # 직전 이벤트(FIRST_HIT 또는 CUSHION)로부터 비물리적 순간이동(예: 3프레임 이내 1050mm 반대편 점프) 차단
         if self.events:
             last_ev = self.events[-1]
             dt_frames = max(1, frame_idx - last_ev.frame_idx)
@@ -197,7 +217,7 @@ class ScoringEngine:
                 cue_pos[0] - last_ev.position_mm[0],
                 cue_pos[1] - last_ev.position_mm[1],
             )
-            if dt_frames <= 10 and jump_d > 1050.0 and (jump_d / dt_frames) > 145.0:
+            if dt_frames <= 3 and jump_d > 1050.0 and (jump_d / dt_frames) > 350.0:
                 return False
 
         # 직전 쿠션 타격 위치로부터의 실제 이동 변위 검사
@@ -217,12 +237,58 @@ class ScoringEngine:
         self._last_cushion_frame[rail_name] = frame_idx
         self._last_cushion_hit_pos = (float(cue_pos[0]), float(cue_pos[1]))
         self._rail_armed[rail_name] = False
+        for r_k in self._same_rail_locked:
+            self._same_rail_locked[r_k] = (r_k == rail_name)
+        if near_rails_count >= 2:
+            self._corner_bounce_count_in_zone += 1
+        else:
+            self._corner_bounce_count_in_zone = 0
 
-        self.total_cushion_count += 1
         if self.first_object_ball_id is None:
             self.cushion_count_before_first_hit += 1
+        elif (
+            self.cushion_count_before_first_hit == 0
+            and self._first_hit_frame is not None
+            and 0 <= (frame_idx - self._first_hit_frame) <= 2
+            and self._stroke_origin_pos is not None
+            and self._initial_stroke_dir is not None
+            and self._min_rail_dist_before_first_hit <= 115.0
+        ):
+            # [규칙 4: 1쿠션 넣어치기(원뱅크)에서 쿠션 바로 앞 제1적구와 반사 프레임이 1~2프레임 겹친 경우]
+            # 초기 스트로크 방향 직선이 제1적구 중심에서 36.0mm 이상 비껴나 쿠션을 먼저 향한 궤적이라면
+            # 이 반사는 제1적구 접촉 직전에 일어난 선쿠션(1쿠션 뱅크)으로 분류합니다.
+            ox, oy = self._stroke_origin_pos
+            dx_i, dy_i = self._initial_stroke_dir
+            t1_pos = self._initial_ball_positions.get(self.first_object_ball_id, cue_pos)
+            tx_v = t1_pos[0] - ox
+            ty_v = t1_pos[1] - oy
+            proj_l = tx_v * dx_i + ty_v * dy_i
+            imp_p = (
+                math.hypot(tx_v - proj_l * dx_i, ty_v - proj_l * dy_i)
+                if proj_l > 0.0
+                else 999.0
+            )
+            if imp_p > 36.0:
+                self.cushion_count_before_first_hit += 1
+            else:
+                self.cushion_count_after_first_hit += 1
+        elif (
+            self.cushion_count_before_first_hit == 1
+            and self._first_hit_frame is not None
+            and 0 <= (frame_idx - self._first_hit_frame) <= 2
+            and any(ev.detail == "BANK_GEOM_RECOVERED" for ev in self.events)
+        ):
+            # 기하학적 선쿠션 복원으로 이미 선쿠션 1회가 반영된 직후 동일 반사 프레임이 도달한 경우 중복 가산 방지
+            for ev in self.events:
+                if ev.detail == "BANK_GEOM_RECOVERED":
+                    ev.detail = rail_name
+                    break
+            return True
+        else:
+            self.cushion_count_after_first_hit += 1
+        self.total_cushion_count = self.cushion_count_before_first_hit + self.cushion_count_after_first_hit
         if self.second_object_ball_id is None and not self.failed_early:
-            self.cushion_count_before_second_hit += 1
+            self.cushion_count_before_second_hit = self.total_cushion_count
 
         self.events.append(
             ShotEvent(
@@ -257,8 +323,13 @@ class ScoringEngine:
             f_curr, p_curr, v_curr, min_target_d = self._cue_trajectory_log[i]
             if f_curr > up_to_frame_idx:
                 break
-            # 목적구와 가까울 때(85mm 미만) 꺾인 궤적은 공끼리의 키스/충돌이므로 쿠션 복원에서 배제
-            if min_target_d < 85.0:
+            # 제1적구 접촉 이후 구간에서 목적구와 가까울 때(85mm 미만) 꺾인 궤적은 공끼리의 키스/충돌이므로 쿠션 복원에서 배제
+            # 단, 제1적구 접촉 전(1쿠션 넣어치기 등)에는 쿠션 근처 목적구 때문에 선쿠션이 누락되지 않도록 마스킹하지 않음
+            if (
+                self._first_hit_frame is not None
+                and f_curr >= self._first_hit_frame
+                and min_target_d < 85.0
+            ):
                 continue
 
             rail_checks = [
@@ -289,12 +360,70 @@ class ScoringEngine:
         수구와 목적구(제1적구 또는 제2적구)의 충돌을 이벤트 시퀀스에 기록하고,
         결정론적 4단계 FSM(VALID_SCORE_PENDING vs NO_SCORE_LOCKED) 상태를 전이합니다.
         """
+        # 목적구 충돌 시 동일 레일 잠금(_same_rail_locked) 및 코너 카운트 해제
+        self._last_rail_hit = None
+        self._last_cushion_hit_pos = None
+        self._corner_bounce_count_in_zone = 0
+        self.in_rail_zone.clear()
+        for r_k in self._rail_armed:
+            self._rail_armed[r_k] = True
+            self._same_rail_locked[r_k] = False
+            self._last_cushion_frame[r_k] = -999
+            self._approaching_rail[r_k] = False
+
         if self.first_object_ball_id is None:
+            # [규칙 4: 1쿠션 넣어치기(원뱅크 걸어치기) 기하학적 1쿠션 보장 검증]
+            # 수구가 출발 후 제1적구에 닿기 전까지 아직 선쿠션이 0으로 찍혀 있더라도,
+            # 1) 수구가 4면 쿠션 경계(130.0mm 이내)에 접근한 적이 있고,
+            # 2) 수구 초기 스트로크 방향 벡터(_initial_stroke_dir)로부터 출발점->충돌점 벡터가 8.0도 이상 꺾였거나,
+            #    초기 스트로크 직선에서 제1적구 중심까지의 수직 거리(Impact Parameter)가 72.0mm를 초과하여
+            #    쿠션 반사 없이는 물리적으로 제1적구를 맞힐 수 없는 궤적이라면 1쿠션 뱅크샷으로 100% 복원!
+            if (
+                self.cushion_count_before_first_hit == 0
+                and self._stroke_origin_pos is not None
+                and self._initial_stroke_dir is not None
+                and self._min_rail_dist_before_first_hit <= 130.0
+            ):
+                ox, oy = self._stroke_origin_pos
+                dx_init, dy_init = self._initial_stroke_dir
+                vx_hit = cue_pos[0] - ox
+                vy_hit = cue_pos[1] - oy
+                dist_hit = math.hypot(vx_hit, vy_hit)
+                deflection_from_init = 0.0
+                if dist_hit > 35.0:
+                    cos_a = max(
+                        -1.0,
+                        min(1.0, (dx_init * vx_hit + dy_init * vy_hit) / dist_hit),
+                    )
+                    deflection_from_init = math.degrees(math.acos(cos_a))
+                t1_origin = self._initial_ball_positions.get(target_ball_id, cue_pos)
+                tx_vec = t1_origin[0] - ox
+                ty_vec = t1_origin[1] - oy
+                proj_len = tx_vec * dx_init + ty_vec * dy_init
+                if proj_len > 0.0:
+                    perp_x = tx_vec - proj_len * dx_init
+                    perp_y = ty_vec - proj_len * dy_init
+                    impact_param = math.hypot(perp_x, perp_y)
+                else:
+                    impact_param = 999.0
+
+                if deflection_from_init >= 8.0 or impact_param > 72.0:
+                    self.cushion_count_before_first_hit = 1
+                    self.total_cushion_count = max(1, self.total_cushion_count)
+                    self.cushion_count_before_second_hit = max(
+                        1, self.cushion_count_before_second_hit
+                    )
+                    self.events.append(
+                        ShotEvent(
+                            frame_idx=max(0, frame_idx - 1),
+                            event_type="CUSHION",
+                            detail="BANK_GEOM_RECOVERED",
+                            position_mm=cue_pos,
+                        )
+                    )
+
             self.first_object_ball_id = target_ball_id
             self._first_hit_frame = frame_idx
-            self._last_rail_hit = None
-            for r_k in self._rail_armed:
-                self._rail_armed[r_k] = True
             if self.fsm_state == ShotFSMState.IDLE:
                 self.fsm_state = ShotFSMState.IN_PLAY
             self.events.append(
@@ -310,13 +439,14 @@ class ScoringEngine:
             and self.second_object_ball_id is None
         ):
             self.second_object_ball_id = target_ball_id
-            self._last_rail_hit = None
 
             # [4대 업그레이드 ④] 제2적구 충돌 시점에 쿠션 수가 3 미만이면,
             # 즉시 NO_SCORE_LOCKED로 잠그기 전에 역추적 쿠션 감사(_retroactive_cushion_audit)를 수행하여 누락 쿠션 복원!
             if self.cushion_count_before_second_hit < 3:
                 audited_c = self._retroactive_cushion_audit(frame_idx)
                 if audited_c > self.cushion_count_before_second_hit:
+                    diff = audited_c - self.cushion_count_before_second_hit
+                    self.cushion_count_after_first_hit += diff
                     self.cushion_count_before_second_hit = audited_c
                     self.total_cushion_count = max(
                         self.total_cushion_count, self.cushion_count_before_second_hit
@@ -366,7 +496,7 @@ class ScoringEngine:
     ) -> List[str]:
         """
         단순 마진 진입이 아닌, 슈미트 트리거 3단계 대역 + 법선 속도 부호 반전(Velocity Reversal) +
-        광역 대역 내 목적구 키스 배제를 결합하여 유효 1쿠션을 판정합니다.
+        동일 레일 심층 이탈 잠금(220mm) + 코너 2회 상한 + 광역 대역 내 목적구 키스 배제를 결합하여 유효 1쿠션을 판정합니다.
         """
         triggered_rails: List[str] = []
         # 이미 득점 확정 대기 상태이면 사후 쿠션 감지 즉시 중단(동결)
@@ -396,6 +526,15 @@ class ScoringEngine:
             "TOP": y,
             "BOTTOM": self.table_height_mm - y,
         }
+        if self.first_object_ball_id is None:
+            min_r_now = min(rail_dists.values())
+            if min_r_now < self._min_rail_dist_before_first_hit:
+                self._min_rail_dist_before_first_hit = min_r_now
+
+        near_rails_count = sum(1 for d_r in rail_dists.values() if d_r <= 120.0)
+        if near_rails_count == 0:
+            self._corner_bounce_count_in_zone = 0
+
         rail_max_zones = {
             "LEFT": self.left_bound + 25.0,
             "RIGHT": (self.table_width_mm - self.right_bound) + 25.0,
@@ -403,9 +542,7 @@ class ScoringEngine:
             "BOTTOM": (self.table_height_mm - self.bottom_bound) + 25.0,
         }
 
-        # [4대 업그레이드 ①] 슈미트 트리거 히스테리시스 재무장(Re-arm) 검사:
-        # 레일로부터 92.0mm(RAIL_EXIT_HYSTERESIS) 이상 멀어지거나,
-        # 마지막 쿠션 타격 위치로부터 80.0mm(MIN_RAIL_TRAVEL_DIST) 이상 이동해야만 잠금 해제
+        # [4대 업그레이드 ①] 슈미트 트리거 히스테리시스 재무장(Re-arm) 및 동일 레일 심층 이탈(220mm) 잠금 해제:
         travel_from_last = (
             math.hypot(
                 x - self._last_cushion_hit_pos[0],
@@ -418,6 +555,8 @@ class ScoringEngine:
             if not self._rail_armed.get(r_name, True):
                 if d_rail >= self.RAIL_EXIT_HYSTERESIS or travel_from_last >= self.MIN_RAIL_TRAVEL_DIST:
                     self._rail_armed[r_name] = True
+            if self._same_rail_locked.get(r_name, False) and d_rail >= self.SAME_RAIL_DEEP_EXIT_MM:
+                self._same_rail_locked[r_name] = False
 
         current_zones: Set[str] = set()
         if x <= self.left_bound:
@@ -429,17 +568,42 @@ class ScoringEngine:
         if y >= self.bottom_bound:
             current_zones.add("BOTTOM")
 
+        just_hit_target = (
+            self._first_hit_frame is not None and abs(frame_idx - self._first_hit_frame) <= 2
+        )
+
         def _can_accept_in_zone(rail_name: str, v_in: float, v_out: float) -> Tuple[bool, bool]:
             d_rail = rail_dists[rail_name]
             clear_rev = v_in > 1.2 and v_out > 1.0
             # 레일 최대 반사 허용 대역을 벗어난 허공(예: x=229mm, x=2201mm)에서는 절대 쿠션으로 인정하지 않음!
             if d_rail > rail_max_zones[rail_name]:
                 return False, clear_rev
-            # 근접 대역(<= 54.0mm) 진입 시에는 목적구 거리와 무관하게 실제 레일 접촉으로 인정
+            # [규칙 4 핵심] 제1적구 접촉 전(self.first_object_ball_id is None)에는 아직 어떤 공과도 충돌하지 않았으므로,
+            # 제1적구가 쿠션 바로 앞에 서 있는 '1쿠션 넣어치기(원뱅크 걸어치기)' 샷에서 min_dist_to_targets 때문에 선쿠션이 씹히지 않도록 마스킹 해제!
             if d_rail <= self.RAIL_ENTER_MARGIN:
-                return True, clear_rev
-            # 광역 궤적 반사 대역(54.0mm ~ 경계)에서는 목적구와 85mm 이상 떨어져 있을 때만 쿠션 반사로 인정 (목적구 충돌 오판 방지)
-            if min_dist_to_targets >= 85.0:
+                is_one_cushion_entry = (
+                    self.cushion_count_before_first_hit == 0
+                    and self._initial_stroke_dir is not None
+                    and self._min_rail_dist_before_first_hit <= 54.0
+                )
+                if (
+                    self.first_object_ball_id is None
+                    or is_one_cushion_entry
+                    or min_dist_to_targets >= 68.0
+                    or d_rail <= 42.0
+                ) and (not just_hit_target or is_one_cushion_entry or d_rail <= 42.0):
+                    return True, clear_rev
+                return False, clear_rev
+            # 광역 궤적 반사 대역(54.0mm ~ 경계)에서는 제1적구 접촉 전이거나 목적구와 85mm 이상 떨어져 있을 때 쿠션 반사로 인정
+            if (
+                self.first_object_ball_id is None
+                or (
+                    just_hit_target
+                    and self.cushion_count_before_first_hit == 0
+                    and self._min_rail_dist_before_first_hit <= 54.0
+                )
+                or min_dist_to_targets >= 85.0
+            ):
                 return True, clear_rev
             return False, clear_rev
 
@@ -525,12 +689,8 @@ class ScoringEngine:
         cue_velocity: Optional[Point2D] = None,
     ) -> None:
         """
-        매 프레임 수구 및 목적구들의 좌표를 입력받아 쿠션 법선 속도 반전과 목적구 충돌을 감지합니다.
-
-        Args:
-            frame_idx: 현재 프레임 번호
-            ball_positions: {ball_id: (x_mm, y_mm)} 딕셔너리
-            cue_velocity: 수구의 현재 프레임 속도 벡터 (vx, vy). 생략 시 이전 위치와의 차분으로 자동 계산
+        매 프레임 수구 및 목적구들의 좌표를 입력받아
+        [1순위: 목적구 충돌 판정] -> [2순위: 쿠션 법선 속도 반전 판정(목적구 충돌 없을 때만)] 순서로 처리합니다.
         """
         if self.cue_ball_id is None or self.cue_ball_id not in ball_positions:
             raise ValueError("수구(cue_ball_id)가 설정되지 않았거나 좌표 딕셔너리에 없습니다.")
@@ -549,6 +709,29 @@ class ScoringEngine:
                 self._ball_trajectories[bid].append((float(pt[0]), float(pt[1])))
 
         cue_pos = ball_positions[self.cue_ball_id]
+        if self._stroke_origin_pos is None:
+            init_c = self._initial_ball_positions.get(self.cue_ball_id, cue_pos)
+            self._stroke_origin_pos = (float(init_c[0]), float(init_c[1]))
+        elif (
+            self._initial_stroke_dir is None
+            and self.first_object_ball_id is None
+            and self.cushion_count_before_first_hit == 0
+        ):
+            dx0 = cue_pos[0] - self._stroke_origin_pos[0]
+            dy0 = cue_pos[1] - self._stroke_origin_pos[1]
+            d0 = math.hypot(dx0, dy0)
+            if 20.0 <= d0 <= 180.0:
+                self._initial_stroke_dir = (dx0 / d0, dy0 / d0)
+
+        if self.first_object_ball_id is None:
+            min_r_init = min(
+                cue_pos[0],
+                self.table_width_mm - cue_pos[0],
+                cue_pos[1],
+                self.table_height_mm - cue_pos[1],
+            )
+            if min_r_init < self._min_rail_dist_before_first_hit:
+                self._min_rail_dist_before_first_hit = min_r_init
 
         if cue_velocity is None:
             if self._prev_cue_pos is None:
@@ -580,14 +763,9 @@ class ScoringEngine:
 
         self._cue_trajectory_log.append((frame_idx, cue_pos, cue_vel, min_dist_to_targets))
 
-        # 1. 4면 쿠션 법선 속도 부호 반전(Velocity Reversal) + 슈미트 트리거 + 물리 충격량(Impulse) 판정
-        triggered_rails = self._check_cushion_velocity_reversal(
-            frame_idx, cue_pos, cue_vel, min_dist_to_targets=min_dist_to_targets
-        )
-
-        # 수구의 허공 진행 각도 변화량(Deflection Angle) 계산 (쿠션 반사 프레임이 아닐 때)
+        # 수구의 진행 각도 변화량(Deflection Angle) 사전 계산
         cue_deflection_deg = 0.0
-        if not triggered_rails and self._prev_cue_vel is not None:
+        if self._prev_cue_vel is not None:
             v1_norm = math.hypot(self._prev_cue_vel[0], self._prev_cue_vel[1])
             v2_norm = math.hypot(cue_vel[0], cue_vel[1])
             if v1_norm >= 2.5 and v2_norm >= 2.5:
@@ -598,7 +776,7 @@ class ScoringEngine:
                 cos_ang = max(-1.0, min(1.0, cos_ang))
                 cue_deflection_deg = math.degrees(math.acos(cos_ang))
 
-        # 2. 목적구(제1적구, 제2적구) 충돌 판정 (수구 직접 접촉 + 스플라인 복원 + 적구 간 키스 분리 검증)
+        # 1순위: 목적구(제1적구, 제2적구) 충돌 판정 먼저 수행! (레일 근처 목적구 타격 시 가짜 선쿠션/뱅크샷 둔갑 방지)
         spline_pts: List[Point2D] = []
         if self._prev_cue_pos is not None and self._prev_cue_vel is not None:
             from cue24.core.physics_tracker import PhysicsTracker
@@ -609,6 +787,7 @@ class ScoringEngine:
 
         from cue24.mcp.billiard_physics_mcp import physics_ai_engine
 
+        hit_target_this_frame = False
         for bid, pos in ball_positions.items():
             if bid == self.cue_ball_id:
                 continue
@@ -661,8 +840,6 @@ class ScoringEngine:
             )
 
             # [4대 업그레이드 ④] 0쿠션 초반 회색지대 조기 키스 오탐 방지:
-            # 제1적구 타격 직후 5프레임(0.18초) 이내이면서 0쿠션 상태일 때는,
-            # 호모그래피 시차로 옆을 스쳐 지나가는 것을 '0쿠션 조기키스'로 잘못 잠그지 않도록 엄격히 검증
             if (
                 is_direct_hit
                 and self.first_object_ball_id is not None
@@ -675,11 +852,18 @@ class ScoringEngine:
                     is_direct_hit = False
 
             if is_direct_hit:
+                hit_target_this_frame = True
                 if not self._in_contact_with_ball.get(bid, False):
                     self.record_ball_hit(bid, frame_idx, cue_pos)
                     self._in_contact_with_ball[bid] = True
             else:
                 self._in_contact_with_ball[bid] = False
+
+        # 2순위: 이번 프레임에 목적구 충돌이 발생하지 않았고 아직 득점이 확정되지 않았을 때만 4면 쿠션 반사 판정 수행!
+        if not hit_target_this_frame and self.fsm_state != ShotFSMState.VALID_SCORE_PENDING:
+            self._check_cushion_velocity_reversal(
+                frame_idx, cue_pos, cue_vel, min_dist_to_targets=min_dist_to_targets
+            )
 
         # [실시간 제2적구 충돌 즉시 복원]
         # 모션 블러나 트랙 스왑으로 순간 접촉 거리를 놓쳤더라도, 제2적구가 충돌 직후 움직이기 시작하는 바로 그 프레임에

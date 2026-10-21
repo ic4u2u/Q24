@@ -307,7 +307,7 @@ class ThreeCushionScoringFSM:
 
             if cushions_now >= 3:
                 self.state = ShotState.VALID_SCORE_PENDING
-                self.is_bank_shot = self.cushions_before_first_ball >= 3
+                self.is_bank_shot = self.cushions_before_first_ball >= 1
                 self.fail_reason = FailReason.NONE.value
                 shot_tag = "BANK_SHOT" if self.is_bank_shot else "REGULAR_3C"
                 self.events.append(
@@ -462,12 +462,13 @@ class ThreeCushionScoringFSM:
         )
         self.centroid_shift_corrected_count = self.kinematics.centroid_shift_corrected_count
 
-        # 동일 프레임 내에서 쿠션과 목적구 접촉의 시간순 정렬 처리
-        for c_ev in cushion_events:
-            self.on_cushion_impact(c_ev)
-
+        # 동일 프레임 내에서 [1순위: 목적구 접촉] -> [2순위: 쿠션 접촉(목적구 접촉 및 득점 확정이 아닐 때만)] 순서로 처리
         for hit_ev in contact_events:
             self.on_ball_contact(hit_ev)
+
+        if not contact_events and self.state != ShotState.VALID_SCORE_PENDING:
+            for c_ev in cushion_events:
+                self.on_cushion_impact(c_ev)
 
         # [추가 보정 1] 스트로크 초기 0.15초 내 투터치(Double Hit) 파울 감시
         self._check_double_hit_foul(

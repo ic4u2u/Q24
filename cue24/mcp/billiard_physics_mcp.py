@@ -275,7 +275,7 @@ class LocalPhysics3CushionAI:
                 if cushions:
                     prev_idx = cushions[-1][0]
                     dt_f = max(1, idx - prev_idx)
-                    if dt_f <= 10 and travel_d > 1050.0 and (travel_d / dt_f) > 145.0:
+                    if dt_f <= 3 and travel_d > 1050.0 and (travel_d / dt_f) > 350.0:
                         return
             if self.verify_cushion_impulse(rail_name, pt, prev_vel, curr_vel):
                 cushions.append((idx, rail_name))
@@ -534,7 +534,7 @@ class LocalPhysics3CushionAI:
         if reconstructed_c_before_2nd < 3:
             return result
 
-        # 제1적구 충돌(t1_step) 이전 쿠션 수 계산
+        # 제1적구 충돌(t1_step) 이전 쿠션 수 계산 (이미 제1적구 접촉이 실시간으로 확정된 경우에는 기존 선쿠션 수를 보존)
         c_before_1st = sum(
             1
             for step_i, _ in cushions_by_candidate.get(best_carrier_id, [])
@@ -543,7 +543,11 @@ class LocalPhysics3CushionAI:
 
         result["first_object_ball_id"] = first_object_ball_id or inferred_first_id
         result["second_object_ball_id"] = second_object_ball_id or inferred_second_id
-        result["cushions_before_first_hit"] = max(cushions_before_first_hit, c_before_1st)
+        result["cushions_before_first_hit"] = (
+            cushions_before_first_hit
+            if first_object_ball_id is not None
+            else max(cushions_before_first_hit, c_before_1st)
+        )
         result["cushions_before_second_hit"] = max(
             cushions_before_second_hit, reconstructed_c_before_2nd
         )

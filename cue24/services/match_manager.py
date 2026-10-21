@@ -127,6 +127,8 @@ class MatchManager:
         self._last_shot_inning: int = 1
         self._last_shot_was_miss: bool = False
         self._last_shot_prev_run: int = 0
+        self.shot_seq_id: int = 0
+        self.last_scored_shot_id: int = -1
         self.score_dispatched_for_current_shot: bool = False
         self.bank_shot_dispatched_for_current_shot: bool = False
 
@@ -604,6 +606,7 @@ class MatchManager:
         수구가 움직이기 시작하면 FSM을 SHOT_IN_PROGRESS로 전환하고,
         진행 중이던 40초 샷 타이머를 즉시 일시 정지(Pause)합니다.
         """
+        self.shot_seq_id += 1
         self.sync_active_player_to_current_inning(self.active_player_id)
         self.fsm_state = MatchState.SHOT_IN_PROGRESS
         self.is_timer_paused = True
@@ -623,7 +626,10 @@ class MatchManager:
         - 메인 점수 아래 그라데이션 타이머 바를 40초(100%, 에메랄드 그린)로 즉시 리셋
         을 수행하고 중복 가산 방지 플래그(score_dispatched_for_current_shot = True)를 설정합니다.
         """
-        if self.score_dispatched_for_current_shot:
+        if (
+            self.score_dispatched_for_current_shot
+            or self.last_scored_shot_id == self.shot_seq_id
+        ):
             payload = self.get_match_payload()
             return {
                 "event_type": "SCORE_UPDATED",
@@ -632,11 +638,13 @@ class MatchManager:
                 "active_cue_ball_color": self.active_cue_ball_color,
                 "is_scored": True,
                 "already_dispatched": True,
+                "shot_id": self.shot_seq_id,
                 "points_awarded": 0,
                 "payload": payload,
             }
 
         self.score_dispatched_for_current_shot = True
+        self.last_scored_shot_id = self.shot_seq_id
         shot_type = str(shot_eval.get("shot_type", "REGULAR_3C"))
         if shot_type not in ("REGULAR_3C", "BANK_SHOT"):
             shot_type = "REGULAR_3C"
@@ -654,7 +662,7 @@ class MatchManager:
         else:
             points_awarded = 1
 
-        if shot_type == "BANK_SHOT":
+        if shot_type == "BANK_SHOT" and not self.bank_shot_dispatched_for_current_shot:
             current_player.bank_shots += 1
             self.bank_shot_dispatched_for_current_shot = True
 
@@ -671,6 +679,7 @@ class MatchManager:
         self.is_timer_paused = self.is_match_paused
 
         self.last_shot_result = {
+            "shot_id": self.shot_seq_id,
             "is_scored": True,
             "immediate_score": True,
             "already_dispatched": False,
@@ -680,6 +689,9 @@ class MatchManager:
             "message": shot_eval.get(
                 "message",
                 f"⚡ 제2적구 충돌 즉시 득점! (+{points_awarded}점 실시간 반영)",
+            ),
+            "cushions_before_first_hit": shot_eval.get(
+                "cushions_before_first_hit", 0
             ),
             "cushions_before_second_hit": shot_eval.get(
                 "cushions_before_second_hit", 3
@@ -696,6 +708,7 @@ class MatchManager:
             "is_scored": True,
             "immediate_score": True,
             "already_dispatched": False,
+            "shot_id": self.shot_seq_id,
             "points_awarded": points_awarded,
             "payload": payload,
         }
@@ -746,8 +759,10 @@ class MatchManager:
           * 후공(P2)이 실패한 경우: 해당 이닝이 종료되므로 다음 이닝(self.current_inning + 1)으로 증가하며 선공(P1)으로 턴 전환!
         """
         self.fsm_state = MatchState.BALL_STOPPED
-        already_dispatched = self.score_dispatched_for_current_shot or bool(
-            shot_eval.get("already_dispatched", False)
+        already_dispatched = (
+            self.score_dispatched_for_current_shot
+            or (self.shot_seq_id > 0 and self.last_scored_shot_id == self.shot_seq_id)
+            or bool(shot_eval.get("already_dispatched", False))
         )
         was_bank_dispatched = self.bank_shot_dispatched_for_current_shot
         # [불변 원칙] 제2적구 충돌 즉시 한 번 올라간 점수(+1)는 절대 롤백(차감)하지 않으며,
@@ -772,6 +787,7 @@ class MatchManager:
 
         points_awarded = 0
         if is_scored:
+            self.last_scored_shot_id = self.shot_seq_id
             if already_dispatched:
                 # 이미 제2적구 충돌 순간에 즉시 득점(+1)이 반영되었으므로 중복 가산 및 롤백을 모두 차단하고 턴을 유지!
                 # 단, 즉시 득점 시점에는 일반 3C였다가 정지 시점에 뱅크샷으로 최종 확인된 경우 뱅크샷 카운트를 보정합니다.
@@ -843,12 +859,16 @@ class MatchManager:
         self.fsm_state = MatchState.WAIT_SHOT
 
         self.last_shot_result = {
+            "shot_id": self.shot_seq_id,
             "is_scored": is_scored,
             "already_dispatched": already_dispatched,
             "points_awarded": points_awarded,
             "shot_type": shot_type,
             "reason_code": shot_eval.get("reason_code", ""),
             "message": shot_eval.get("message", ""),
+            "cushions_before_first_hit": shot_eval.get(
+                "cushions_before_first_hit", 0
+            ),
             "cushions_before_second_hit": shot_eval.get(
                 "cushions_before_second_hit", 0
             ),
@@ -863,6 +883,7 @@ class MatchManager:
             "active_cue_ball_color": self.active_cue_ball_color,
             "is_scored": is_scored,
             "already_dispatched": already_dispatched,
+            "shot_id": self.shot_seq_id,
             "points_awarded": points_awarded,
             "payload": payload,
         }

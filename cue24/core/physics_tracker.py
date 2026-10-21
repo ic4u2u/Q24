@@ -168,11 +168,12 @@ class BallCandidateDetector:
         )
 
         valid_candidates: List[Dict[str, float]] = []
+        cluster_contours: List[Tuple[np.ndarray, float, float]] = []
 
         for cnt in contours:
             raw_area = float(cv2.contourArea(cnt))
             area = raw_area * area_scale
-            if area < self.min_area or area > self.max_area:
+            if area < self.min_area or area > self.max_area * 2.1:
                 continue
 
             perimeter = float(cv2.arcLength(cnt, True))
@@ -181,20 +182,53 @@ class BallCandidateDetector:
 
             # 3. 진원도(Circularity = 4 * pi * area / perimeter^2) 계산 및 필터링
             circularity = (4.0 * math.pi * raw_area) / (perimeter * perimeter)
-            if circularity <= self.CIRCULARITY_TH:
-                # 큐대, 선수 팔, 긴 그림자 등은 진원도가 0.72 이하이므로 완벽히 배제됨
-                continue
+            if circularity > self.CIRCULARITY_TH and area <= max(4600.0, self.max_area * 0.72):
+                (cx, cy), radius = cv2.minEnclosingCircle(cnt)
+                valid_candidates.append(
+                    {
+                        "x": float(cx) * inv_scale,
+                        "y": float(cy) * inv_scale,
+                        "radius": float(radius) * inv_scale,
+                        "circularity": float(circularity),
+                        "area": area,
+                    }
+                )
+            elif 4000.0 <= area <= 13500.0 and circularity > 0.35:
+                cluster_contours.append((cnt, area, circularity))
 
-            (cx, cy), radius = cv2.minEnclosingCircle(cnt)
-            valid_candidates.append(
-                {
-                    "x": float(cx) * inv_scale,
-                    "y": float(cy) * inv_scale,
-                    "radius": float(radius) * inv_scale,
-                    "circularity": float(circularity),
-                    "area": area,
-                }
-            )
+        # 만약 2~3개의 공이 서로 밀착하여 하나의 컨투어로 합쳐진 경우 CIE LAB 색도 분리로 개별 공 추출
+        if len(valid_candidates) < max_balls and cluster_contours:
+            lab_frame = cv2.cvtColor(work_frame, cv2.COLOR_BGR2LAB)
+            L_ch, A_ch, B_ch = lab_frame[:, :, 0], lab_frame[:, :, 1], lab_frame[:, :, 2]
+            for cnt, _, _ in cluster_contours:
+                cmask = np.zeros(foreground_mask.shape, dtype=np.uint8)
+                cv2.drawContours(cmask, [cnt], -1, 255, -1)
+                sub_masks = [
+                    (cmask > 0) & (A_ch >= 142),
+                    (cmask > 0) & (A_ch < 142) & (B_ch >= 140),
+                    (cmask > 0) & (A_ch < 142) & (B_ch < 140) & (L_ch >= 135),
+                ]
+                for sm in sub_masks:
+                    scnts, _ = cv2.findContours(
+                        sm.astype(np.uint8) * 255,
+                        cv2.RETR_EXTERNAL,
+                        cv2.CHAIN_APPROX_SIMPLE,
+                    )
+                    if not scnts:
+                        continue
+                    sc = max(scnts, key=cv2.contourArea)
+                    s_area = float(cv2.contourArea(sc)) * area_scale
+                    if s_area >= 1100.0:
+                        (cx, cy), radius = cv2.minEnclosingCircle(sc)
+                        valid_candidates.append(
+                            {
+                                "x": float(cx) * inv_scale,
+                                "y": float(cy) * inv_scale,
+                                "radius": float(radius) * inv_scale,
+                                "circularity": 0.78,
+                                "area": s_area,
+                            }
+                        )
 
         # 진원도가 높고 이상적인 당구공 면적에 가까운 순서로 정렬하여 상위 3개 반환
         valid_candidates.sort(

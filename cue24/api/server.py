@@ -128,9 +128,9 @@ class LiveStreamReader:
     VISION_START_SPEED_TH: float = 4.5
     VISION_START_DISP_MM: float = 14.0
     MOTION_BLUR_CIRC_TH: float = 0.42
-    # 테스트 녹화 영상(L-billiard.mp4)에서 경기 초기화/화면 리플레시 즉시 3구 색상 잠금 ->
-    # 선공 첫 샷 3쿠션 득점 성공(공격 중 유지) -> 다음 샷 공타(같은 1이닝 후공 전환) -> 후공 연속 득점이 이어지는 프레임
-    ACTIVE_SHOT_START_FRAME: int = 7915
+    # 테스트 녹화 영상(H:\OBS녹화\new1020.mp4)에서 경기 초기화/화면 리플레시 즉시 3구 색상 잠금 ->
+    # 1이닝 선공(흰공) 초구 브레이크샷 -> 1이닝 후공(노란공) 쓰리뱅크샷 득점 -> 연속 경기가 이어지는 시작 프레임
+    ACTIVE_SHOT_START_FRAME: int = 0
 
     def __init__(
         self,
@@ -301,6 +301,9 @@ class LiveStreamReader:
                     self._latest_live_jpeg = jpg_bytes
                     self.replay_buffer.push_frame(jpg_bytes)
 
+            if self.camera_index is None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, self.ACTIVE_SHOT_START_FRAME)
+
             self.replay_buffer.lock_last_shot(
                 "REGULAR_3C", True, "카메라/테스트 영상 초기 리플레이 준비 완료"
             )
@@ -343,18 +346,19 @@ class LiveStreamReader:
         )
         strict_candidates: List[Dict[str, float]] = []
         blur_candidates: List[Dict[str, float]] = []
+        cluster_contours: List[np.ndarray] = []
+        tilt = self.calibrator.camera_tilt_ratio
 
         for cnt in contours:
             raw_area = float(cv2.contourArea(cnt))
             area = raw_area * 16.0  # 0.25x 스케일이므로 면적은 x16 복원
-            if area < self.detector.min_area or area > self.detector.max_area * 1.45:
+            if area < self.detector.min_area or area > self.detector.max_area * 2.1:
                 continue
             perim = float(cv2.arcLength(cnt, True))
             if perim <= 0.0:
                 continue
             circ = (4.0 * math.pi * raw_area) / (perim * perim)
             (cx, cy), rad = cv2.minEnclosingCircle(cnt)
-            tilt = self.calibrator.camera_tilt_ratio
             cand_item = {
                 "x": float(cx) * 4.0,
                 "y": (float(cy) + float(rad) * tilt) * 4.0,
@@ -362,10 +366,57 @@ class LiveStreamReader:
                 "circularity": float(circ),
                 "area": area,
             }
-            if circ > self.detector.CIRCULARITY_TH and area <= self.detector.max_area * 1.1:
+            if circ > self.detector.CIRCULARITY_TH and area <= max(
+                4600.0, self.detector.max_area * 0.72
+            ):
                 strict_candidates.append(cand_item)
-            elif circ > self.MOTION_BLUR_CIRC_TH:
+            elif 4000.0 <= area <= 13500.0 and circ > 0.35:
+                cluster_contours.append(cnt)
                 blur_candidates.append(cand_item)
+            elif circ > self.MOTION_BLUR_CIRC_TH and area <= self.detector.max_area * 1.45:
+                blur_candidates.append(cand_item)
+
+        # 공 2~3개가 서로 밀착/충돌하여 하나의 컨투어로 합쳐진 경우 CIE LAB 색도 분리로 개별 공 추출
+        if len(strict_candidates) < 3 and cluster_contours:
+            lab_q = cv2.cvtColor(warped_quarter, cv2.COLOR_BGR2LAB)
+            L_ch, A_ch, B_ch = lab_q[:, :, 0], lab_q[:, :, 1], lab_q[:, :, 2]
+            for cnt in cluster_contours:
+                cmask = np.zeros(fg_mask.shape, dtype=np.uint8)
+                cv2.drawContours(cmask, [cnt], -1, 255, -1)
+                sub_masks = [
+                    (cmask > 0) & (A_ch >= 142),
+                    (cmask > 0) & (A_ch < 142) & (B_ch >= 140),
+                    (cmask > 0) & (A_ch < 142) & (B_ch < 140) & (L_ch >= 135),
+                ]
+                for sm in sub_masks:
+                    scnts, _ = cv2.findContours(
+                        sm.astype(np.uint8) * 255,
+                        cv2.RETR_EXTERNAL,
+                        cv2.CHAIN_APPROX_SIMPLE,
+                    )
+                    if not scnts:
+                        continue
+                    sc = max(scnts, key=cv2.contourArea)
+                    s_area = float(cv2.contourArea(sc)) * 16.0
+                    if s_area >= 1100.0:
+                        (cx, cy), rad = cv2.minEnclosingCircle(sc)
+                        cand_pt = (
+                            float(cx) * 4.0,
+                            (float(cy) + float(rad) * tilt) * 4.0,
+                        )
+                        if all(
+                            math.hypot(cand_pt[0] - ec["x"], cand_pt[1] - ec["y"]) >= 42.0
+                            for ec in strict_candidates
+                        ):
+                            strict_candidates.append(
+                                {
+                                    "x": cand_pt[0],
+                                    "y": cand_pt[1],
+                                    "radius": float(rad) * 4.0,
+                                    "circularity": 0.78,
+                                    "area": s_area,
+                                }
+                            )
 
         strict_candidates.sort(
             key=lambda c: (-c["circularity"], abs(c["area"] - self.detector.ideal_area))
@@ -398,12 +449,10 @@ class LiveStreamReader:
         self._reset_wall_clock_sync()
 
         if self.is_real_video_loaded and self._video_cap is not None:
-            if self.camera_index is None:
-                cur_pos = int(self._video_cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                if seek_to_active_shot or cur_pos < 580:
-                    self._video_cap.set(
-                        cv2.CAP_PROP_POS_FRAMES, self.ACTIVE_SHOT_START_FRAME
-                    )
+            if self.camera_index is None and seek_to_active_shot:
+                self._video_cap.set(
+                    cv2.CAP_PROP_POS_FRAMES, self.ACTIVE_SHOT_START_FRAME
+                )
 
             ret, raw_frame = self._video_cap.read()
             if not ret or raw_frame is None:
@@ -994,53 +1043,108 @@ class LiveStreamReader:
                 else settings.STOP_VELOCITY_TH
             )
             active_expected_color = self.match_manager.active_cue_ball_color
-            moving_candidates: List[Tuple[float, int]] = []
-
+            expected_cue_id: Optional[int] = None
             for bid, st in ball_states.items():
-                if st.speed < vel_th:
-                    continue
-                if require_rest_displacement and bid in self._rest_positions:
-                    rx, ry = self._rest_positions[bid]
-                    disp = math.hypot(
-                        float(st.position[0]) - rx, float(st.position[1]) - ry
+                if st.color == active_expected_color:
+                    expected_cue_id = bid
+                    break
+
+            first_moving_id: Optional[int] = None
+            occluded_first_hit_id: Optional[int] = None
+
+            # [규칙 1: 세 공이 멈춘 상태(IDLE)에서 '가장 먼저 출발한 공(First-Mover Onset)' 추적]
+            # 아직 공끼리 충돌하기 전(min_pair_dist >= 66.0mm) 상태에서 적구(RED)를 제외한 WHITE/YELLOW 중
+            # 가장 먼저 정지 위치로부터 출발한 공을 추적합니다.
+            pts_list = [
+                (float(st.position[0]), float(st.position[1]))
+                for st in ball_states.values()
+            ]
+            min_pair_dist_now = (
+                min(
+                    math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+                    for i, p1 in enumerate(pts_list)
+                    for p2 in pts_list[i + 1 :]
+                )
+                if len(pts_list) >= 2
+                else 999.0
+            )
+            is_opening_unlocked = (
+                not self.causal_kiss_fsm.turn_locked_by_previous_shot
+                and self.match_manager.shot_seq_id <= 1
+                and self.match_manager.current_inning == 1
+                and self.match_manager.players["P1"].score == 0
+                and self.match_manager.players["P2"].score == 0
+            )
+
+            # 1순위: 현재 턴 선수의 지정 수구(active_expected_color)가 출발했는지 확인
+            if expected_cue_id is not None and expected_cue_id in ball_states:
+                exp_st = ball_states[expected_cue_id]
+                exp_disp = 999.0
+                if require_rest_displacement and expected_cue_id in self._rest_positions:
+                    rx, ry = self._rest_positions[expected_cue_id]
+                    exp_disp = math.hypot(
+                        float(exp_st.position[0]) - rx, float(exp_st.position[1]) - ry
                     )
-                    if disp < self.VISION_START_DISP_MM:
+                if exp_st.speed >= vel_th and exp_disp >= self.VISION_START_DISP_MM:
+                    first_moving_id = expected_cue_id
+
+            # 1-B순위: 경기 시작 첫 초구(턴 잠금 전)에 아직 공끼리 충돌하기 전(>= 66mm) 상태에서
+            # WHITE 또는 YELLOW 중 가장 먼저 출발한 공(First-Mover)이 포착되면 그 공을 수구로 결정!
+            if (
+                first_moving_id is None
+                and is_opening_unlocked
+                and min_pair_dist_now >= 66.0
+            ):
+                best_onset_id: Optional[int] = None
+                best_onset_speed: float = 0.0
+                for bid, st in ball_states.items():
+                    if str(st.color).upper() not in ("WHITE", "YELLOW"):
                         continue
-                # WHITE와 YELLOW 수구 후보에 동등한 우선순위를 부여하여(적구 RED만 후순위),
-                # 현재 점수판 턴과 무관하게 선수가 실제로 친 공(흰공 또는 노란공)을 공정하게 인식합니다.
-                if st.color in ("WHITE", "YELLOW"):
-                    tie_breaker = 5.0 if st.color == active_expected_color else 0.0
-                    color_bonus = 2000.0 + tie_breaker
-                else:
-                    color_bonus = 0.0
-                moving_candidates.append((color_bonus + st.speed, bid))
+                    cand_disp = 999.0
+                    if require_rest_displacement and bid in self._rest_positions:
+                        rx, ry = self._rest_positions[bid]
+                        cand_disp = math.hypot(
+                            float(st.position[0]) - rx, float(st.position[1]) - ry
+                        )
+                    if st.speed >= vel_th and cand_disp >= max(12.0, self.VISION_START_DISP_MM):
+                        if st.speed > best_onset_speed:
+                            best_onset_speed = float(st.speed)
+                            best_onset_id = bid
+                if best_onset_id is not None:
+                    first_moving_id = best_onset_id
+                    mover_color = str(ball_states[best_onset_id].color).upper()
+                    self.match_manager.active_player_id = (
+                        "P2" if mover_color == "YELLOW" else "P1"
+                    )
+                    self.match_manager.active_cue_ball_color = (
+                        "YELLOW" if mover_color == "YELLOW" else "WHITE"
+                    )
 
-            if moving_candidates:
-                moving_candidates.sort(reverse=True)
-                first_moving_id = moving_candidates[0][1]
+            # 2순위: 만약 스트로크 순간 큐대/손 가림으로 인해 지정 수구는 안 보였지만
+            # 다른 공(제1적구 또는 상대방 수구)이 강하게(>= 35.0mm) 튀어나간 경우:
+            # 절대 수구(턴)를 상대방으로 넘기지 않고, 지정 수구(expected_cue_id)를 수구로 잠근 채 튀어나간 공을 제1적구로 등록!
+            if first_moving_id is None and expected_cue_id is not None:
+                for bid, st in ball_states.items():
+                    if bid == expected_cue_id or st.speed < max(vel_th * 1.5, 11.5):
+                        continue
+                    disp_other = 999.0
+                    if bid in self._rest_positions:
+                        rx, ry = self._rest_positions[bid]
+                        disp_other = math.hypot(
+                            float(st.position[0]) - rx, float(st.position[1]) - ry
+                        )
+                    elif require_rest_displacement:
+                        disp_other = math.hypot(
+                            float(st.position[0]) - float(st.prev_position[0]),
+                            float(st.position[1]) - float(st.prev_position[1]),
+                        )
+                    if disp_other >= 35.0:
+                        first_moving_id = expected_cue_id
+                        occluded_first_hit_id = bid
+                        break
 
-                # 만약 초고속 타구 블러로 인해 정지 위치에서 먼저 사라졌던 수구(_last_missing_wait_id)가 있거나
-                # 피격된 적구(RED)가 먼저 감지된 경우 진짜 수구(WHITE/YELLOW)로 바로잡음
-                if (
-                    require_rest_displacement
-                    and self._last_missing_wait_id is not None
-                    and self._last_missing_wait_id in ball_states
-                    and ball_states[self._last_missing_wait_id].color in ("WHITE", "YELLOW")
-                ):
-                    first_moving_id = self._last_missing_wait_id
-                elif ball_states[first_moving_id].color == "RED":
-                    active_color = self.match_manager.active_cue_ball_color
-                    for bid, st in ball_states.items():
-                        if st.color == active_color:
-                            first_moving_id = bid
-                            break
-                    else:
-                        for bid, st in ball_states.items():
-                            if st.color in ("WHITE", "YELLOW"):
-                                first_moving_id = bid
-                                break
-
-                # 처음 움직이는 공을 이번 샷의 수구(Cue Ball)로 영구 고정!
+            if first_moving_id is not None:
+                # 현재 턴의 지정 수구를 이번 샷의 수구(Cue Ball)로 영구 고정! (상대방 공 노이즈 턴 하이재킹 원천 차단)
                 self.tracker.cue_ball_id = first_moving_id
                 cue_id = first_moving_id
                 cue_state = ball_states[cue_id]
@@ -1050,23 +1154,14 @@ class LiveStreamReader:
                 self.bulletproof_tracker.is_shot_in_progress = True
 
                 # [절대 원칙]
-                # 1) 흰공(WHITE) 타구 = 1번 선수(선공 P1), 노란공(YELLOW) 타구 = 2번 선수(후공 P2) 100% 일치!
-                # 2) 직전 샷에서 비전이 미세 득점을 놓쳐 턴이 넘어갔더라도, 선수가 자기 공(흰공 또는 노란공)을
-                #    계속 치는 순간 누락된 직전 점수(+1점)와 공격권이 즉시 제자리로 복구됩니다!
+                # 1) 흰공(WHITE) = 1번 선수(선공 P1), 노란공(YELLOW) = 2번 선수(후공 P2) 100% 고정!
+                # 2) 상대방 공의 미세 흔들림이나 스트로크 시 가려짐 때문에 공격권이 강탈되거나 가짜 점수가 올라가는 것을 원천 차단!
                 self.match_manager.players["P1"].cue_ball_color = "WHITE"
                 self.match_manager.players["P2"].cue_ball_color = "YELLOW"
                 compensated_prev_shot = False
-                if cue_state.color in ("WHITE", "YELLOW"):
-                    rec_info = self.match_manager.reconcile_cue_ball_stroke(
-                        stroked_cue_color=cue_state.color,
-                        compensate_missed_score=True,
-                        force_sync_player=True,
-                    )
-                    compensated_prev_shot = bool(rec_info.get("compensated", False))
-                else:
-                    self.match_manager.sync_active_player_to_current_inning(
-                        self.match_manager.active_player_id
-                    )
+                self.match_manager.sync_active_player_to_current_inning(
+                    self.match_manager.active_player_id
+                )
 
                 # 수구가 움직였으므로 샷 클락(카운트) 작동을 즉시 멈추고 득점 알고리즘 가동
                 self.match_manager.on_shot_started()
@@ -1076,6 +1171,12 @@ class LiveStreamReader:
                 self.scoring_engine.reset_shot(
                     cue_ball_id=cue_id, object_ball_ids=obj_ids
                 )
+                if occluded_first_hit_id is not None:
+                    self.scoring_engine.record_ball_hit(
+                        occluded_first_hit_id,
+                        self.frame_counter,
+                        (float(cue_state.position[0]), float(cue_state.position[1])),
+                    )
                 # 3체 인과 키스 분리 엔진(CausalKissSafeFSM) 및 100% Autoresearch 물리 감지기 초기화
                 shooter_vcol = (
                     VisionBallColor.YELLOW
@@ -1086,6 +1187,12 @@ class LiveStreamReader:
                 self.causal_kiss_fsm.assigned_cue_ball = shooter_vcol
                 self.causal_kiss_fsm.active_cue_ball = shooter_vcol
                 self.causal_kiss_fsm.state = CausalShotState.IN_PLAY
+                self.causal_kiss_fsm.shot_seq_id = self.match_manager.shot_seq_id
+                if occluded_first_hit_id is not None and occluded_first_hit_id in ball_states:
+                    occ_col_str = str(ball_states[occluded_first_hit_id].color).upper()
+                    if occ_col_str in VisionBallColor.__members__:
+                        self.causal_kiss_fsm.first_target_ball = VisionBallColor[occ_col_str]
+                        self.causal_kiss_fsm.first_target_hit_time = self.frame_counter / fps_scale
                 self._last_causal_shot_result = None
                 self.vision_kinematics.reset()
                 init_vpos, init_kdpos = self._build_vision_color_positions(
@@ -1141,22 +1248,17 @@ class LiveStreamReader:
                 }
                 active_cue_color = self.match_manager.active_cue_ball_color
                 cue_ko = COLOR_KO_LABELS.get(active_cue_color, active_cue_color)
-                if compensated_prev_shot:
-                    start_msg = (
-                        f"수구({cue_ko}) 연속 타구 감지 -> 직전 미인지 득점(+1점) 자동 복구 및 "
-                        f"{self.match_manager.active_player.name} 공격 계속 진행 중"
-                    )
-                    start_reason = "RETROACTIVE_SCORE_COMPENSATED"
-                else:
-                    start_msg = f"수구({cue_ko}) 출발 감지 - 타이머 일시정지 및 5단계 초고속 궤적 추적 중"
-                    start_reason = "CUE_MOVING"
+                start_msg = f"수구({cue_ko}) 출발 감지 - 타이머 일시정지 및 5단계 초고속 궤적 추적 중"
+                start_reason = "CUE_MOVING"
 
                 self.match_manager.last_shot_result = {
-                    "is_scored": compensated_prev_shot,
-                    "points_awarded": 1 if compensated_prev_shot else 0,
+                    "shot_id": self.match_manager.shot_seq_id,
+                    "is_scored": False,
+                    "points_awarded": 0,
                     "shot_type": "IN_PROGRESS",
                     "reason_code": start_reason,
                     "message": start_msg,
+                    "cushions_before_first_hit": 0,
                     "cushions_before_second_hit": 0,
                     "total_cushions": 0,
                 }
@@ -1177,11 +1279,14 @@ class LiveStreamReader:
             prev_cushions = self.scoring_engine.total_cushion_count
             prev_events_count = len(self.scoring_engine.events)
 
-            self.scoring_engine.update_frame(
-                frame_idx=self.frame_counter,
-                ball_positions=positions_map,
-                cue_velocity=cue_vel,
-            )
+            # [득점 후 잔여 구름 동결(Freeze)]
+            # 제2적구 충돌로 즉시 득점이 이미 발송된 이후에는 사후 쿠션/충돌 평가를 완전히 중단하고 공이 멈추기만 기다립니다!
+            if not self.match_manager.score_dispatched_for_current_shot:
+                self.scoring_engine.update_frame(
+                    frame_idx=self.frame_counter,
+                    ball_positions=positions_map,
+                    cue_velocity=cue_vel,
+                )
 
             # 3체 인과 키스 분리 엔진 및 Autoresearch 100% 물리 감지기 실시간 동기화
             cur_vpos, cur_kdpos = self._build_vision_color_positions(
@@ -1196,16 +1301,17 @@ class LiveStreamReader:
                 )
                 if maybe_causal is not None:
                     self._last_causal_shot_result = maybe_causal
-                self.vision_kinematics.step(
-                    balls=cur_kdpos,
-                    assigned_cue_ball=(
-                        KDColor.YELLOW
-                        if str(cue_state.color).upper() == "YELLOW"
-                        else KDColor.WHITE
-                    ),
-                    timestamp=t_curr,
-                    current_cushion_count=self.scoring_engine.total_cushion_count,
-                )
+                if not self.match_manager.score_dispatched_for_current_shot:
+                    self.vision_kinematics.step(
+                        balls=cur_kdpos,
+                        assigned_cue_ball=(
+                            KDColor.YELLOW
+                            if str(cue_state.color).upper() == "YELLOW"
+                            else KDColor.WHITE
+                        ),
+                        timestamp=t_curr,
+                        current_cushion_count=self.scoring_engine.total_cushion_count,
+                    )
 
             self._cue_trajectory.append(positions_map[cue_id])
             for bid, tr_list in self._target_trajectories.items():
@@ -1242,16 +1348,13 @@ class LiveStreamReader:
                 and not has_double_touch_foul
                 and (causal_instant_scored or engine_instant_scored or kinematics_instant_scored)
             ):
-                is_bank = bool(
-                    self.scoring_engine.cushion_count_before_first_hit >= 1
-                    or (maybe_causal is not None and maybe_causal.is_bank_shot)
-                    or self.causal_kiss_fsm.is_bank_shot
-                    or (
-                        len(self.scoring_engine.events) > 0
-                        and str(self.scoring_engine.events[0].event_type)
-                        in ("CUSHION", "CUSHION_HIT")
-                    )
+                cush_before_1st = max(
+                    int(self.scoring_engine.cushion_count_before_first_hit),
+                    int(maybe_causal.cushions_before_first_hit)
+                    if maybe_causal is not None
+                    else int(self.causal_kiss_fsm.cushions_before_first_hit),
                 )
+                is_bank = bool(cush_before_1st >= 1)
                 cush_at_2nd = max(
                     int(self.scoring_engine.cushion_count_before_second_hit),
                     int(maybe_causal.cushions_at_second_hit) if maybe_causal is not None else 3,
@@ -1265,9 +1368,7 @@ class LiveStreamReader:
                     "message": (
                         f"⚡ 제2적구 충돌 즉시 득점! ({bank_tag}{cush_at_2nd}쿠션 충족 실시간 +1 반영)"
                     ),
-                    "cushions_before_first_hit": int(
-                        self.scoring_engine.cushion_count_before_first_hit
-                    ),
+                    "cushions_before_first_hit": cush_before_1st,
                     "cushions_before_second_hit": cush_at_2nd,
                     "total_cushions": tot_cush,
                 }
@@ -1402,8 +1503,20 @@ class LiveStreamReader:
                         "파울 (투터치/밀어치기 감지): 근접 충돌 직후 수구 재가속·비정상 추격 차단"
                     )
 
-                # 0.3mm 초미세 스침 / 시속 35km 고속 코너 반사 등 기존 엔진 미탐지 득점을 정밀 구출
+                # 0.3mm 초미세 스침 / 1쿠션 넣어치기 뱅크샷 / 시속 35km 고속 코너 반사 등 정밀 구출 및 동기화
                 if (
+                    bool(shot_eval.get("is_scored", False))
+                    and causal_res.is_bank_shot
+                    and str(shot_eval.get("shot_type", "")) != "BANK_SHOT"
+                ):
+                    shot_eval["shot_type"] = "BANK_SHOT"
+                    shot_eval["reason_code"] = "VALID_BANK_SHOT"
+                    shot_eval["cushions_before_first_hit"] = max(
+                        1,
+                        int(shot_eval.get("cushions_before_first_hit", 0)),
+                        int(causal_res.cushions_before_first_hit),
+                    )
+                elif (
                     not bool(shot_eval.get("is_scored", False))
                     and not has_double_touch_foul
                     and causal_res.scored
@@ -1417,21 +1530,26 @@ class LiveStreamReader:
                         if causal_res.is_bank_shot
                         else "VALID_REGULAR_3C"
                     )
+                    shot_eval["cushions_before_first_hit"] = max(
+                        int(shot_eval.get("cushions_before_first_hit", 0)),
+                        int(causal_res.cushions_before_first_hit),
+                    )
                     shot_eval["cushions_before_second_hit"] = max(
                         int(shot_eval.get("cushions_before_second_hit", 0)),
                         int(causal_res.cushions_at_second_hit),
                     )
                     shot_eval["total_cushions"] = int(shot_eval["cushions_before_second_hit"])
+                    bank_label = "뱅크 샷" if causal_res.is_bank_shot else "초미세 판독"
                     shot_eval["message"] = (
-                        f"득점 인정 (초미세 판독): "
+                        f"득점 인정 ({bank_label}): "
                         f"{shot_eval['cushions_before_second_hit']}쿠션 후 제2적구 충돌 성공!"
                     )
 
-                # [유령 샷(Phantom Trigger) 필터]
-                # 실제 카메라/영상 스트림(require_rest_displacement=True)에서 선수가 당구대 옆을 지나가거나
-                # 큐대 그림자 가림으로 인해 공이 제자리에서 잠깐 흔들렸다가 아무 목적구도 맞히지 않고 멈춘 경우,
+                # [유령 샷(Phantom Trigger) 및 120mm 미만 헛스트로크/노이즈 필터]
+                # 1) 수구 총 이동거리가 120.0mm 미만이면서 제1적구 접촉이 없는 경우(카메라 떨림·큐대 노이즈), 또는
+                # 2) 실제 카메라/영상 스트림(require_rest_displacement=True)에서 공이 제자리에서 잠깐 흔들렸다가 멈춘 경우,
                 # 공격권(턴)이나 이닝을 절대 변경하지 않고 기존 선수의 '공격 중' 상태를 그대로 복원합니다!
-                if require_rest_displacement and not bool(shot_eval.get("is_scored", False)):
+                if not bool(shot_eval.get("is_scored", False)):
                     init_map = self.scoring_engine._initial_ball_positions
                     max_net_disp = 0.0
                     for bid, st in ball_states.items():
@@ -1443,11 +1561,18 @@ class LiveStreamReader:
                             if d_net > max_net_disp:
                                 max_net_disp = d_net
 
-                    is_phantom_occlusion = (
-                        max_net_disp < 38.0
-                        or (
-                            self.scoring_engine.first_object_ball_id is None
-                            and self.scoring_engine.cue_travel_distance_mm < 550.0
+                    is_short_noise_stroke = (
+                        self.scoring_engine.first_object_ball_id is None
+                        and self.scoring_engine.cue_travel_distance_mm < 120.0
+                    )
+                    is_phantom_occlusion = is_short_noise_stroke or (
+                        require_rest_displacement
+                        and (
+                            max_net_disp < 38.0
+                            or (
+                                self.scoring_engine.first_object_ball_id is None
+                                and self.scoring_engine.cue_travel_distance_mm < 550.0
+                            )
                         )
                     )
                     if is_phantom_occlusion:
