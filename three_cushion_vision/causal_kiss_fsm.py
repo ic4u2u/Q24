@@ -1,12 +1,39 @@
 """
-Module H: 3체 인과 충돌 분리, 투터치 파울, 바운딩 박스 병합/NanoGPT 가려짐 복원 및 8대 악성 키스 오판 방어 엔진
+폴리라인 꼭짓점 단순화(cv2.approxPolyDP) + 목적구 위치 이탈(Displacement) 감지 기반
+초단순·고신뢰 3쿠션 판정 엔진 (CausalKissSafeFSM)
 파일 경로: three_cushion_vision/causal_kiss_fsm.py
+
+[4대 핵심 원리]
+1. 원리 1 (수구 결정 및 턴 유지/교대):
+   - 세 공(WHITE, YELLOW, RED)이 정지(speed < 20mm/s)해 있을 때 정지 위치(rest_pos)를 저장합니다.
+   - 적구(RED)는 수구가 될 수 없으며, WHITE와 YELLOW 중 정지 위치에서 가장 먼저 이탈한 공을 수구로 결정합니다.
+   - 득점 성공(scored == True) 시 수구(assigned_cue_ball)를 그대로 유지하고,
+     득점 실패(scored == False) 시 모든 공이 멈추면 반대 색상(WHITE <-> YELLOW)으로 수구를 교체합니다.
+2. 원리 2 (cv2.approxPolyDP 폴리라인 꼭짓점 기반 쿠션 카운트):
+   - 수구 이동 궤적(cue_path)에 cv2.approxPolyDP(pts, epsilon=18.0, closed=False)를 적용하여
+     바운딩 박스 떨림과 쿠션 슬라이딩 노이즈를 모두 직선으로 펴고 실제 꺾인 꼭짓점(Vertex)만 추출합니다.
+   - 각 꼭짓점에서 진행 방향이 10.0도 이상 꺾였고, 당구대 4면 가장자리(125.0mm 이내)에 있으며,
+     목적구 충돌 꼭짓점이 아니면 유효 쿠션 1회로 카운트합니다 (0쿠션 누락 및 5/11쿠션 폭주 원천 차단).
+3. 원리 3 (목적구 충돌 판정 단순화 - 위치 이탈 OR 확실한 꼭짓점 굴절):
+   - 수구와 목적구가 72.0mm 이내로 근접했을 때:
+     * 현상 A (목적구 위치 이탈): 근접 3프레임 전 위치 대비 통과 2프레임 후 목적구가 5.5mm 이상 새로운 방향으로 밀려났고
+       다른 목적구에 의한 간접 키스가 아니면 충돌로 확정합니다.
+     * 현상 B (얇은 스침 수구 꼭짓점 확인): 목적구가 5.5mm 미만으로 움직였더라도 수구 폴리라인 꼭짓점이
+       목적구 옆(d_min <= 65.5mm)에서 4.2도 이상 꺾였고(또는 서브픽셀 위상 진동 감지), 다른 목적구 충돌이나 쿠션 반사 중이 아니면 인정합니다.
+     * 목적구도 안 밀렸고 수구도 직선으로 통과했다면 거리가 55~58mm로 찍혀도 100% 평범한 실패(노카운트)로 기각합니다.
+4. 원리 4 (뱅크샷 및 제2적구 충돌 즉시 득점):
+   - 제1적구 최초 충돌 이전 폴리라인 쿠션 꼭짓점 수(cushions_before_first_hit >= 1, 1쿠션 넣어치기 포함)로 뱅크샷을 판정합니다.
+   - 제2적구 최초 충돌 확정 순간 누적 쿠션이 3회 이상이면 즉시 score_dispatched = True로 잠그고
+     on_immediate_score 콜백을 호출하여 실시간 +1점을 반영한 뒤 잔여 구름 동안 모든 판정을 동결합니다.
 """
 
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
+import math
 from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
+
+import cv2
 import numpy as np
 import torch
 
@@ -82,18 +109,51 @@ class ShotResult:
         )
 
 
+@dataclass
+class CuePathPoint:
+    """수구 시계열 궤적의 단일 샘플 데이터"""
+    frame_idx: int
+    t: float
+    pos: np.ndarray
+    min_dist_to_targets: float
+    intra_frame_v_bounce: bool = False
+
+
 class CausalKissSafeFSM:
     """
-    1적구-2적구 키스 후 득점 실패를 득점으로 오인하는 현상을 100% 차단하기 위해
-    - Split-Window 무중첩 전후 속도 미분 및 이벤트 방화벽 (last_impulse_frame)
-    - 뉴턴 제3법칙 운동량 보존 기반 적구 키스 충격량 차감 (Δv_C_net = Δv_C + Δv_B)
-    - 무조건 거리 판정(is_hard_overlap) 폐지 및 쌍방 작용-반작용(AND 게이트) 검증
-    - A -> B -> C 연쇄 간접 충돌(Chain Cannon) 기하학적 차폐
-    - 적구 정면 키스 시 칼만 필터 ID 스왑(Ghost Pass-Through) 자동 역스왑 복원
-    - 3쿠션 이상 충족 상태에서 제2적구 충돌 즉시 실시간 득점(+1) 발송 (on_immediate_score & score_dispatched)
-    - 제1적구 접촉 전/후 쿠션 분리 카운팅 및 가짜 턴 넘김 원천 차단
-    을 모두 탑재한 쓰리쿠션 판정 엔진
+    cv2.approxPolyDP 폴리라인 꼭짓점 단순화 + 목적구 위치 이탈(Displacement) 감지 기반의
+    초단순·고신뢰 3쿠션 판정 유한 상태 머신(FSM)입니다.
     """
+
+    # 원리 1: 수구 출발 및 정지 감지 상수
+    STROKE_START_SPEED: float = 160.0
+    STOP_SPEED: float = 18.0
+    MIN_STROKE_DISP_MM: float = 22.0
+    MIN_VALID_SHOT_TRAVEL_MM: float = 120.0
+
+    # 원리 2: cv2.approxPolyDP 폴리라인 쿠션 꼭짓점 상수
+    POLY_EPSILON_CUSHION_MM: float = 18.0
+    POLY_MIN_CUSHION_BEND_DEG: float = 10.0
+    RAIL_VERTEX_ZONE_MM: float = 125.0
+    RAIL_ENTER_MARGIN: float = 54.0
+    SAME_RAIL_DEEP_EXIT_MM: float = 220.0
+
+    # 원리 3: 목적구 위치 이탈 및 얇은 스침 꼭짓점 판정 상수
+    TARGET_APPROACH_ZONE_MM: float = 72.0
+    TARGET_MOVED_DISP_TH_MM: float = 5.5
+    THIN_HIT_MAX_DIST_MM: float = 65.5
+    THIN_HIT_MIN_BEND_DEG: float = 4.2
+    PAIR_COOLDOWN_SEC: float = 0.08
+
+    # 투터치 및 블롭 병합 방어 상수
+    DOUBLE_HIT_INIT_DIST_MAX: float = 115.0
+    DOUBLE_HIT_WINDOW_SEC: float = 0.16
+    DOUBLE_HIT_REACCEL_THRESH: float = 1500.0
+    DOUBLE_HIT_FOLLOW_RATIO: float = 0.75
+    BLOB_PROXIMITY_ZONE_MM: float = 92.0
+    MAX_CENTROID_JUMP_RESIDUAL_MM: float = 14.0
+    MAX_OCCLUSION_INTERP_FRAMES: int = 10
+
     def __init__(
         self,
         fps: float = 60.0,
@@ -101,91 +161,59 @@ class CausalKissSafeFSM:
         gpt_model: Optional[BilliardNanoGPT] = None,
         device: str = "cpu",
         on_immediate_score: Optional[Callable[[ShotResult], None]] = None,
-    ):
-        self.fps = fps
-        self.assigned_cue_ball = assigned_cue_ball
-        self.device = device
-        self.gpt_model = (gpt_model or BilliardNanoGPT()).to(device).eval()
+    ) -> None:
+        self.fps: float = fps
+        self.assigned_cue_ball: BallColor = assigned_cue_ball
+        self.device: str = device
+        self.gpt_model: BilliardNanoGPT = (gpt_model or BilliardNanoGPT()).to(device).eval()
         self.on_immediate_score: Optional[Callable[[ShotResult], None]] = on_immediate_score
 
-        self.STROKE_START_SPEED = 180.0
-        self.STOP_SPEED = 15.0
-        self.STOP_HOLD_FRAMES = int(fps * 0.55)          # 0.55초(33프레임) 완전 정지 확인
-        self.MIN_STROKE_DISP_MM = 20.0                   # 출발 인정 최소 변위 (mm)
-        self.MIN_VALID_SHOT_TRAVEL_MM = 120.0            # 120mm 미만 주행 노이즈는 턴 교대 취소
-
-        self.HARD_CONTACT_DIST = BALL_DIAM + 1.5     # 63.0mm
-        self.GRAY_ZONE_MAX_DIST = BALL_DIAM + 15.5   # 77.0mm
-        self.RAIL_MARGIN = BALL_R + 14.0             # 44.75mm
-
-        # [5대 쿠션 알고리즘 고도화 상수]
-        # 1) 슈미트 트리거 히스테리시스 3단계 대역 + 동일 레일 심층 이탈 경계
-        self.RAIL_ENTER_MARGIN = BALL_R + 23.25          # 54.0mm: 밀착 쿠션 진입 경계
-        self.RAIL_KINEMATIC_ZONE = BALL_R + 84.25        # 115.0mm: 시차 보정용 광역 반사 대역
-        self.RAIL_EXIT_HYSTERESIS = BALL_R + 61.25       # 92.0mm: 다른 레일 타격 후 재장전 경계
-        self.SAME_RAIL_DEEP_EXIT_MM = 220.0              # 동일 레일 연속 타격 인정 최소 이탈 깊이 (mm)
-        # 2) 코너 핑퐁 방지 및 최저 속도 게이트
-        self.MIN_CUSHION_SPEED = 65.0                    # 정지 직전 저속 떨림 쿠션 카운트 차단
-        self.MIN_CUSHION_BOUNCE_SPEED = 65.0             # 최저 유효 쿠션 반사 속도 (mm/s)
-        self.MIN_RAIL_TRAVEL_DIST = 80.0                 # 동일 레일 재장전/재타격 인정 최소 이동 변위 (mm)
-        self.CORNER_MIN_TRAVEL_DIST = 22.0               # 코너 인접 레일 연속 타격 시 최소 이동 변위 (mm)
-        self.PER_RAIL_COOLDOWN_SEC = 0.28                # 개별 레일 쿨다운 (초)
-
-        self.MIN_TARGET_DELTA_V = 25.0
-        self.MIN_CUE_DEFLECTION_DEG = 1.8
-        self.PAIR_COOLDOWN_SEC = 0.12
-
-        # 투터치(Double Hit) 파울 감지 임계값
-        self.DOUBLE_HIT_WINDOW_SEC = 0.15
-        self.DOUBLE_HIT_INIT_DIST_MAX = 115.0
-        self.DOUBLE_HIT_REACCEL_THRESH = 1500.0
-        self.DOUBLE_HIT_FOLLOW_RATIO = 0.75
-
-        # 바운딩 박스 병합 및 NanoGPT 가려짐 복원 임계값
-        self.BLOB_PROXIMITY_ZONE_MM = 85.0
-        self.MAX_CENTROID_JUMP_RESIDUAL_MM = 14.0
-        self.MAX_OCCLUSION_INTERP_FRAMES = 15
-
+        self.STOP_HOLD_FRAMES: int = max(10, int(fps * 0.25))
         self.shot_seq_id: int = 0
-        self.idle_anchor_pos: Dict[BallColor, np.ndarray] = {}
+        self.turn_locked_by_previous_shot: bool = False
+
+        self.history: Deque[FrameSnapshot] = deque(maxlen=20)
+        self.prev_raw_pos: Dict[BallColor, Tuple[np.ndarray, float]] = {}
+        self.prev_ema_vel: Dict[BallColor, np.ndarray] = {}
+        self.gpt_buffers: Dict[BallColor, Deque[List[float]]] = {
+            c: deque(maxlen=6) for c in BallColor
+        }
+        self.missing_streak: Dict[BallColor, int] = {c: 0 for c in BallColor}
+        self.frame_counter: int = 0
+        self.rest_pos: Dict[BallColor, np.ndarray] = {}
+        self.idle_anchor_pos: Dict[BallColor, np.ndarray] = self.rest_pos
         self.onset_candidate_time: Dict[BallColor, Optional[float]] = {
             BallColor.WHITE: None,
             BallColor.YELLOW: None,
         }
         self.first_mover_from_idle: Optional[BallColor] = None
-        self.turn_locked_by_previous_shot: bool = False  # 초구 전에는 False(최초 움직인 공으로 수구 결정), 이후 득점/실패 규칙에 따라 자동 관리
+        self._reset_shot()
+
+    def _reset_shot(self) -> None:
+        """새로운 샷 대기를 위해 내부 샷 상태 변수를 초기화합니다."""
+        self.state: ShotState = ShotState.IDLE
+        self.active_cue_ball: Optional[BallColor] = None
+        self.stroke_start_time: float = 0.0
+        self.initial_positions: Dict[BallColor, np.ndarray] = {}
+        self.initial_ball_distances: Dict[BallColor, float] = {}
         self.stroke_origin_pos: Optional[np.ndarray] = None
         self.initial_stroke_dir: Optional[np.ndarray] = None
         self._initial_stroke_samples: List[np.ndarray] = []
         self.min_rail_dist_before_first_hit: float = 9999.0
-        self.frame_counter: int = 0
-        self.history: Deque[FrameSnapshot] = deque(maxlen=6)
-        self.prev_raw_pos: Dict[BallColor, Tuple[np.ndarray, float]] = {}
-        self.prev_ema_vel: Dict[BallColor, np.ndarray] = {}
-        self.missing_streak: Dict[BallColor, int] = {c: 0 for c in BallColor}
 
-        self.gpt_buffers: Dict[BallColor, Deque[Tuple[float, float, float, float]]] = {
-            c: deque(maxlen=self.gpt_model.config.block_size) for c in BallColor
-        }
-
-        self._reset_shot()
-
-    def _reset_shot(self):
-        self.state = ShotState.IDLE
-        self.stroke_start_time: float = 0.0
-        self.active_cue_ball: Optional[BallColor] = None
         self.first_target_ball: Optional[BallColor] = None
         self.second_target_ball: Optional[BallColor] = None
         self.first_target_hit_time: Optional[float] = None
+        self.first_target_hit_path_idx: Optional[int] = None
         self.first_target_normal: Optional[np.ndarray] = None
 
-        self.initial_positions: Dict[BallColor, np.ndarray] = {}
-        self.initial_ball_distances: Dict[BallColor, float] = {}
         self.cushions_before_first_hit: int = 0
         self.cushions_after_first_hit: int = 0
         self.cushion_count: int = 0
         self.cushions_at_second_hit: int = 0
         self.is_bank_shot: bool = False
+        self._geom_one_bank_recovered: bool = False
+
         self.object_ball_kiss_occurred: bool = False
         self.last_object_kiss_time: float = -999.0
         self.double_hit_foul: bool = False
@@ -198,61 +226,105 @@ class CausalKissSafeFSM:
         self.event_log: List[str] = []
 
         self.stop_counter: int = 0
-        self.in_rail_zone: Set[Rail] = set()
-        self.rail_armed: Dict[Rail, bool] = {r: True for r in Rail}
-        self.same_rail_locked: Dict[Rail, bool] = {r: False for r in Rail}
-        self.per_rail_last_time: Dict[Rail, float] = {r: -999.0 for r in Rail}
-        self.last_rail_hit: Optional[Rail] = None
-        self.last_rail_time: float = -999.0
-        self.last_cushion_hit_pos: Optional[np.ndarray] = None
-        self.corner_bounce_count_in_zone: int = 0
+        self.cue_path: List[CuePathPoint] = []
+        self.all_ball_paths: Dict[BallColor, List[Tuple[int, float, np.ndarray]]] = {
+            c: [] for c in BallColor
+        }
+        self._logged_cushion_frames: Set[int] = set()
         self.pair_last_hit_time: Dict[frozenset, float] = {}
-        self.cue_trajectory_log: List[Tuple[float, np.ndarray, np.ndarray, float]] = []
-
-        # [핵심 방화벽 1] 각 공이 마지막으로 충돌/반사 이벤트를 겪은 프레임 번호 기록 (이전 충격파 누수 차단)
-        self.last_impulse_frame: Dict[BallColor, int] = {c: -1 for c in BallColor}
-        # [핵심 방화벽 2] 적구 간 정면 키스 시 트래커 ID 스왑 보정 매핑 테이블
         self.id_swap_map: Dict[BallColor, BallColor] = {c: c for c in BallColor}
         self._last_id_swap_check_time: float = -999.0
         self.centroid_clamp_cooldown: Dict[BallColor, int] = {c: 0 for c in BallColor}
         self._pending_immediate_result: Optional[ShotResult] = None
-        self._evaluated_frame_indices: Set[int] = set()
-        self.idle_anchor_pos: Dict[BallColor, np.ndarray] = {}
+        self.rest_pos.clear()
         self.onset_candidate_time = {
             BallColor.WHITE: None,
             BallColor.YELLOW: None,
         }
         self.first_mover_from_idle = None
-        self.stroke_origin_pos = None
-        self.initial_stroke_dir = None
-        self._initial_stroke_samples = []
-        self.min_rail_dist_before_first_hit = 9999.0
 
-    def _predict_next_state_with_gpt(self, color: BallColor, dt: float) -> Tuple[np.ndarray, np.ndarray]:
+    @staticmethod
+    def _angle_between_deg(v1: np.ndarray, v2: np.ndarray) -> float:
+        """두 2D 벡터 사이의 각도(도, 0 ~ 180)를 계산합니다."""
+        n1 = float(np.linalg.norm(v1))
+        n2 = float(np.linalg.norm(v2))
+        if n1 < 1e-6 or n2 < 1e-6:
+            return 0.0
+        cos_t = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+        return float(np.degrees(np.arccos(cos_t)))
+
+    @staticmethod
+    def _subframe_ccd(
+        pA0: np.ndarray, pA1: np.ndarray, pB0: np.ndarray, pB1: np.ndarray
+    ) -> Tuple[float, float, np.ndarray]:
+        """프레임 간 두 공의 선형 이동 선분 사이 최근접 거리(d_min), 시각 비율(tau), 단위 법선 벡터(n_ab)를 반환합니다."""
+        r0 = pB0 - pA0
+        v_rel = (pB1 - pB0) - (pA1 - pA0)
+        v_rel_sq = float(np.dot(v_rel, v_rel))
+        if v_rel_sq < 1e-6:
+            tau = 0.0
+        else:
+            tau = float(np.clip(-np.dot(r0, v_rel) / v_rel_sq, 0.0, 1.0))
+        pos_a = pA0 + tau * (pA1 - pA0)
+        pos_b = pB0 + tau * (pB1 - pB0)
+        diff = pos_b - pos_a
+        dist = float(np.linalg.norm(diff))
+        n_ab = diff / max(dist, 1e-6)
+        return dist, tau, n_ab
+
+    def _predict_next_state_with_gpt(
+        self, color: BallColor, dt: float, use_gpt: bool = False
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """선수 신체에 의해 공이 가려졌을 때(None) BilliardNanoGPT 및 탄성 반사 물리 모델로 좌표를 복원합니다."""
         buf = self.gpt_buffers[color]
         p_prev, _ = self.prev_raw_pos[color]
-        v_prev = self.prev_ema_vel.get(color, np.zeros(2, dtype=np.float64))
+        v_prev = self.prev_ema_vel.get(color, np.zeros(2, dtype=np.float64)).copy()
 
-        if len(buf) >= 2 and float(np.linalg.norm(v_prev)) > 25.0:
+        # 물리적 등속 전진 + 레일 경계 탄성 반사 계산
+        next_x = float(p_prev[0] + v_prev[0] * dt)
+        next_y = float(p_prev[1] + v_prev[1] * dt)
+        next_vx, next_vy = float(v_prev[0]), float(v_prev[1])
+
+        if next_x < BALL_R:
+            next_x = BALL_R + (BALL_R - next_x)
+            next_vx = abs(next_vx) * 0.88
+        elif next_x > TABLE_W - BALL_R:
+            next_x = (TABLE_W - BALL_R) - (next_x - (TABLE_W - BALL_R))
+            next_vx = -abs(next_vx) * 0.88
+
+        if next_y < BALL_R:
+            next_y = BALL_R + (BALL_R - next_y)
+            next_vy = abs(next_vy) * 0.88
+        elif next_y > TABLE_H - BALL_R:
+            next_y = (TABLE_H - BALL_R) - (next_y - (TABLE_H - BALL_R))
+            next_vy = -abs(next_vy) * 0.88
+
+        phys_pos = np.array([next_x, next_y], dtype=np.float64)
+        phys_vel = np.array([next_vx, next_vy], dtype=np.float64)
+
+        if use_gpt and len(buf) >= 2 and float(np.linalg.norm(v_prev)) > 25.0:
             hist_tensor = torch.tensor([list(buf)], dtype=torch.float32, device=self.device)
-            pred_state = self.gpt_model.rollout_occlusion(hist_tensor, n_missing_frames=1)[0, 0].cpu().numpy()
-            pred_pos = np.array([float(pred_state[0]), float(pred_state[1])], dtype=np.float64)
-            pred_vel = np.array([float(pred_state[2]), float(pred_state[3])], dtype=np.float64)
-            return pred_pos, pred_vel
+            pred_state = (
+                self.gpt_model.rollout_occlusion(hist_tensor, n_missing_frames=1)[0, 0]
+                .cpu()
+                .numpy()
+            )
+            gpt_pos = np.array([float(pred_state[0]), float(pred_state[1])], dtype=np.float64)
+            # GPT 추론 좌표가 물리 반사 궤적과 크게 벗어나지 않을 때만 블렌딩
+            if float(np.linalg.norm(gpt_pos - phys_pos)) <= 80.0:
+                return 0.3 * gpt_pos + 0.7 * phys_pos, phys_vel
 
-        pred_pos = np.clip(
-            p_prev + v_prev * dt,
-            [BALL_R, BALL_R],
-            [TABLE_W - BALL_R, TABLE_H - BALL_R]
-        )
-        return pred_pos, v_prev.copy()
+        return phys_pos, phys_vel
 
     def _stabilize_blob_merging(
         self,
         t: float,
-        raw_coords_mm: Dict[BallColor, Optional[Tuple[float, float]]]
+        raw_coords_mm: Dict[BallColor, Optional[Tuple[float, float]]],
     ) -> Optional[Tuple[Dict[BallColor, np.ndarray], Dict[BallColor, Optional[np.ndarray]]]]:
-        # 트래커 ID 스왑 보정 매핑을 먼저 적용
+        """
+        바운딩 박스 병합(Blob Merging)에 의한 정지 공 중심점 끌림(Centroid Shift)과
+        가려짐(None) 결측 프레임을 보정합니다.
+        """
         mapped_coords: Dict[BallColor, Optional[Tuple[float, float]]] = {
             true_c: raw_coords_mm.get(obs_c, None)
             for true_c, obs_c in self.id_swap_map.items()
@@ -261,14 +333,18 @@ class CausalKissSafeFSM:
         predicted_pos: Dict[BallColor, np.ndarray] = {}
         predicted_vel: Dict[BallColor, np.ndarray] = {}
         stabilized_pos: Dict[BallColor, np.ndarray] = {}
-        gpt_restored_vel_override: Dict[BallColor, Optional[np.ndarray]] = {c: None for c in BallColor}
+        gpt_restored_vel_override: Dict[BallColor, Optional[np.ndarray]] = {
+            c: None for c in BallColor
+        }
 
         for color in BallColor:
             obs = mapped_coords.get(color, None)
             if color in self.prev_raw_pos:
                 _, t_prev = self.prev_raw_pos[color]
                 dt = max(t - t_prev, 1e-4)
-                p_pred, v_pred = self._predict_next_state_with_gpt(color, dt)
+                p_pred, v_pred = self._predict_next_state_with_gpt(
+                    color, dt, use_gpt=(obs is None)
+                )
                 predicted_pos[color] = p_pred
                 predicted_vel[color] = v_pred
             elif obs is not None:
@@ -278,7 +354,10 @@ class CausalKissSafeFSM:
 
             if obs is None:
                 self.missing_streak[color] += 1
-                if color in predicted_pos and self.missing_streak[color] <= self.MAX_OCCLUSION_INTERP_FRAMES:
+                if (
+                    color in predicted_pos
+                    and self.missing_streak[color] <= self.MAX_OCCLUSION_INTERP_FRAMES
+                ):
                     stabilized_pos[color] = predicted_pos[color]
                     gpt_restored_vel_override[color] = predicted_vel[color]
                     self.gpt_occlusion_restored_frames += 1
@@ -286,1285 +365,615 @@ class CausalKissSafeFSM:
                     return None
             else:
                 self.missing_streak[color] = 0
-                stabilized_pos[color] = np.array([float(obs[0]), float(obs[1])], dtype=np.float64)
+                stabilized_pos[color] = np.array(
+                    [float(obs[0]), float(obs[1])], dtype=np.float64
+                )
 
+        cue_ref = self.active_cue_ball or self.assigned_cue_ball
         colors = list(BallColor)
         for i in range(len(colors)):
             for j in range(i + 1, len(colors)):
                 c1, c2 = colors[i], colors[j]
                 if c1 not in self.prev_raw_pos or c2 not in self.prev_raw_pos:
                     continue
-
                 p1_pred, p2_pred = predicted_pos[c1], predicted_pos[c2]
                 dist_pred = float(np.linalg.norm(p2_pred - p1_pred))
 
                 if dist_pred <= self.BLOB_PROXIMITY_ZONE_MM:
                     for target_c, neighbor_c in [(c1, c2), (c2, c1)]:
-                        if mapped_coords.get(target_c, None) is None:
+                        # 수구(cue_ref) 자체는 스트로크 출발 주체이므로 클램핑에서 제외
+                        if target_c == cue_ref or mapped_coords.get(target_c, None) is None:
                             continue
                         p_obs = stabilized_pos[target_c]
                         p_prd = predicted_pos[target_c]
                         shift_vec = p_obs - p_prd
                         shift_mag = float(np.linalg.norm(shift_vec))
 
-                        to_neighbor = self.prev_raw_pos[neighbor_c][0] - self.prev_raw_pos[target_c][0]
-                        to_neighbor_norm = to_neighbor / max(float(np.linalg.norm(to_neighbor)), 1e-6)
-                        pull_alignment = float(np.dot(shift_vec / max(shift_mag, 1e-6), to_neighbor_norm))
-
-                        prev_speed = float(np.linalg.norm(self.prev_ema_vel.get(target_c, np.zeros(2))))
-                        if shift_mag > self.MAX_CENTROID_JUMP_RESIDUAL_MM and pull_alignment > 0.45 and prev_speed < 150.0:
+                        to_neighbor = (
+                            self.prev_raw_pos[neighbor_c][0]
+                            - self.prev_raw_pos[target_c][0]
+                        )
+                        to_neighbor_norm = to_neighbor / max(
+                            float(np.linalg.norm(to_neighbor)), 1e-6
+                        )
+                        pull_alignment = float(
+                            np.dot(shift_vec / max(shift_mag, 1e-6), to_neighbor_norm)
+                        )
+                        prev_speed = float(
+                            np.linalg.norm(
+                                self.prev_ema_vel.get(target_c, np.zeros(2))
+                            )
+                        )
+                        neighbor_speed = float(
+                            np.linalg.norm(
+                                self.prev_ema_vel.get(neighbor_c, np.zeros(2))
+                            )
+                        )
+                        if (
+                            self.MAX_CENTROID_JUMP_RESIDUAL_MM < shift_mag <= 30.0
+                            and pull_alignment > 0.45
+                            and prev_speed < 50.0
+                            and neighbor_speed > 200.0
+                        ):
                             stabilized_pos[target_c] = 0.85 * p_prd + 0.15 * p_obs
                             self.centroid_shift_corrected_count += 1
                             self.centroid_clamp_cooldown[target_c] = 6
 
         return stabilized_pos, gpt_restored_vel_override
 
-    @staticmethod
-    def _subframe_ccd(pA0: np.ndarray, pA1: np.ndarray, pB0: np.ndarray, pB1: np.ndarray) -> Tuple[float, float, np.ndarray]:
-        r0 = pB0 - pA0
-        v_rel = (pB1 - pB0) - (pA1 - pA0)
-        v_rel_sq = float(np.dot(v_rel, v_rel))
-        tau = 0.0 if v_rel_sq < 1e-6 else float(np.clip(-np.dot(r0, v_rel) / v_rel_sq, 0.0, 1.0))
-        diff = r0 + tau * v_rel
-        d_min = float(np.linalg.norm(diff))
-        normal_ab = diff / max(d_min, 1e-6)
-        return d_min, tau, normal_ab
-
-    @staticmethod
-    def _angle_between_deg(v1: np.ndarray, v2: np.ndarray) -> float:
-        n1, n2 = float(np.linalg.norm(v1)), float(np.linalg.norm(v2))
-        if n1 < 10.0 or n2 < 10.0:
-            return 0.0
-        cos_val = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
-        return float(np.degrees(np.arccos(cos_val)))
-
-    def _compute_split_velocities(self) -> Tuple[Dict[BallColor, np.ndarray], Dict[BallColor, np.ndarray], Dict[BallColor, np.ndarray]]:
-        """
-        [핵심 해결책 1] EMA 스무딩에 의한 충격파 번짐(Smearing)을 원천 배제하기 위해,
-        평가 구간 [f_prev, f_curr]을 기준으로:
-        - v_pre: 순수 충돌 전 구간 [h[start], f_prev]의 평균 속도 (단, start는 last_impulse_frame 이후로 클램핑!)
-        - v_post1: 충돌 직후 1프레임 구간 [f_curr, f_post1]의 즉각 속도
-        - v_post2: 충돌 후 2프레임 구간 [f_curr, f_post2]의 안정 속도
-        를 완전히 분리 계산합니다. (len(self.history) >= 3 부터 즉시 동작)
-        """
-        v_pre: Dict[BallColor, np.ndarray] = {}
-        v_post1: Dict[BallColor, np.ndarray] = {}
-        v_post2: Dict[BallColor, np.ndarray] = {}
-
-        h = list(self.history)
-        n_h = len(h)
-        curr_idx = max(1, n_h - 3)
-        prev_idx = max(0, curr_idx - 1)
-        post1_idx = min(n_h - 1, curr_idx + 1)
-        post2_idx = n_h - 1
-
-        for c in BallColor:
-            last_ev_f = self.last_impulse_frame.get(c, -1)
-            start_idx = prev_idx
-            for idx in range(0, prev_idx + 1):
-                if h[idx].frame_idx >= last_ev_f:
-                    start_idx = idx
-                    break
-
-            if start_idx < prev_idx:
-                dt_pre = max(h[prev_idx].t - h[start_idx].t, 1e-4)
-                v_pre[c] = (h[prev_idx].pos[c] - h[start_idx].pos[c]) / dt_pre
-            elif curr_idx > prev_idx:
-                dt_pre = max(h[curr_idx].t - h[prev_idx].t, 1e-4)
-                v_pre[c] = (h[curr_idx].pos[c] - h[prev_idx].pos[c]) / dt_pre
-            else:
-                v_pre[c] = h[curr_idx].vel[c].copy()
-
-            dt_post1 = max(h[post1_idx].t - h[curr_idx].t, 1e-4)
-            v_post1[c] = (h[post1_idx].pos[c] - h[curr_idx].pos[c]) / dt_post1
-
-            dt_post2 = max(h[post2_idx].t - h[curr_idx].t, 1e-4)
-            v_post2[c] = (h[post2_idx].pos[c] - h[curr_idx].pos[c]) / dt_post2
-
-        return v_pre, v_post1, v_post2
-
     def _detect_and_fix_kiss_id_swap(
-        self,
-        t_eval: float,
-        b1: BallColor,
-        b2: BallColor,
-        v_pre: Dict[BallColor, np.ndarray],
-        v_post2: Dict[BallColor, np.ndarray]
+        self, t_eval: float, b1: BallColor, b2: BallColor
     ) -> bool:
         """
-        [핵심 해결책 4] 1적구(B)가 정지한 2적구(C)를 정면으로 쳤을 때,
-        B는 멈추고 C가 B의 속도로 날아가는 현상 때문에 칼만 필터(OC-SORT)가 두 적구의 ID를
-        서로 뒤바꾸는 '유령 투과(Ghost Pass-Through)' 현상을 감지하고 즉시 역스왑(Un-swap)합니다.
+        적구 정면 키스(자리바꿈 키스) 시 칼만 필터 트래커가 직진 관성에 속아
+        정지한 공(실제 1적구)과 날아간 공(실제 2적구)의 ID를 서로 뒤바꾼 경우 즉시 역스왑합니다.
         """
-        if (t_eval - self._last_id_swap_check_time) < 0.20 or len(self.history) < 4:
+        if (t_eval - self._last_id_swap_check_time) < 0.15 or len(self.history) < 5:
             return False
 
-        h2, h3, h5 = self.history[-4], self.history[-3], self.history[-1]
-        d_min, _, n_12 = self._subframe_ccd(h2.pos[b1], h3.pos[b1], h2.pos[b2], h3.pos[b2])
+        f_pre2 = self.history[-5]
+        f_prev = self.history[-4]
+        f_curr = self.history[-3]
+        f_post = self.history[-1]
 
-        # 두 적구의 중심이 물리적 직경(61.5mm)보다 훨씬 깊숙이 겹쳐 투과(d_min < 42mm)했을 때 검사
-        if d_min > 42.0:
+        d_min, _, _ = self._subframe_ccd(
+            f_prev.pos[b1], f_curr.pos[b1], f_prev.pos[b2], f_curr.pos[b2]
+        )
+        if d_min > 35.0:
             return False
 
-        for moving_b, stationary_b in [(b1, b2), (b2, b1)]:
-            s_mov_pre = float(np.linalg.norm(v_pre[moving_b]))
-            s_sta_pre = float(np.linalg.norm(v_pre[stationary_b]))
-            s_mov_post = float(np.linalg.norm(v_post2[moving_b]))
-            s_sta_post = float(np.linalg.norm(v_post2[stationary_b]))
+        dt_pre = max(f_prev.t - f_pre2.t, 1e-4)
+        dt_post = max(f_post.t - f_curr.t, 1e-4)
+        v1_pre = (f_prev.pos[b1] - f_pre2.pos[b1]) / dt_pre
+        v2_pre = (f_prev.pos[b2] - f_pre2.pos[b2]) / dt_pre
+        v1_post = (f_post.pos[b1] - f_curr.pos[b1]) / dt_post
+        v2_post = (f_post.pos[b2] - f_curr.pos[b2]) / dt_post
 
-            # 한 적구는 빠르게 진입(>300mm/s)하고 다른 적구는 정지(<25mm/s)해 있었는데,
-            # 중심 거리 42mm 이하로 정면 관통했음에도 계속 전방(>150mm/s, <25도)으로 뚫고 나갔다면
-            # 강체 물리학상 불가능한 유령 관통이므로 트래커 ID 스왑으로 확정!
-            if s_mov_pre > 300.0 and s_sta_pre < 25.0 and s_sta_post < 25.0 and s_mov_post > 150.0:
-                angle_change = self._angle_between_deg(v_pre[moving_b], v_post2[moving_b])
-                # 관통 전후 위치 벡터의 부호가 역전되었는지(뚫고 지나갔는지) 확인
-                rel_before = h2.pos[stationary_b] - h2.pos[moving_b]
-                rel_after = h5.pos[stationary_b] - h5.pos[moving_b]
-                passed_through = float(np.dot(rel_before, rel_after)) < 0.0
+        s1_pre, s2_pre = float(np.linalg.norm(v1_pre)), float(np.linalg.norm(v2_pre))
+        s1_post, s2_post = float(np.linalg.norm(v1_post)), float(np.linalg.norm(v2_post))
 
-                if passed_through and angle_change < 25.0:
-                    # ID 매핑 역스왑 및 히스토리 내 두 적구 좌표/속도 즉시 교환
-                    self.id_swap_map[b1], self.id_swap_map[b2] = self.id_swap_map[b2], self.id_swap_map[b1]
-                    for snap in self.history:
-                        snap.pos[b1], snap.pos[b2] = snap.pos[b2].copy(), snap.pos[b1].copy()
-                        snap.vel[b1], snap.vel[b2] = snap.vel[b2].copy(), snap.vel[b1].copy()
-                        snap.acc[b1], snap.acc[b2] = snap.acc[b2].copy(), snap.acc[b1].copy()
-                    self.prev_raw_pos[b1], self.prev_raw_pos[b2] = self.prev_raw_pos[b2], self.prev_raw_pos[b1]
-                    self.prev_ema_vel[b1], self.prev_ema_vel[b2] = self.prev_ema_vel[b2], self.prev_ema_vel[b1]
+        mover: Optional[BallColor] = None
+        stayer: Optional[BallColor] = None
+        v_m_pre = v_m_post = np.zeros(2)
+        s_m_pre = s_m_post = s_s_post = 0.0
 
-                    self.kiss_id_swap_corrected = True
-                    self.object_ball_kiss_occurred = True
-                    self.last_object_kiss_time = t_eval
-                    self._last_id_swap_check_time = t_eval
-                    self.last_impulse_frame[b1] = h3.frame_idx
-                    self.last_impulse_frame[b2] = h3.frame_idx
-                    self.event_log.append(
-                        f"[{t_eval:.2f}s] [트래커 ID 스왑 자동 복원] 적구 정면 키스({b1.name}<->{b2.name}) 후 자리바꿈 역스왑 완료"
+        if s1_pre > 250.0 and s2_pre < 45.0:
+            mover, stayer = b1, b2
+            v_m_pre, v_m_post = v1_pre, v1_post
+            s_m_pre, s_m_post, s_s_post = s1_pre, s1_post, s2_post
+        elif s2_pre > 250.0 and s1_pre < 45.0:
+            mover, stayer = b2, b1
+            v_m_pre, v_m_post = v2_pre, v2_post
+            s_m_pre, s_m_post, s_s_post = s2_pre, s2_post, s1_post
+
+        if mover is None or stayer is None:
+            return False
+
+        cos_dir = float(
+            np.dot(v_m_pre, v_m_post) / max(s_m_pre * s_m_post, 1e-6)
+        )
+        if s_m_post > s_m_pre * 0.65 and s_s_post < 45.0 and cos_dir > 0.92:
+            self.id_swap_map[b1], self.id_swap_map[b2] = (
+                self.id_swap_map[b2],
+                self.id_swap_map[b1],
+            )
+            for snap in self.history:
+                if snap.t >= f_curr.t:
+                    snap.pos[b1], snap.pos[b2] = (
+                        snap.pos[b2].copy(),
+                        snap.pos[b1].copy(),
                     )
-                    return True
+                    snap.vel[b1], snap.vel[b2] = (
+                        snap.vel[b2].copy(),
+                        snap.vel[b1].copy(),
+                    )
+            self.all_ball_paths[b1], self.all_ball_paths[b2] = (
+                self.all_ball_paths[b2],
+                self.all_ball_paths[b1],
+            )
+            self.prev_raw_pos[b1], self.prev_raw_pos[b2] = (
+                self.prev_raw_pos[b2],
+                self.prev_raw_pos[b1],
+            )
+            self.prev_ema_vel[b1], self.prev_ema_vel[b2] = (
+                self.prev_ema_vel[b2].copy(),
+                self.prev_ema_vel[b1].copy(),
+            )
+            self.kiss_id_swap_corrected = True
+            self.object_ball_kiss_occurred = True
+            self._last_id_swap_check_time = t_eval
+            self.event_log.append(
+                f"[{t_eval:.2f}s] [트래커 ID 역스왑 복원] {mover.name}<->{stayer.name} 정면 키스 자리바꿈 교정 완료"
+            )
+            return True
         return False
 
-    def _find_nearest_rail(self, p: np.ndarray) -> Rail:
-        """주어진 (x, y) 좌표에서 가장 가까운 당구대 4면 쿠션 레일(LEFT, RIGHT, TOP, BOTTOM)을 반환합니다."""
-        dists = {
-            Rail.LEFT: float(p[0]),
-            Rail.RIGHT: float(TABLE_W - p[0]),
-            Rail.TOP: float(p[1]),
-            Rail.BOTTOM: float(TABLE_H - p[1]),
-        }
-        return min(dists.keys(), key=lambda r: dists[r])
+    def _extract_polyline_cushions(
+        self, up_to_path_idx: Optional[int] = None
+    ) -> Tuple[int, int, List[Tuple[int, float, Rail, np.ndarray]]]:
+        """
+        [원리 2: cv2.approxPolyDP 폴리라인 꼭짓점 기반 쿠션 카운트]
+        수구 이동 궤적(self.cue_path)에 cv2.approxPolyDP(pts, epsilon=18.0, closed=False)를 적용하여
+        자잘한 떨림을 모두 직선으로 펴고, 실제로 궤적이 꺾인 쿠션 꼭짓점만 추출합니다.
 
-    def _increment_cushion(
-        self,
-        t: float,
-        rail: Rail,
-        pos: np.ndarray,
-        dist: float,
-        frame_idx: Optional[int] = None,
-        near_rails_count: int = 0,
-    ) -> None:
-        """제1적구 접촉 전/후를 구분하여 정확히 쿠션 카운트를 1 증가시킵니다."""
-        if self.state == ShotState.VALID_SCORE_PENDING or self.score_dispatched:
-            return
-        if self.first_target_ball is None:
-            self.cushions_before_first_hit += 1
-        else:
-            self.cushions_after_first_hit += 1
-
-        self.cushion_count = self.cushions_before_first_hit + self.cushions_after_first_hit
-        self.rail_armed[rail] = False
-        # 다른 레일이나 공을 맞히기 전까지 동일 레일 연속 카운트 잠금!
-        for r in Rail:
-            self.same_rail_locked[r] = (r == rail)
-
-        if near_rails_count >= 2:
-            self.corner_bounce_count_in_zone += 1
-        else:
-            self.corner_bounce_count_in_zone = 0
-
-        self.per_rail_last_time[rail] = t
-        self.last_rail_hit = rail
-        self.last_rail_time = t
-        self.last_cushion_hit_pos = pos.copy()
-        cue_c = self.active_cue_ball or self.assigned_cue_ball
-        if frame_idx is not None and cue_c is not None:
-            self.last_impulse_frame[cue_c] = frame_idx
-        phase_str = "빈쿠션(1적구전)" if self.first_target_ball is None else "1적구후"
-        self.event_log.append(
-            f"[{t:.2f}s] 쿠션 접촉 #{self.cushion_count} [{phase_str}] ({rail.value}, dist={dist:.1f}mm)"
+        반환값:
+            (cushions_before_first_hit, cushions_after_first_hit, valid_cushion_vertices)
+        """
+        path = (
+            self.cue_path
+            if up_to_path_idx is None
+            else self.cue_path[: up_to_path_idx + 1]
         )
+        if len(path) < 3:
+            c_before = 1 if self._geom_one_bank_recovered else 0
+            return c_before, 0, []
 
-    def _apply_vision_precision_signals(
-        self,
-        t: float,
-        pos_map: Dict[BallColor, np.ndarray],
-        vel_map: Dict[BallColor, np.ndarray],
-        subpixel_impacts: Optional[Dict[BallColor, bool]],
-        intra_frame_rail_bounce: bool,
+        pts_arr = np.array([pt.pos for pt in path], dtype=np.float32).reshape(-1, 1, 2)
+        approx = cv2.approxPolyDP(
+            pts_arr, epsilon=self.POLY_EPSILON_CUSHION_MM, closed=False
+        ).reshape(-1, 2)
+
+        if len(approx) < 3:
+            c_before = 1 if self._geom_one_bank_recovered else 0
+            return c_before, 0, []
+
+        # approx의 각 꼭짓점에 대응하는 원본 cue_path 인덱스(orig_indices) 매핑
+        orig_indices: List[int] = []
+        search_start = 0
+        for v_pt in approx:
+            best_i = search_start
+            best_d = float("inf")
+            for idx in range(search_start, len(path)):
+                d = float(np.linalg.norm(path[idx].pos - v_pt))
+                if d < best_d:
+                    best_d = d
+                    best_i = idx
+                if d < 1e-3:
+                    break
+            orig_indices.append(best_i)
+            search_start = best_i
+
+        valid_vertices: List[Tuple[int, float, Rail, np.ndarray]] = []
+        last_rail: Optional[Rail] = None
+        last_vertex_path_idx: int = -1
+
+        for k in range(1, len(approx) - 1):
+            p_prev = approx[k - 1]
+            p_curr = approx[k]
+            p_next = approx[k + 1]
+            idx_curr = orig_indices[k]
+            pt_info = path[idx_curr]
+
+            vec_in = p_curr - p_prev
+            vec_out = p_next - p_curr
+            len_in = float(np.linalg.norm(vec_in))
+            len_out = float(np.linalg.norm(vec_out))
+
+            min_seg_len = 12.0 if (k == 1 or k == len(approx) - 2) else 18.0
+            if len_in < min_seg_len or len_out < min_seg_len:
+                continue
+
+            bend_deg = self._angle_between_deg(vec_in, vec_out)
+            if bend_deg < self.POLY_MIN_CUSHION_BEND_DEG:
+                continue
+
+            # 꼭짓점 전후 1프레임 윈도우 내 최소 레일 거리 및 프레임 내 V자 반사 여부 확인
+            w_lo = max(0, idx_curr - 1)
+            w_hi = min(len(path) - 1, idx_curr + 1)
+            has_v_bounce = any(path[i].intra_frame_v_bounce for i in range(w_lo, w_hi + 1))
+            max_rail_zone = 135.0 if has_v_bounce else self.RAIL_VERTEX_ZONE_MM
+
+            d_left = min(float(path[i].pos[0]) for i in range(w_lo, w_hi + 1))
+            d_right = min(float(TABLE_W - path[i].pos[0]) for i in range(w_lo, w_hi + 1))
+            d_top = min(float(path[i].pos[1]) for i in range(w_lo, w_hi + 1))
+            d_bottom = min(float(TABLE_H - path[i].pos[1]) for i in range(w_lo, w_hi + 1))
+
+            # 해당 꼭짓점에서 실제 반사가 일어난 레일 후보 탐색
+            rail_candidates: List[Tuple[float, Rail]] = []
+            if d_left <= max_rail_zone and vec_in[0] < -1.5 and vec_out[0] > 1.5:
+                rail_candidates.append((d_left, Rail.LEFT))
+            if d_right <= max_rail_zone and vec_in[0] > 1.5 and vec_out[0] < -1.5:
+                rail_candidates.append((d_right, Rail.RIGHT))
+            if d_top <= max_rail_zone and vec_in[1] < -1.5 and vec_out[1] > 1.5:
+                rail_candidates.append((d_top, Rail.TOP))
+            if d_bottom <= max_rail_zone and vec_in[1] > 1.5 and vec_out[1] < -1.5:
+                rail_candidates.append((d_bottom, Rail.BOTTOM))
+
+            if not rail_candidates:
+                continue
+
+            rail_candidates.sort(key=lambda item: item[0])
+            d_rail_min, hit_rail = rail_candidates[0]
+
+            # 목적구 충돌 꼭짓점과 쿠션 반사 꼭짓점 분리:
+            # 1) 만약 꼭짓점 시점이 제1적구 최초 충돌 시점과 겹치는 경우:
+            #    일반 샷(Test 2: 레일 앞 제1적구를 직접 먼저 맞혀 꺾인 경우)은 쿠션에서 배제하되,
+            #    1쿠션 넣어치기(Test 6: 초기 스트로크 방향이 제1적구 중심을 비껴나 쿠션을 먼저 찍은 경우)는 선행 쿠션으로 보존!
+            is_before_first_hit = (
+                self.first_target_hit_path_idx is None
+                or idx_curr < self.first_target_hit_path_idx
+            )
+            if (
+                self.first_target_hit_path_idx is not None
+                and abs(idx_curr - self.first_target_hit_path_idx) <= 1
+            ):
+                if self._geom_one_bank_recovered:
+                    is_before_first_hit = True
+                else:
+                    continue
+
+            # 2) 제1적구 충돌 이후 구간에서 꼭짓점 반경 72.0mm 이내에 목적구가 있고
+            #    레일 밀착(<= 42.0mm) 반사가 아니라면 목적구 재키스/충돌 꼭짓점이므로 배제
+            if not is_before_first_hit:
+                if pt_info.min_dist_to_targets < 72.0 and d_rail_min > 42.0:
+                    continue
+
+            # 3) 동일 레일 슬라이딩 중복 카운트 차단:
+            #    직전 쿠션 꼭짓점과 같은 레일이면, 중간에 제1적구 충돌이 있었거나
+            #    레일로부터 220mm 이상 깊숙이 이탈했다가 다시 들어온 경우에만 인정
+            if hit_rail == last_rail and last_vertex_path_idx >= 0:
+                crossed_first_hit = (
+                    self.first_target_hit_path_idx is not None
+                    and last_vertex_path_idx < self.first_target_hit_path_idx < idx_curr
+                )
+                if not crossed_first_hit:
+                    max_away = 0.0
+                    for m_i in range(last_vertex_path_idx, idx_curr + 1):
+                        mp = path[m_i].pos
+                        if hit_rail == Rail.LEFT:
+                            r_d = float(mp[0])
+                        elif hit_rail == Rail.RIGHT:
+                            r_d = float(TABLE_W - mp[0])
+                        elif hit_rail == Rail.TOP:
+                            r_d = float(mp[1])
+                        else:
+                            r_d = float(TABLE_H - mp[1])
+                        if r_d > max_away:
+                            max_away = r_d
+                    if max_away < self.SAME_RAIL_DEEP_EXIT_MM:
+                        continue
+
+            valid_vertices.append((pt_info.frame_idx, pt_info.t, hit_rail, p_curr.copy()))
+            last_rail = hit_rail
+            last_vertex_path_idx = idx_curr
+
+        c_before = 0
+        c_after = 0
+        for f_idx, t_v, r_v, _ in valid_vertices:
+            if (
+                self.first_target_hit_time is None
+                or t_v < self.first_target_hit_time - 0.005
+            ):
+                c_before += 1
+            else:
+                c_after += 1
+
+        if self._geom_one_bank_recovered and c_before == 0:
+            if c_after > 0 and self.first_target_hit_time is not None:
+                # 첫 쿠션 꼭짓점이 제1적구 충돌 직후 1프레임에 걸친 경우 선쿠션으로 전환
+                first_v_t = valid_vertices[0][1]
+                if abs(first_v_t - self.first_target_hit_time) <= 0.04:
+                    c_before = 1
+                    c_after = max(0, c_after - 1)
+                else:
+                    c_before = 1
+            else:
+                c_before = 1
+
+        return c_before, c_after, valid_vertices
+
+    def _update_polyline_cushion_counts(
+        self, up_to_path_idx: Optional[int] = None
     ) -> None:
-        """
-        [4대 정밀 비전 신호 최우선 반영]
-        1) intra_frame_rail_bounce == True (MotionStreakVApexDetector 또는 CushionRimPixelTrigger 감지):
-           프레임 사이에서 쿠션을 찍고 나온 V자 잔상/픽셀 터치를 인정하여 누락 없이 cushion_count += 1 수행
-        2) subpixel_impacts[target_color] == True (SubPixelPhaseImpactDetector 0.06px 이상 위상 진동 감지):
-           수구가 목적구 근방(d_min <= 95.0mm, 완화 적용)을 지날 때 좌표상 속도 변화가 0이더라도 즉시 접촉(득점) 인정
-        """
+        """폴리라인 꼭짓점 분석 결과를 FSM 쿠션 카운터 및 이벤트 로그에 동기화합니다."""
         if self.score_dispatched:
             return
-        cue_color = self.active_cue_ball or self.assigned_cue_ball
-        if cue_color is None or cue_color not in pos_map:
-            return
+        c_before, c_after, vertices = self._extract_polyline_cushions(up_to_path_idx)
+        self.cushions_before_first_hit = c_before
+        self.cushions_after_first_hit = c_after
+        self.cushion_count = c_before + c_after
+        if self.cushions_before_first_hit >= 1:
+            self.is_bank_shot = True
 
-        # 1. 푸리에 위상 상관법(cv2.phaseCorrelate) 초미세 스침(subpixel_impacts) 기반 즉시 접촉 판정 먼저 수행!
-        hit_any_subpixel = False
-        if subpixel_impacts:
-            prev_snap = self.history[-2] if len(self.history) >= 2 else self.history[-1]
-            for target_color, impacted in subpixel_impacts.items():
-                if not impacted or target_color == cue_color or target_color not in pos_map:
-                    continue
-                pair_key = frozenset([cue_color, target_color])
-                if (t - self.pair_last_hit_time.get(pair_key, -999.0)) < self.PAIR_COOLDOWN_SEC:
-                    continue
-
-                d_min, _, n_ab = self._subframe_ccd(
-                    prev_snap.pos[cue_color],
-                    pos_map[cue_color],
-                    prev_snap.pos[target_color],
-                    pos_map[target_color],
+        for f_idx, t_v, rail, pos_v in vertices:
+            if f_idx not in self._logged_cushion_frames:
+                self._logged_cushion_frames.add(f_idx)
+                self.event_log.append(
+                    f"[{t_v:.2f}s] 쿠션 꼭짓점 #{len(self._logged_cushion_frames)} ({rail.name}) "
+                    f"pos=({pos_v[0]:.1f}, {pos_v[1]:.1f}) "
+                    f"[선쿠션:{self.cushions_before_first_hit} + 후쿠션:{self.cushions_after_first_hit} = 총:{self.cushion_count}]"
                 )
-                if d_min <= 95.0:
-                    hit_any_subpixel = True
-                    for r in Rail:
-                        self.same_rail_locked[r] = False
-                    self.pair_last_hit_time[pair_key] = t
-                    self.last_impulse_frame[cue_color] = self.frame_counter
-                    self.last_impulse_frame[target_color] = self.frame_counter
-                    self.event_log.append(
-                        f"[{t:.2f}s] [SubPixel 위상감지] {target_color.name} 초미세 접촉 확정 (d_min={d_min:.1f}mm <= 95.0mm)"
-                    )
-                    self._register_cue_target_hit(t, target_color, n_ab, vel_map, vel_map)
 
-        # 2. 프레임 내 모션 블러 V자 꺾임(intra_frame_rail_bounce) 기반 쿠션 카운트 반영 (목적구 충돌/즉시득점이 없을 때만)
-        if (
-            intra_frame_rail_bounce
-            and not hit_any_subpixel
-            and not self.score_dispatched
-            and self.state != ShotState.VALID_SCORE_PENDING
-        ):
-            nearest_rail = self._find_nearest_rail(pos_map[cue_color])
-            if (
-                not self.same_rail_locked.get(nearest_rail, False)
-                and self.rail_armed.get(nearest_rail, True)
-                and ((t - self.per_rail_last_time.get(nearest_rail, -999.0)) >= self.PER_RAIL_COOLDOWN_SEC)
-            ):
-                p_cue = pos_map[cue_color]
-                d_rail = {
-                    Rail.LEFT: float(p_cue[0]),
-                    Rail.RIGHT: float(TABLE_W - p_cue[0]),
-                    Rail.TOP: float(p_cue[1]),
-                    Rail.BOTTOM: float(TABLE_H - p_cue[1]),
-                }[nearest_rail]
-                self._increment_cushion(t, nearest_rail, p_cue, d_rail, self.frame_counter)
-
-    def update(
+    def _check_cue_polyline_vertex_at_target(
         self,
-        t: float,
-        coords_mm: Dict[BallColor, Optional[Tuple[float, float]]],
-        subpixel_impacts: Optional[Dict[BallColor, bool]] = None,
-        intra_frame_rail_bounce: bool = False,
-    ) -> Optional[ShotResult]:
-        stabilized_out = self._stabilize_blob_merging(t, coords_mm)
-        if stabilized_out is None:
-            return None
-        stabilized_pos, gpt_vel_override = stabilized_out
-
-        pos_map: Dict[BallColor, np.ndarray] = {}
-        vel_map: Dict[BallColor, np.ndarray] = {}
-        acc_map: Dict[BallColor, np.ndarray] = {}
-
-        for color, p in stabilized_pos.items():
-            v = np.zeros(2, dtype=np.float64)
-            acc = np.zeros(2, dtype=np.float64)
-            if color in self.prev_raw_pos:
-                p_prev, t_prev = self.prev_raw_pos[color]
-                dt = max(t - t_prev, 1e-4)
-                v_prev = self.prev_ema_vel.get(color, np.zeros(2, dtype=np.float64))
-
-                if self.centroid_clamp_cooldown.get(color, 0) > 0:
-                    v = v_prev
-                    acc = np.zeros(2, dtype=np.float64)
-                    self.centroid_clamp_cooldown[color] -= 1
-                elif gpt_vel_override[color] is not None:
-                    v = gpt_vel_override[color]
-                    acc = (v - v_prev) / dt
-                else:
-                    raw_v = (p - p_prev) / dt
-                    if float(np.linalg.norm(raw_v)) < 2.0:
-                        v = raw_v
-                    else:
-                        v = 0.65 * raw_v + 0.35 * v_prev
-                    acc = (v - v_prev) / dt
-
-            self.prev_raw_pos[color] = (p, t)
-            self.prev_ema_vel[color] = v
-            pos_map[color] = p
-            vel_map[color] = v
-            acc_map[color] = acc
-
-            self.gpt_buffers[color].append((float(p[0]), float(p[1]), float(v[0]), float(v[1])))
-
-        self.frame_counter += 1
-        self.history.append(
-            FrameSnapshot(
-                frame_idx=self.frame_counter,
-                t=t,
-                pos=pos_map,
-                vel=vel_map,
-                acc=acc_map,
-                subpixel_impacts=dict(subpixel_impacts) if subpixel_impacts else {},
-                intra_frame_rail_bounce=bool(intra_frame_rail_bounce),
-            )
-        )
-
-        if self.state == ShotState.IDLE:
-            for c in BallColor:
-                spd_c = float(np.linalg.norm(vel_map[c]))
-                if c not in self.idle_anchor_pos:
-                    prev_s = self.history[-2] if len(self.history) >= 2 else self.history[-1]
-                    self.idle_anchor_pos[c] = prev_s.pos[c].copy()
-                elif spd_c < 45.0:
-                    self.idle_anchor_pos[c] = 0.85 * self.idle_anchor_pos[c] + 0.15 * pos_map[c]
-
-            # [규칙 1] 세 공이 서로 충돌하기 전(모든 공 사이 거리 >= 66.0mm),
-            # 정지 기준점으로부터 가장 먼저 12.0mm 이상 이탈하며 속도 65.0mm/s 이상을 기록한 수구 후보(WHITE / YELLOW) 포착
-            all_colors = list(BallColor)
-            min_pair_dist = min(
-                float(np.linalg.norm(pos_map[all_colors[i]] - pos_map[all_colors[j]]))
-                for i in range(3)
-                for j in range(i + 1, 3)
-            )
-            if min_pair_dist >= 66.0:
-                for cand_c in (BallColor.WHITE, BallColor.YELLOW):
-                    cand_spd = float(np.linalg.norm(vel_map[cand_c]))
-                    cand_anc = self.idle_anchor_pos.get(cand_c, self.history[0].pos[cand_c])
-                    cand_disp = float(np.linalg.norm(pos_map[cand_c] - cand_anc))
-                    if cand_disp >= 12.0 and cand_spd >= 65.0:
-                        if self.onset_candidate_time.get(cand_c) is None:
-                            self.onset_candidate_time[cand_c] = t
-                        if self.first_mover_from_idle is None:
-                            self.first_mover_from_idle = cand_c
-                    elif cand_disp < 8.0 and cand_spd < 35.0:
-                        self.onset_candidate_time[cand_c] = None
-                        if self.first_mover_from_idle == cand_c:
-                            other_cand = BallColor.YELLOW if cand_c == BallColor.WHITE else BallColor.WHITE
-                            self.first_mover_from_idle = (
-                                other_cand if self.onset_candidate_time.get(other_cand) is not None else None
-                            )
-
-            min_disp_req = max(22.0, self.MIN_STROKE_DISP_MM) if len(self.history) >= 4 else 6.0
-            stroke_speed_req = min(160.0, self.STROKE_START_SPEED)
-
-            # 수구 후보(WHITE, YELLOW) 각각의 현재 변위 및 속도 계산 (RED는 절대 수구가 될 수 없음)
-            cand_ready: List[BallColor] = []
-            for cand_c in (BallColor.WHITE, BallColor.YELLOW):
-                c_spd = float(np.linalg.norm(vel_map[cand_c]))
-                c_anc = self.idle_anchor_pos.get(cand_c, self.history[0].pos[cand_c])
-                c_disp = float(np.linalg.norm(pos_map[cand_c] - c_anc))
-                if c_spd >= stroke_speed_req and c_disp >= min_disp_req:
-                    cand_ready.append(cand_c)
-
-            cue = self.assigned_cue_ball
-            stroke_started = False
-            occluded_first_hit_target: Optional[BallColor] = None
-
-            if cand_ready:
-                stroke_started = True
-                if not self.turn_locked_by_previous_shot:
-                    # 초구 또는 턴 미잠금 상태: 가장 먼저 출발 신호(onset_time)를 낸 공을 수구로 결정!
-                    if self.first_mover_from_idle in cand_ready:
-                        cue = self.first_mover_from_idle
-                    elif self.first_mover_from_idle is not None and self.onset_candidate_time.get(self.first_mover_from_idle) is not None:
-                        cue = self.first_mover_from_idle
-                    elif len(cand_ready) == 1:
-                        cue = cand_ready[0]
-                    else:
-                        t_w = self.onset_candidate_time.get(BallColor.WHITE)
-                        t_y = self.onset_candidate_time.get(BallColor.YELLOW)
-                        if t_w is not None and (t_y is None or t_w <= t_y):
-                            cue = BallColor.WHITE
-                        elif t_y is not None and (t_w is None or t_y < t_w):
-                            cue = BallColor.YELLOW
-                        else:
-                            d_w = float(np.linalg.norm(pos_map[BallColor.WHITE] - self.idle_anchor_pos[BallColor.WHITE]))
-                            d_y = float(np.linalg.norm(pos_map[BallColor.YELLOW] - self.idle_anchor_pos[BallColor.YELLOW]))
-                            cue = BallColor.WHITE if d_w >= d_y else BallColor.YELLOW
-                    self.assigned_cue_ball = cue
-                else:
-                    # 이전 이닝 결과로 턴이 지정된 상태:
-                    # 지정 수구가 출발했거나 먼저 onset 신호를 냈으면 지정 수구 유지,
-                    # 만약 지정 수구는 정지 앵커에 가만히 멈춰(< 8mm) 있는데 반대 수구가 충돌 전(>= 66mm) 단독으로 먼저 출발한 경우 그 공을 수구로 동기화
-                    if self.assigned_cue_ball in cand_ready:
-                        cue = self.assigned_cue_ball
-                    elif (
-                        self.first_mover_from_idle == self.assigned_cue_ball
-                        and self.onset_candidate_time.get(self.assigned_cue_ball) is not None
-                    ):
-                        cue = self.assigned_cue_ball
-                    else:
-                        other_cue = cand_ready[0]
-                        assigned_anc = self.idle_anchor_pos.get(self.assigned_cue_ball, pos_map[self.assigned_cue_ball])
-                        assigned_disp = float(np.linalg.norm(pos_map[self.assigned_cue_ball] - assigned_anc))
-                        if min_pair_dist >= 66.0 and assigned_disp < 8.0 and self.first_mover_from_idle == other_cue:
-                            cue = other_cue
-                            self.assigned_cue_ball = other_cue
-                        else:
-                            cue = self.assigned_cue_ball
-                            occluded_first_hit_target = other_cue
-            else:
-                # 2) 만약 스트로크 순간 신체 가려짐 때문에 수구(WHITE/YELLOW)는 안 보이고
-                #    적구(RED)가 먼저 >= 350.0mm/s, 변위 >= 35.0mm로 강하게 튕겨 나간 경우:
-                red_spd = float(np.linalg.norm(vel_map[BallColor.RED]))
-                red_anchor = self.idle_anchor_pos.get(BallColor.RED, self.history[0].pos[BallColor.RED])
-                red_disp = float(np.linalg.norm(pos_map[BallColor.RED] - red_anchor))
-                if red_spd >= 350.0 and red_disp >= 35.0:
-                    stroke_started = True
-                    cue = self.first_mover_from_idle or self.assigned_cue_ball
-                    self.assigned_cue_ball = cue
-                    occluded_first_hit_target = BallColor.RED
-
-            if stroke_started:
-                cue_anchor = self.idle_anchor_pos.get(cue, self.history[0].pos[cue])
-                cue_disp = float(np.linalg.norm(pos_map[cue] - cue_anchor))
-                saved_anchors = {c: self.idle_anchor_pos[c].copy() for c in BallColor if c in self.idle_anchor_pos}
-                self._reset_shot()
-                self.shot_seq_id += 1
-                self.stroke_start_time = t
-                self.active_cue_ball = cue
-                self.assigned_cue_ball = cue
-                self.state = ShotState.IN_PLAY
-                prev_snap = self.history[-2] if len(self.history) >= 2 else self.history[-1]
-                self.initial_positions = (
-                    saved_anchors
-                    if len(saved_anchors) == 3
-                    else {c: prev_snap.pos[c].copy() for c in BallColor}
-                )
-                cue_init_p = self.initial_positions[cue]
-                self.stroke_origin_pos = cue_init_p.copy()
-                init_vec = pos_map[cue] - self.stroke_origin_pos
-                init_norm = float(np.linalg.norm(init_vec))
-                if init_norm >= 5.0:
-                    self.initial_stroke_dir = init_vec / init_norm
-                self._initial_stroke_samples = [pos_map[cue].copy()]
-                for s_h in self.history:
-                    p_h = s_h.pos[cue]
-                    d_r_h = min(float(p_h[0]), float(TABLE_W - p_h[0]), float(p_h[1]), float(TABLE_H - p_h[1]))
-                    if d_r_h < self.min_rail_dist_before_first_hit:
-                        self.min_rail_dist_before_first_hit = d_r_h
-                self.initial_ball_distances = {
-                    c: float(np.linalg.norm(self.initial_positions[c] - cue_init_p))
-                    for c in BallColor if c != cue
-                }
-                self.cue_total_travel_mm = max(cue_disp, 150.0 if occluded_first_hit_target is not None else cue_disp)
-
-                if occluded_first_hit_target is not None:
-                    self.first_target_ball = occluded_first_hit_target
-                    self.first_target_hit_time = t
-                    self.event_log.append(
-                        f"[{t:.2f}s] 스트로크 출발 및 가려짐 중 제1적구({occluded_first_hit_target.name}) 피격 감지 (수구 고정: {cue.name})"
-                    )
-                else:
-                    self.event_log.append(f"[{t:.2f}s] 스트로크 출발 (수구: {cue.name})")
-
-                if subpixel_impacts or intra_frame_rail_bounce:
-                    self._apply_vision_precision_signals(
-                        t, pos_map, vel_map, subpixel_impacts, intra_frame_rail_bounce
-                    )
-                if len(self.history) >= 3:
-                    self._evaluate_frame_with_context(subpixel_impacts)
-                if self._pending_immediate_result is not None:
-                    instant_res = self._pending_immediate_result
-                    self._pending_immediate_result = None
-                    return instant_res
-            return None
-
-        # IN_PLAY 중 수구 누적 이동 거리, 초기 3프레임 진행 방향(initial_stroke_dir) 및 제1적구 전 최소 레일 거리 기록
-        if self.active_cue_ball is not None and len(self.history) >= 2:
-            p_cue_now = self.history[-1].pos[self.active_cue_ball]
-            step_travel = float(
-                np.linalg.norm(
-                    p_cue_now - self.history[-2].pos[self.active_cue_ball]
-                )
-            )
-            self.cue_total_travel_mm += step_travel
-            if self.first_target_ball is None:
-                d_rail_now = min(
-                    float(p_cue_now[0]),
-                    float(TABLE_W - p_cue_now[0]),
-                    float(p_cue_now[1]),
-                    float(TABLE_H - p_cue_now[1]),
-                )
-                if d_rail_now < self.min_rail_dist_before_first_hit:
-                    self.min_rail_dist_before_first_hit = d_rail_now
-                if (
-                    len(self._initial_stroke_samples) < 3
-                    and self.cushion_count == 0
-                    and d_rail_now > self.RAIL_ENTER_MARGIN
-                    and self.stroke_origin_pos is not None
-                ):
-                    vec_from_origin = p_cue_now - self.stroke_origin_pos
-                    norm_from_origin = float(np.linalg.norm(vec_from_origin))
-                    if norm_from_origin >= 10.0:
-                        cand_dir = vec_from_origin / norm_from_origin
-                        if (
-                            self.initial_stroke_dir is None
-                            or self._angle_between_deg(self.initial_stroke_dir, cand_dir) <= 6.0
-                        ):
-                            self.initial_stroke_dir = cand_dir
-                            self._initial_stroke_samples.append(p_cue_now.copy())
-
-        # 정밀 비전 신호(SubPixel 위상 진동 / V-Apex 쿠션 반사)가 들어온 경우 최우선 반영
-        if not self.score_dispatched and (subpixel_impacts or intra_frame_rail_bounce):
-            self._apply_vision_precision_signals(
-                t, pos_map, vel_map, subpixel_impacts, intra_frame_rail_bounce
-            )
-
-        # 초구 뱅크샷 첫 쿠션 누락 방지를 위해 len(self.history) >= 3 부터 즉시 평가 가동
-        if not self.score_dispatched and len(self.history) >= 3:
-            self._evaluate_frame_with_context(subpixel_impacts)
-
-        all_stopped = all(float(np.linalg.norm(v)) < self.STOP_SPEED for v in vel_map.values())
-        self.stop_counter = (self.stop_counter + 1) if all_stopped else 0
-
-        if self.stop_counter >= self.STOP_HOLD_FRAMES:
-            # 노이즈 가짜 출발 자동 취소 (MIN_VALID_SHOT_TRAVEL_MM = 120.0):
-            # IN_PLAY 진입 후 수구 누적 이동 거리가 120mm 미만이고 목적구 충돌도 없었다면
-            # 절대 공격권을 넘기지 않고 조용히 _reset_shot()만 호출하여 현재 선수 턴 유지!
-            if (
-                not self.score_dispatched
-                and self.state != ShotState.VALID_SCORE_PENDING
-                and self.first_target_ball is None
-                and not self.double_hit_foul
-                and self.cue_total_travel_mm < self.MIN_VALID_SHOT_TRAVEL_MM
-            ):
-                self._reset_shot()
-                return None
-            return self._finalize_shot(t)
-
-        # 제2적구 충돌로 즉시 득점이 발생한 해당 프레임이면 공이 멈추기를 기다리지 않고 즉시 ShotResult 반환
-        if self._pending_immediate_result is not None:
-            instant_res = self._pending_immediate_result
-            self._pending_immediate_result = None
-            return instant_res
-
-        return None
-
-    def _evaluate_frame_with_context(self, subpixel_impacts: Optional[Dict[BallColor, bool]] = None):
+        target_pos: np.ndarray,
+        f_pre2: FrameSnapshot,
+        f_prev: FrameSnapshot,
+        f_curr: FrameSnapshot,
+        f_post2: FrameSnapshot,
+        cue_color: BallColor,
+    ) -> Tuple[bool, float]:
         """
-        [핵심 교정]
-        1) 이미 즉시 득점(score_dispatched)이 완료된 이닝은 잔여 구름 중 모든 판정을 동결합니다.
-        2) 목적구 충돌 검사를 쿠션 검사보다 먼저 수행하여, 적구 타격을 쿠션으로 오인하거나
-           제2적구 타격 프레임에 사후 쿠션이 먼저 더해져 쿠션 숫자가 틀리는 버그를 원천 차단합니다.
+        [원리 3 - 현상 B 보조]:
+        수구가 목적구와 최근접한 시점(f_curr) 전후 궤적에 cv2.approxPolyDP를 적용하여,
+        목적구 바로 옆에서 실제로 4.2도 이상 꺾인 꼭짓점이 발생했는지 확인합니다.
         """
-        if self.score_dispatched or self.active_cue_ball is None or len(self.history) < 3:
-            return
+        p0 = f_pre2.pos[cue_color]
+        p1 = f_prev.pos[cue_color]
+        p2 = f_curr.pos[cue_color]
+        p3 = f_post2.pos[cue_color]
 
-        f_pre2 = self.history[-5] if len(self.history) >= 5 else self.history[0]
-        f_prev = self.history[-4] if len(self.history) >= 4 else self.history[-2]
-        f_curr = self.history[-3] if len(self.history) >= 3 else self.history[-1]
-        f_post2 = self.history[-1]
-        t_eval = f_curr.t
-        cue_color = self.active_cue_ball
+        # 현재 최근접 프레임(f_curr = p2)에서 궤적이 실제로 꺾였는지 확인
+        bend_at_curr = self._angle_between_deg(p2 - p1, p3 - p2)
+        if bend_at_curr < 1.8:
+            return False, 0.0
 
-        v_pre, v_post1, v_post2 = self._compute_split_velocities()
+        local_pts = np.array([p0, p1, p2, p3], dtype=np.float32).reshape(-1, 1, 2)
+        approx = cv2.approxPolyDP(local_pts, epsilon=1.8, closed=False).reshape(-1, 2)
 
-        other_balls = [c for c in BallColor if c != cue_color]
-        b1, b2 = other_balls[0], other_balls[1]
+        max_bend = 0.0
+        for k in range(1, len(approx) - 1):
+            v_in = approx[k] - approx[k - 1]
+            v_out = approx[k + 1] - approx[k]
+            if float(np.linalg.norm(v_in)) < 5.0 or float(np.linalg.norm(v_out)) < 5.0:
+                continue
+            bend = self._angle_between_deg(v_in, v_out)
+            dist_to_t = float(np.linalg.norm(approx[k] - target_pos))
+            if dist_to_t <= 74.0 and bend > max_bend:
+                max_bend = bend
 
-        # 적구 정면 키스 시 트래커 ID 스왑(유령 관통) 자동 감지 및 역스왑
-        if self._detect_and_fix_kiss_id_swap(t_eval, b1, b2, v_pre, v_post2):
-            v_pre, v_post1, v_post2 = self._compute_split_velocities()
-
-        # 수구가 현재 레일 반사 중인지 여부만 사전 계산 (카운트는 하지 않음!)
-        p_cue = f_curr.pos[cue_color]
-        v_in, v_out = v_pre[cue_color], v_post2[cue_color]
-        min_dist_to_targets = min(
-            float(np.linalg.norm(p_cue - f_curr.pos[b1])),
-            float(np.linalg.norm(p_cue - f_curr.pos[b2])),
-        )
-        near_any_rail = (
-            p_cue[0] <= self.RAIL_ENTER_MARGIN
-            or (TABLE_W - p_cue[0]) <= self.RAIL_ENTER_MARGIN
-            or p_cue[1] <= self.RAIL_ENTER_MARGIN
-            or (TABLE_H - p_cue[1]) <= self.RAIL_ENTER_MARGIN
-        )
-        normal_flipped = (v_in[0] * v_out[0] < -100.0) or (v_in[1] * v_out[1] < -100.0)
-        cue_bouncing_on_rail = (near_any_rail and normal_flipped) or ((t_eval - self.last_rail_time) <= 0.10)
-
-        # [Step 1] 적구 간 키스 감지 (B <-> C)
-        bc_collided = self._verify_pair_collision(
-            ball_x=b1,
-            ball_y=b2,
-            f_pre2=f_pre2,
-            f_prev=f_prev,
-            f_curr=f_curr,
-            f_post2=f_post2,
-            x_near_rail=False,
-            other_ball=cue_color,
-            v_pre=v_pre,
-            v_post1=v_post1,
-            v_post2=v_post2,
-            is_cue_second_target_check=False,
-            bc_kiss_this_frame=False,
-        )
-        if bc_collided:
-            self.object_ball_kiss_occurred = True
-            self.last_object_kiss_time = t_eval
-            self.last_impulse_frame[b1] = f_curr.frame_idx
-            self.last_impulse_frame[b2] = f_curr.frame_idx
-            self.event_log.append(f"[{t_eval:.2f}s] [적구 간 키스 감지] {b1.name} <-> {b2.name}")
-
-        # [Step 2] 수구-목적구 충돌 감지 먼저 실행! (충돌 발생 시 동일 레일 잠금 해제 및 즉시 득점 처리)
-        sorted_targets = sorted(
-            other_balls,
-            key=lambda c: 0 if c == self.first_target_ball else 1,
-        )
-        hit_target_this_frame = False
-        a_hit_first_target_this_frame = False
-        eval_subpixel = f_curr.subpixel_impacts or subpixel_impacts or {}
-
-        for target_color in sorted_targets:
-            third_ball = b2 if target_color == b1 else b1
-            is_second_target_check = (
-                self.first_target_ball is not None and target_color != self.first_target_ball
-            )
-            sp_hit = bool(eval_subpixel.get(target_color, False))
-            if self._verify_pair_collision(
-                ball_x=cue_color,
-                ball_y=target_color,
-                f_pre2=f_pre2,
-                f_prev=f_prev,
-                f_curr=f_curr,
-                f_post2=f_post2,
-                x_near_rail=cue_bouncing_on_rail,
-                other_ball=third_ball,
-                subpixel_phase_hit=sp_hit,
-                v_pre=v_pre,
-                v_post1=v_post1,
-                v_post2=v_post2,
-                is_cue_second_target_check=is_second_target_check,
-                bc_kiss_this_frame=(bc_collided or a_hit_first_target_this_frame),
-            ):
-                hit_target_this_frame = True
-                if target_color == self.first_target_ball:
-                    a_hit_first_target_this_frame = True
-                # 목적구를 맞혔으므로 이후 같은 레일에 다시 들어가도 카운트될 수 있도록 잠금 해제
-                for r in Rail:
-                    self.same_rail_locked[r] = False
-                self.last_impulse_frame[cue_color] = f_curr.frame_idx
-                self.last_impulse_frame[target_color] = f_curr.frame_idx
-                _, _, n_ab = self._subframe_ccd(
-                    f_prev.pos[cue_color],
-                    f_curr.pos[cue_color],
-                    f_prev.pos[target_color],
-                    f_curr.pos[target_color],
-                )
-                self._register_cue_target_hit(t_eval, target_color, n_ab, v_pre, v_post2)
-
-        # [Step 3] 이번 프레임에 목적구 충돌이나 즉시 득점이 일어나지 않았을 때만 쿠션 접촉 카운트 실행!
-        if not hit_target_this_frame and not self.score_dispatched:
-            self._check_cushion_contact(
-                t_eval,
-                f_prev,
-                f_curr,
-                v_in,
-                v_out,
-                cue_color,
-                min_dist_to_targets=min_dist_to_targets,
-            )
-
-        # [Step 4] 투터치 파울 검사
-        if not self.score_dispatched:
-            self._check_double_hit_foul(t_eval, v_pre, v_post2, f_post2)
-
-    def _line_fit_rmse_and_kink(self, ball: BallColor) -> Tuple[float, np.ndarray, np.ndarray, float]:
-        """
-        최근 프레임들의 궤적에 대해:
-        1) 단일 등속 직선 모델 p(t) = p0 + v*t 로 피팅했을 때의 직선 잔차(line_rmse_mm)를 계산하고,
-        2) 충돌 전 구간(history[-6:-3])과 충돌 후 구간(history[-3:]) 각각의 선형 회귀 속도 벡터(v_pre, v_post) 및
-           굴절각(kink_deg)을 반환합니다.
-        평범한 득점 실패(안 맞고 직진 통과)는 line_rmse_mm < 2.0mm 이고 kink_deg ≈ 0° 로 나타납니다.
-        """
-        snaps = list(self.history)[-6:]
-        t_arr = np.array([s.t for s in snaps], dtype=np.float64)
-        p_arr = np.array([s.pos[ball] for s in snaps], dtype=np.float64)  # (N, 2)
-
-        t_mean = np.mean(t_arr)
-        p_mean = np.mean(p_arr, axis=0)
-        dt_arr = t_arr - t_mean
-        denom = float(np.sum(dt_arr ** 2))
-        if denom < 1e-8:
-            return 0.0, np.zeros(2), np.zeros(2), 0.0
-
-        # 전체 구간 단일 직선 최소자승(OLS) 기울기 및 잔차 RMSE 계산
-        v_ols = np.sum(dt_arr[:, None] * (p_arr - p_mean), axis=0) / denom
-        p_pred_line = p_mean + dt_arr[:, None] * v_ols
-        residuals = np.linalg.norm(p_arr - p_pred_line, axis=1)
-        line_rmse_mm = float(np.sqrt(np.mean(residuals ** 2)))
-
-        # 전반부(충돌 전) / 후반부(충돌 후) 구간 평균 속도 벡터
-        pre_snaps = snaps[:3]
-        post_snaps = snaps[-3:]
-        dt_pre = max(pre_snaps[-1].t - pre_snaps[0].t, 1e-4)
-        dt_post = max(post_snaps[-1].t - post_snaps[0].t, 1e-4)
-
-        v_pre_reg = (pre_snaps[-1].pos[ball] - pre_snaps[0].pos[ball]) / dt_pre
-        v_post_reg = (post_snaps[-1].pos[ball] - post_snaps[0].pos[ball]) / dt_post
-        kink_deg = self._angle_between_deg(v_pre_reg, v_post_reg)
-
-        return line_rmse_mm, v_pre_reg, v_post_reg, kink_deg
+        best_bend = max(max_bend, bend_at_curr)
+        return best_bend >= self.THIN_HIT_MIN_BEND_DEG, best_bend
 
     def _verify_pair_collision(
         self,
         ball_x: BallColor,
         ball_y: BallColor,
-        f_pre2: Optional[FrameSnapshot] = None,
-        f_prev: Optional[FrameSnapshot] = None,
-        f_curr: Optional[FrameSnapshot] = None,
-        f_post2: Optional[FrameSnapshot] = None,
-        x_near_rail: bool = False,
-        other_ball: Optional[BallColor] = None,
+        f_pre2: FrameSnapshot,
+        f_prev: FrameSnapshot,
+        f_curr: FrameSnapshot,
+        f_post2: FrameSnapshot,
+        other_ball: BallColor,
         subpixel_phase_hit: bool = False,
-        *,
-        v_pre: Optional[Dict[BallColor, np.ndarray]] = None,
-        v_post1: Optional[Dict[BallColor, np.ndarray]] = None,
-        v_post2: Optional[Dict[BallColor, np.ndarray]] = None,
-        is_cue_second_target_check: bool = False,
-        bc_kiss_this_frame: bool = False,
+        is_object_ball_kiss_check: bool = False,
     ) -> bool:
         """
-        [평범한 실패 오판(False Positive) 원천 차단 + 3체 인과 키스 분리 통합 버전]
-        - 단순 거리 중첩(is_hard_overlap)만으로 무조건 True를 반환하던 버그를 폐지합니다.
-        - 대각선 시차로 인해 d_min <= 63mm가 찍히거나 바운딩 박스 노이즈(1~2px) 및 회전 휨(2~3°)이 있더라도,
-          1) 피타격구(Y)의 정지 앵커 대비 영구 순이동(>= 5.2mm) + 법선 충격 속도(>= 45mm/s)가 입증되거나,
-          2) 수구(X)의 6프레임 직선 회귀가 깨지며(line_rmse >= 1.6mm) 실제 접촉 반경(d_min <= 66.5mm)에서
-             법선 반대 방향으로 명확히 꺾인 경우(>= 4.0°)에만 충돌로 인정합니다.
+        [원리 3: 목적구 충돌 판정의 단순화 (직접 위치 이동 OR 확실한 꼭짓점 굴절)]
+        복잡한 6차원 미분 행렬 대신, 두 공이 72.0mm 이내로 근접했을 때:
+        - 현상 A: 목적구(ball_y)가 근접 전 위치(p_before) 대비 통과 후 위치(p_after)에서
+                  5.5mm 이상 새로운 방향으로 밀려났고, 다른 공(other_ball)에 의한 간접 키스가 아닌 경우 -> True!
+        - 현상 B: 목적구가 5.5mm 미만으로 움직였더라도 수구(ball_x)의 approxPolyDP 꼭짓점이
+                  목적구 옆(d_min <= 65.5mm)에서 4.2도 이상 꺾였고(또는 서브픽셀 위상 진동 감지),
+                  다른 목적구 충돌이나 쿠션 반사 중이 아닌 경우 -> True!
+        - 둘 다 아니면 거리가 55~58mm로 찍혔더라도 100% 평범한 실패(False)로 기각합니다!
         """
-        h2 = f_prev if f_prev is not None else self.history[2]
-        h3 = f_curr if f_curr is not None else self.history[3]
-        t_eval = h3.t
-
-        if other_ball is None:
-            remaining = [c for c in BallColor if c not in (ball_x, ball_y)]
-            other_ball = remaining[0]
-
+        t_eval = f_curr.t
         pair_key = frozenset([ball_x, ball_y])
         if (t_eval - self.pair_last_hit_time.get(pair_key, -999.0)) < self.PAIR_COOLDOWN_SEC:
             return False
 
-        d_min, _, n_xy = self._subframe_ccd(h2.pos[ball_x], h3.pos[ball_x], h2.pos[ball_y], h3.pos[ball_y])
-        if d_min > 75.0:
-            return False
-
-        # 제3의 공(other_ball)과의 최근접 거리 및 법선 벡터 계산
-        d_x_other, _, n_x_other = self._subframe_ccd(h2.pos[ball_x], h3.pos[ball_x], h2.pos[other_ball], h3.pos[other_ball])
-        d_y_other, _, n_other_y = self._subframe_ccd(h2.pos[other_ball], h3.pos[other_ball], h2.pos[ball_y], h3.pos[ball_y])
-
-        # 1. 공격구(X) 및 피타격구(Y)의 6프레임 단일 직선 회귀 잔차(line_rmse_mm)와 굴절각(kink_deg) 추출
-        line_rmse_x, vx_pre_reg, vx_post_reg, kink_deg_x = self._line_fit_rmse_and_kink(ball_x)
-        _, vy_pre_reg, vy_post_reg, _ = self._line_fit_rmse_and_kink(ball_y)
-
-        if v_pre is None or v_post1 is None or v_post2 is None:
-            v_pre_c, v_post1_c, v_post2_c = self._compute_split_velocities()
-            v_pre = v_pre or v_pre_c
-            v_post1 = v_post1 or v_post1_c
-            v_post2 = v_post2 or v_post2_c
-
-        vx_pre, vx_post = v_pre[ball_x], v_post2[ball_x]
-        vy_pre, vy_post = v_pre[ball_y], v_post2[ball_y]
-        vy_post_immediate = v_post1[ball_y]
-        vx_post_immediate = v_post1[ball_x]
-
-        delta_vx = vx_post - vx_pre
-        delta_vy = vy_post - vy_pre
-        if self.centroid_clamp_cooldown.get(ball_y, 0) > 0:
-            delta_vy = np.zeros(2, dtype=np.float64)
-            vy_post_immediate = vy_pre.copy()
-
-        # 2. 피타격구(Y)의 접근 전 정지 앵커(Anchor) 대비 영구 순변위(Net Displacement) 계산
-        snaps = list(self.history)
-        anchor_y = np.mean([s.pos[ball_y] for s in snaps[:2]], axis=0)
-        post_y = np.mean([s.pos[ball_y] for s in snaps[-2:]], axis=0)
-        net_disp_vec_y = post_y - anchor_y
-        net_disp_mag_y = float(np.linalg.norm(net_disp_vec_y))
-        net_disp_along_normal_y = float(np.dot(net_disp_vec_y, n_xy))
-
-        # -----------------------------------------------------------------
-        # [방어 A] A -> B -> C 간접 연쇄 키스(Chain Cannon) 차폐
-        # -----------------------------------------------------------------
-        delta_v_other = v_post2[other_ball] - v_pre[other_ball]
-        if is_cue_second_target_check and d_y_other <= self.GRAY_ZONE_MAX_DIST:
-            vec_xy = h3.pos[ball_y] - h3.pos[ball_x]
-            vec_x_other = h3.pos[other_ball] - h3.pos[ball_x]
-            dist_xy = max(float(np.linalg.norm(vec_xy)), 1e-6)
-            proj_ratio = float(np.dot(vec_x_other, vec_xy / dist_xy)) / dist_xy
-
-            other_is_between = (0.0 < proj_ratio < 1.05) and (d_x_other <= d_min + 6.0)
-            if other_is_between or bc_kiss_this_frame:
-                recoil_along_other = float(np.dot(delta_vx, -n_x_other))
-                recoil_along_y = float(np.dot(delta_vx, -n_xy))
-                if d_x_other < d_min - 1.5 and recoil_along_other >= recoil_along_y * 0.9:
-                    return False
-
-        # -----------------------------------------------------------------
-        # [방어 B] 뉴턴 제3법칙 운동량 보존 기반 적구 키스 충격량 차감
-        # -----------------------------------------------------------------
-        delta_vy_net = delta_vy.copy()
-        if d_y_other <= self.GRAY_ZONE_MAX_DIST:
-            other_pushed_y = float(np.dot(delta_v_other, -n_other_y)) > 18.0 and float(np.dot(delta_vy, n_other_y)) > 18.0
-            if other_pushed_y:
-                transferred_from_other = float(np.dot(-delta_v_other, n_other_y)) * n_other_y
-                delta_vy_net = delta_vy - transferred_from_other
-                if is_cue_second_target_check:
-                    self.object_ball_kiss_occurred = True
-                    self.last_object_kiss_time = t_eval
-
-        # -----------------------------------------------------------------
-        # [방어 C] 즉각 충격 일관성 검증 (미래 프레임 h[4]->h[5] 충돌의 역방향 누수 차단)
-        # -----------------------------------------------------------------
-        delta_vy_imm = vy_post_immediate - vy_pre
-        delta_vx_imm = vx_post_immediate - vx_pre
-
-        impulse_y_normal = float(np.dot(delta_vy_net, n_xy))
-        impulse_y_imm_normal = float(np.dot(delta_vy_imm, n_xy))
-        delta_vy_net_mag = float(np.linalg.norm(delta_vy_net))
-
-        recoil_x_normal = float(np.dot(delta_vx, -n_xy))
-        recoil_x_imm_normal = float(np.dot(delta_vx_imm, -n_xy))
-        deflection_deg_x = max(self._angle_between_deg(vx_pre, vx_post), kink_deg_x)
-
-        # [0쿠션 초기 그레이존 엄격화]
-        if (
-            is_cue_second_target_check
-            and self.cushion_count == 0
-            and self.first_target_hit_time is not None
-            and (t_eval - self.first_target_hit_time) <= 0.18
-        ):
-            if d_min > 64.0 and impulse_y_normal < 42.0:
-                return False
-
-        closing_speed = float(np.dot(vx_pre - vy_pre, n_xy))
-        if closing_speed < -15.0:
-            return False
-
-        x_deflected_off_other = (
-            (
-                d_x_other < d_min - 1.5
-                and float(np.dot(delta_vx, -n_x_other)) > max(recoil_x_normal * 0.85, 15.0)
-            )
-            or (
-                d_x_other <= 72.0
-                and float(np.linalg.norm(delta_v_other)) >= 35.0
-                and net_disp_mag_y < 3.0
-            )
-            or bc_kiss_this_frame
+        d_min, _, n_xy = self._subframe_ccd(
+            f_prev.pos[ball_x], f_curr.pos[ball_x], f_prev.pos[ball_y], f_curr.pos[ball_y]
         )
-        if x_deflected_off_other and net_disp_mag_y < 5.2:
+        max_allow_dist = 95.0 if subpixel_phase_hit else self.TARGET_APPROACH_ZONE_MM
+        if d_min > max_allow_dist:
             return False
 
-        y_impulse_is_immediate = (impulse_y_imm_normal >= impulse_y_normal * 0.35) or (impulse_y_imm_normal >= 15.0)
-        x_recoil_is_immediate = (recoil_x_imm_normal >= recoil_x_normal * 0.35) or (recoil_x_imm_normal >= 15.0)
-
-        speed_y_pre = float(np.linalg.norm(vy_pre))
-        recent_kiss_contaminating = (
-            self.object_ball_kiss_occurred
-            and (t_eval - self.last_object_kiss_time) <= 0.35
-        ) or (d_y_other <= self.GRAY_ZONE_MAX_DIST)
-
-        # -----------------------------------------------------------------
-        # [방어 D] 상태별 엄격한 물리 게이트 분기 (무조건 거리 통과 완전 폐지!)
-        # -----------------------------------------------------------------
-        # Case 1: 적구 간 키스가 있었거나, 제2적구(Y)가 이미 굴러가고 있는 상태 (speed_y_pre >= 35mm/s 등)
-        if is_cue_second_target_check and (speed_y_pre >= 20.0 or recent_kiss_contaminating):
-            deflection_deg_y = self._angle_between_deg(vy_pre, vy_post)
-            strong_y_kink = (
-                y_impulse_is_immediate
-                and impulse_y_normal >= 42.0
-                and (deflection_deg_y >= 4.0 or impulse_y_normal >= 85.0)
-                and d_min <= d_y_other + 2.0
-            )
-            mutual_action_reaction = (
-                y_impulse_is_immediate
-                and x_recoil_is_immediate
-                and impulse_y_normal >= 28.0
-                and recoil_x_normal >= 20.0
-                and (not x_near_rail)
-            )
-            if strong_y_kink or mutual_action_reaction:
+        # 1) 적구 간 키스(B <-> C) 판정인 경우:
+        if is_object_ball_kiss_check:
+            disp_b1 = float(np.linalg.norm(f_post2.pos[ball_x] - f_pre2.pos[ball_x]))
+            disp_b2 = float(np.linalg.norm(f_post2.pos[ball_y] - f_pre2.pos[ball_y]))
+            if d_min <= 66.0 and (disp_b1 >= 5.5 or disp_b2 >= 5.5):
                 self.pair_last_hit_time[pair_key] = t_eval
                 return True
             return False
 
-        # Case 2: 피타격구(Y)가 정지 상태(speed_y_pre < 35mm/s)일 때
-        # [증거 1] 피타격구(Y)가 실제 물리적 타격을 받아 정지 앵커 대비 영구 이동(>= 5.2mm)하고 법선 충격 속도가 발생했는가?
-        y_truly_moved = (
-            (
-                y_impulse_is_immediate
-                and net_disp_mag_y >= 5.2
-                and net_disp_along_normal_y >= 3.5
-                and delta_vy_net_mag >= 45.0
-                and impulse_y_normal >= 30.0
-            )
-            or (subpixel_phase_hit and d_min <= 68.0)
-        ) and (d_min <= d_y_other + 3.0)
-
-        # [증거 2] 목적구(Y)가 거의 안 밀린 얇은 스침(박박이)일 때, 수구(X)의 6프레임 직선이 실제로 부러졌는가?
-        # 단순 스핀 휘어짐이나 노이즈(1.8°)에 속지 않도록 실제 접촉 가능 거리(d_min <= 66.5mm) 내에서만 허용하되
-        # 직선 회귀 오차가 깨지고(line_rmse_x >= 1.6mm) 굴절각 >= 4.0° 이며 Y에도 최소한의 반작용 미동이 있을 때만 인정!
-        x_truly_deflected = (
-            d_min <= 66.5
-            and (not x_near_rail)
-            and (not x_deflected_off_other)
-            and x_recoil_is_immediate
-            and (impulse_y_normal >= 8.0 or net_disp_mag_y >= 1.0 or subpixel_phase_hit)
-            and (
-                (deflection_deg_x >= 4.0 and line_rmse_x >= 1.6 and recoil_x_normal >= 30.0)
-                or (d_min <= 62.5 and recoil_x_normal >= 60.0)
-            )
+        # 2) 수구(ball_x) <-> 목적구(ball_y) 충돌 판정:
+        # 제3의 공(other_ball)과의 거리 확인 (A -> B -> C 간접 연쇄 키스 및 3구 밀집 착시 차단)
+        d_x_other, _, _ = self._subframe_ccd(
+            f_prev.pos[ball_x], f_curr.pos[ball_x], f_prev.pos[other_ball], f_curr.pos[other_ball]
         )
-
-        # 정면 타격 후 수구 급정지 케이스 (d_min <= 60mm 이고 수구가 정면에서 급감속 정지)
-        head_on_stop_verified = (
-            d_min <= 60.0
-            and closing_speed >= 400.0
-            and recoil_x_normal >= closing_speed * 0.75
-            and float(np.linalg.norm(vx_post)) < 50.0
-            and (not recent_kiss_contaminating)
+        d_y_other, _, _ = self._subframe_ccd(
+            f_prev.pos[other_ball], f_curr.pos[other_ball], f_prev.pos[ball_y], f_curr.pos[ball_y]
         )
+        d_y_other_post = float(np.linalg.norm(f_post2.pos[ball_y] - f_post2.pos[other_ball]))
 
-        # [최종 판정] 시차로 인해 d_min <= 60mm로 겹쳐 보여도,
-        # 수구가 직진(not x_truly_deflected)하고 목적구도 제자리에 가만히(not y_truly_moved) 있으면 100% 노카운트(False)!
-        if y_truly_moved or x_truly_deflected or head_on_stop_verified:
+        # 만약 제2적구(ball_y) 판정인데, 제1적구(other_ball)가 ball_y에 밀착(<= 66mm)해 있으면서
+        # 수구(ball_x)가 제1적구(other_ball)에 더 먼저/가깝게 부딪혀 제1적구가 제2적구를 친 간접 연쇄 키스(Case 2)라면 기각!
+        if self.first_target_ball is not None and ball_y != self.first_target_ball:
+            if (
+                min(d_y_other, d_y_other_post) <= 66.0
+                and d_x_other <= 64.0
+                and d_x_other < d_min
+            ):
+                return False
+
+        # 근접 3프레임 전 위치(p_before)와 통과 2프레임 후 위치(p_after) 추출
+        p_y_before = f_pre2.pos[ball_y]
+        p_y_mid = f_prev.pos[ball_y]
+        p_y_after = f_post2.pos[ball_y]
+
+        dt_before = max(f_prev.t - f_pre2.t, 1e-4)
+        dt_total = max(f_post2.t - f_pre2.t, 1e-4)
+        v_y_before = (p_y_mid - p_y_before) / dt_before
+        speed_y_before = float(np.linalg.norm(v_y_before))
+
+        # ------------------------------------------------------------------
+        # [현상 A] 목적구 위치 이탈(Displacement) 확인
+        # ------------------------------------------------------------------
+        has_cue_vertex, cue_bend_deg = self._check_cue_polyline_vertex_at_target(
+            f_curr.pos[ball_y], f_pre2, f_prev, f_curr, f_post2, ball_x
+        )
+        recent_ob_kiss = abs(t_eval - self.last_object_kiss_time) <= 0.08
+
+        phenomenon_a_hit = False
+        if speed_y_before < 40.0 and not recent_ob_kiss:
+            # 목적구가 정지해 있었고 직전 적구 간 키스가 없었던 경우:
+            # 수구 통과 후 목적구가 정지 위치(p_y_before)로부터 5.5mm 이상 밀려났는지 확인!
+            net_disp_y = float(np.linalg.norm(p_y_after - p_y_before))
+            step_after_hit = float(np.linalg.norm(p_y_after - f_curr.pos[ball_y]))
+            if net_disp_y >= self.TARGET_MOVED_DISP_TH_MM and step_after_hit >= 1.5:
+                # 다른 목적구(other_ball)가 친 것이 아닌지 확인 (수구가 다른 목적구보다 더 가깝게 타격)
+                if d_min <= d_x_other + 6.0 or d_y_other > 68.0:
+                    phenomenon_a_hit = True
+        else:
+            # 목적구가 이미 적구 간 키스로 굴러가고 있거나 직전(0.08s 이내) 키스가 발생한 경우 (Case 1, Case 5, Case 7):
+            # 원래 등속 직진 예상 위치(expected_after) 대비 새로운 방향으로 12.0mm 이상 꺾여 밀려났고,
+            # 동시에 수구도 반작용으로 꼭짓점 굴절이 동반되었을 때만 진짜 타격으로 인정!
+            expected_y_after = p_y_before + v_y_before * dt_total
+            deviation_from_coast = float(np.linalg.norm(p_y_after - expected_y_after))
+            v_y_after = (p_y_after - f_curr.pos[ball_y]) / max(f_post2.t - f_curr.t, 1e-4)
+            y_bend_deg = self._angle_between_deg(v_y_before, v_y_after)
+            if (
+                deviation_from_coast >= 12.0
+                and y_bend_deg >= 8.0
+                and has_cue_vertex
+                and cue_bend_deg >= 5.5
+                and d_y_other > 68.0
+                and not recent_ob_kiss
+            ):
+                phenomenon_a_hit = True
+
+        # ------------------------------------------------------------------
+        # [현상 B] 목적구가 안 밀린 얇은 스침 (수구 꼭짓점 확인 또는 SubPixel 위상 진동)
+        # ------------------------------------------------------------------
+        phenomenon_b_hit = False
+        if subpixel_phase_hit and d_min <= 95.0 and d_y_other > 72.0:
+            phenomenon_b_hit = True
+        elif not phenomenon_a_hit and not recent_ob_kiss:
+            # 수구가 현재 레일 쿠션 반사 중인지 확인 (쿠션 옆 목적구 비접촉 반사 착시 Test 3 / Illusion 3 차단)
+            px, py = float(f_curr.pos[ball_x][0]), float(f_curr.pos[ball_x][1])
+            d_rail_now = min(px, TABLE_W - px, py, TABLE_H - py)
+            is_bouncing_on_rail = d_rail_now <= self.RAIL_ENTER_MARGIN
+
+            other_moved = float(np.linalg.norm(f_post2.pos[other_ball] - f_pre2.pos[other_ball])) >= 5.5
+
+            if self.first_target_ball is None:
+                # 제1적구 최초 타격 시:
+                # 1쿠션 넣어치기(Test 6)에서 쿠션 입사 꼭짓점(d_rail <= 45mm)일 때 바로 옆 정지 적구(disp < 2mm)를
+                # 쿠션보다 먼저 맞혔다고 오판하지 않도록, 레일 밀착 시에는 적구가 실제로 밀렸을 때만 인정
+                if (
+                    d_min <= self.THIN_HIT_MAX_DIST_MM
+                    and has_cue_vertex
+                    and (not is_bouncing_on_rail or float(np.linalg.norm(p_y_after - p_y_before)) >= 3.0)
+                ):
+                    phenomenon_b_hit = True
+            else:
+                # 제2적구 얇은 스침 시:
+                # 수구 꼭짓점이 목적구 옆(d_min <= 65.5mm)에서 4.2도 이상 꺾였고,
+                # 다른 목적구(제1적구)와 충돌한 것이 아니며(d_x_other > 72mm & not other_moved),
+                # 쿠션 반사 중이 아니고, 목적구도 최소 1.5mm 이상 움찔했을 때만 미세 스침으로 인정!
+                # 단, 목적구가 이미 적구 간 키스로 이동 중(speed_y_before >= 40.0)이라면
+                # 목적구의 진행 방향도 최소 3.5도 이상 꺾였을 때만 인정하여 이동 중 비접촉 통과 착시를 차단합니다.
+                net_disp_y = float(np.linalg.norm(p_y_after - p_y_before))
+                v_y_after = (p_y_after - f_curr.pos[ball_y]) / max(f_post2.t - f_curr.t, 1e-4)
+                y_bend_deg = (
+                    self._angle_between_deg(v_y_before, v_y_after)
+                    if speed_y_before >= 40.0
+                    else 999.0
+                )
+                if (
+                    d_min <= self.THIN_HIT_MAX_DIST_MM
+                    and has_cue_vertex
+                    and cue_bend_deg >= self.THIN_HIT_MIN_BEND_DEG
+                    and not is_bouncing_on_rail
+                    and d_x_other > 72.0
+                    and not other_moved
+                    and net_disp_y >= 1.5
+                    and y_bend_deg >= 3.5
+                ):
+                    phenomenon_b_hit = True
+
+        if phenomenon_a_hit or phenomenon_b_hit:
             self.pair_last_hit_time[pair_key] = t_eval
             return True
 
         return False
-
-    def _check_cushion_contact(
-        self,
-        t: float,
-        h2: FrameSnapshot,
-        h3: FrameSnapshot,
-        v_in: np.ndarray,
-        v_out: np.ndarray,
-        cue_color: BallColor,
-        min_dist_to_targets: float = 9999.0,
-    ) -> bool:
-        """
-        [쿠션 감지 알고리즘 고도화 (뱅크샷 선쿠션 분리 및 동일 레일/코너 잠금)]
-        1) 득점 확정(VALID_SCORE_PENDING 또는 score_dispatched) 이후에는 사후 쿠션 카운트 즉시 차단
-        2) 슈미트 트리거 히스테리시스(rail_armed) 및 동일 레일 심층 이탈 잠금(same_rail_locked: 220mm 이상 깊숙이 벗어날 때만 해제)
-        3) 코너 진입 시 2회 상한제(corner_bounce_count_in_zone <= 2) 및 최저 속도 게이트(MIN_CUSHION_SPEED = 65.0mm/s)
-        4) 광역 궤적 변곡점(Kinematic Bounce Apex): 54.0mm ~ 115.0mm 구간에서 v_norm_in < -60, v_norm_out > +45 및 목적구 거리 >= 90mm 시 인정
-        """
-        if self.state == ShotState.VALID_SCORE_PENDING or self.score_dispatched:
-            return False
-
-        p = h3.pos[cue_color]
-        rail_dists: Dict[Rail, float] = {
-            Rail.LEFT: float(p[0]),
-            Rail.RIGHT: float(TABLE_W - p[0]),
-            Rail.TOP: float(p[1]),
-            Rail.BOTTOM: float(TABLE_H - p[1]),
-        }
-
-        near_rails_count = sum(1 for r in Rail if rail_dists[r] <= 120.0)
-        if near_rails_count == 0:
-            self.corner_bounce_count_in_zone = 0
-
-        # ① 슈미트 트리거 히스테리시스 재장전 및 동일 레일 심층 이탈(220.0mm) 잠금 해제
-        dist_from_last_hit = (
-            float(np.linalg.norm(p - self.last_cushion_hit_pos))
-            if self.last_cushion_hit_pos is not None
-            else 9999.0
-        )
-        for r in Rail:
-            if not self.rail_armed[r]:
-                if rail_dists[r] >= self.RAIL_EXIT_HYSTERESIS or (
-                    rail_dists[r] > self.RAIL_ENTER_MARGIN and dist_from_last_hit >= self.MIN_RAIL_TRAVEL_DIST
-                ):
-                    self.rail_armed[r] = True
-            if self.same_rail_locked[r] and rail_dists[r] >= self.SAME_RAIL_DEEP_EXIT_MM:
-                self.same_rail_locked[r] = False
-
-        # 각 레일 기준 법선 속도 (레일로 접근할 때 음수 < 0, 레일에서 반사되어 나올 때 양수 > 0)
-        norm_vels: Dict[Rail, Tuple[float, float]] = {
-            Rail.LEFT: (float(v_in[0]), float(v_out[0])),
-            Rail.RIGHT: (float(-v_in[0]), float(-v_out[0])),
-            Rail.TOP: (float(v_in[1]), float(v_out[1])),
-            Rail.BOTTOM: (float(-v_in[1]), float(-v_out[1])),
-        }
-
-        # ② 최저 속도 게이트: 65.0mm/s 미만 저속 정지 임박 구간에서는 바운딩 박스 노이즈 쿠션 카운트 완전 차단
-        speed_max = max(float(np.linalg.norm(v_in)), float(np.linalg.norm(v_out)))
-        if speed_max < self.MIN_CUSHION_SPEED:
-            return False
-
-        # ③ 근접 진입 대역(<= 54.0mm) 및 광역 궤적 변곡점(54.0mm ~ 115.0mm) 후보 추출
-        current_zones: Set[Rail] = set()
-        kinematic_bounce_rails: Set[Rail] = set()
-        just_hit_target = (
-            self.first_target_hit_time is not None and abs(t - self.first_target_hit_time) <= 0.06
-        )
-
-        for r in Rail:
-            d_r = rail_dists[r]
-            vn_in, vn_out = norm_vels[r]
-            # (A) 근접 진입 대역 (<= 54.0mm): 접근 후 반사 또는 마진 진입
-            # [규칙 4-1] 제1적구 접촉 전(self.first_target_ball is None) 구간에서는 목적구 근접 마스킹(min_dist_to_targets >= 68/75mm)을 해제하여
-            # 제1적구가 쿠션 바로 근처에 서 있는 '1쿠션 넣어치기(원뱅크 걸어치기)'의 선행 1쿠션이 삭제되지 않도록 보장합니다.
-            if (
-                d_r <= self.RAIL_ENTER_MARGIN
-                and (vn_in < -15.0 or vn_out > 15.0)
-                and (self.first_target_ball is None or min_dist_to_targets >= 68.0 or d_r <= 42.0)
-                and (not just_hit_target or d_r <= 42.0)
-            ):
-                current_zones.add(r)
-            # (B) 광역 궤적 변곡점 대역 (<= 115.0mm): 법선 속도 부호 반전(vn_in < -60, vn_out > +45)
-            # 제1적구 접촉 전(self.first_target_ball is None)에는 목적구 근접 마스킹을 해제합니다.
-            if (
-                d_r <= self.RAIL_KINEMATIC_ZONE
-                and vn_in < -60.0
-                and vn_out > 45.0
-                and (self.first_target_ball is None or min_dist_to_targets >= 90.0)
-            ):
-                current_zones.add(r)
-                kinematic_bounce_rails.add(r)
-
-        newly_entered = current_zones - self.in_rail_zone
-        candidate_rails = newly_entered | (kinematic_bounce_rails & {r for r in Rail if self.rail_armed[r]})
-        self.in_rail_zone = current_zones
-
-        # ④ 쿠션 카운트 반영 (동일 레일 교차 잠금 + 코너 2회 상한 적용)
-        for rail in candidate_rails:
-            if not self.rail_armed[rail] or self.same_rail_locked[rail]:
-                continue
-            if (t - self.per_rail_last_time[rail]) < self.PER_RAIL_COOLDOWN_SEC:
-                continue
-            if near_rails_count >= 2 and self.corner_bounce_count_in_zone >= 2:
-                continue
-
-            cur_travel = (
-                float(np.linalg.norm(p - self.last_cushion_hit_pos))
-                if self.last_cushion_hit_pos is not None
-                else 9999.0
-            )
-            vn_in, vn_out = norm_vels[rail]
-            has_true_normal_reversal = (vn_in < -45.0) and (vn_out > 35.0)
-
-            # 직전 타격 레일과 동일한 레일은 다른 레일이나 목적구 충돌 또는 220mm 심층 이탈 전까지 연속 카운트 원천 차단
-            if rail == self.last_rail_hit:
-                continue
-
-            # 코너 핑퐁 방지: 서로 다른 레일 간에도 최소 이동 변위(22.0mm) 또는 실제 법선 속도 반전이 확인될 때만 카운트
-            if (
-                rail != self.last_rail_hit
-                and self.last_cushion_hit_pos is not None
-                and cur_travel < self.CORNER_MIN_TRAVEL_DIST
-                and not has_true_normal_reversal
-            ):
-                continue
-
-            self._increment_cushion(t, rail, p, rail_dists[rail], h3.frame_idx, near_rails_count)
-
-        normal_flipped = (v_in[0] * v_out[0] < -100.0) or (v_in[1] * v_out[1] < -100.0)
-        if len(current_zones) > 0 and normal_flipped:
-            self.last_impulse_frame[cue_color] = h3.frame_idx
-        return ((len(current_zones) > 0) and normal_flipped) or ((t - self.last_rail_time) <= 0.10)
-
-    def _retroactive_cushion_audit(self) -> int:
-        """
-        [④ 궤적 역추적 쿠션 복원 (Retroactive Bounce Audit)]
-        제2적구 접촉 순간 self.cushion_count < 3 일 때 즉시 NO_SCORE_LOCKED로 죽이지 않고,
-        지금까지 기록된 cue_trajectory_log에서 가장자리(135.0mm 이내) 법선 속도 반전(변곡점) 횟수를
-        역추적 재검산하여 누락된 쿠션을 복원합니다.
-        """
-        log = self.cue_trajectory_log
-        if len(log) < 3:
-            return self.cushion_count
-
-        AUDIT_ZONE = 135.0
-        audited_count = 0
-        audit_armed: Dict[Rail, bool] = {r: True for r in Rail}
-        audit_last_t: Dict[Rail, float] = {r: -999.0 for r in Rail}
-        audit_last_pos: Optional[np.ndarray] = None
-        audit_last_rail: Optional[Rail] = None
-
-        for idx in range(1, len(log) - 1):
-            t_cur, p_cur, _, min_t_dist = log[idx]
-            p_prev = log[idx - 1][1]
-            p_next = log[idx + 1][1]
-            dt1 = max(log[idx][0] - log[idx - 1][0], 1e-4)
-            dt2 = max(log[idx + 1][0] - log[idx][0], 1e-4)
-            v_in = (p_cur - p_prev) / dt1
-            v_out = (p_next - p_cur) / dt2
-
-            if max(float(np.linalg.norm(v_in)), float(np.linalg.norm(v_out))) < self.MIN_CUSHION_SPEED:
-                continue
-
-            r_dists = {
-                Rail.LEFT: float(p_cur[0]),
-                Rail.RIGHT: float(TABLE_W - p_cur[0]),
-                Rail.TOP: float(p_cur[1]),
-                Rail.BOTTOM: float(TABLE_H - p_cur[1]),
-            }
-            for r in Rail:
-                if not audit_armed[r] and r_dists[r] >= self.RAIL_EXIT_HYSTERESIS:
-                    audit_armed[r] = True
-
-            if min_t_dist < 85.0:
-                continue
-
-            n_vels = {
-                Rail.LEFT: (float(v_in[0]), float(v_out[0])),
-                Rail.RIGHT: (float(-v_in[0]), float(-v_out[0])),
-                Rail.TOP: (float(v_in[1]), float(v_out[1])),
-                Rail.BOTTOM: (float(-v_in[1]), float(-v_out[1])),
-            }
-            for r in Rail:
-                if not audit_armed[r]:
-                    continue
-                if r_dists[r] > AUDIT_ZONE:
-                    continue
-                vn_in, vn_out = n_vels[r]
-                if vn_in < -45.0 and vn_out > 35.0:
-                    if (t_cur - audit_last_t[r]) < self.PER_RAIL_COOLDOWN_SEC:
-                        continue
-                    travel = (
-                        float(np.linalg.norm(p_cur - audit_last_pos))
-                        if audit_last_pos is not None
-                        else 9999.0
-                    )
-                    if r == audit_last_rail and travel < self.MIN_RAIL_TRAVEL_DIST:
-                        continue
-                    if r != audit_last_rail and audit_last_pos is not None and travel < self.CORNER_MIN_TRAVEL_DIST:
-                        continue
-                    audited_count += 1
-                    audit_armed[r] = False
-                    audit_last_t[r] = t_cur
-                    audit_last_pos = p_cur.copy()
-                    audit_last_rail = r
-
-        return max(self.cushion_count, audited_count)
 
     def _register_cue_target_hit(
         self,
         t: float,
         target_color: BallColor,
         n_ab: np.ndarray,
-        v_pre: Dict[BallColor, np.ndarray],
-        v_post2: Dict[BallColor, np.ndarray]
-    ):
-        # [규칙 4-3] 목적구 접촉 시 모든 레일의 쿨다운, 동일 레일 잠금(same_rail_locked), 무장 상태(rail_armed), 진입 구역 즉시 초기화
-        for r in Rail:
-            self.same_rail_locked[r] = False
-            self.rail_armed[r] = True
-            self.per_rail_last_time[r] = -999.0
-        self.in_rail_zone.clear()
-        self.last_rail_hit = None
-        self.last_cushion_hit_pos = None
-        self.corner_bounce_count_in_zone = 0
-
+        f_prev: FrameSnapshot,
+        f_curr: FrameSnapshot,
+        f_post2: FrameSnapshot,
+    ) -> None:
+        """
+        [원리 4: 뱅크샷(1쿠션 넣어치기 포함) 및 제2적구 충돌 즉시 득점]
+        """
         if self.first_target_ball is None:
-            cue_c = self.active_cue_ball or self.assigned_cue_ball
-            # [규칙 4-2] 초구 스트로크 직선 대비 꺾임(Initial Stroke Ray Deflection)을 통한 '1쿠션 넣어치기(원뱅크)' 기하학적 보장:
-            # 아직 cushions_before_first_hit == 0 으로 집계되었더라도,
-            # 수구가 제1적구에 닿기 전까지 쿠션 경계 대역(130.0mm 이내)을 거치면서
-            # 1) 초기 출발 방향(initial_stroke_dir)과 제1적구 타격 직전 속도 벡터 사이의 각도가 8.0도 이상 꺾였거나,
-            # 2) 초기 출발 직선(stroke_origin_pos + s * initial_stroke_dir)으로부터 제1적구 중심까지의 수직 거리(Impact Parameter)가 72.0mm를 초과하여
-            #    직선으로는 절대 제1적구를 맞힐 수 없고 쿠션을 한 번 맞고 굴절되어야만 맞힐 수 있는 궤적이었다면 1쿠션 넣어치기로 복원!
-            if (
-                self.cushions_before_first_hit == 0
-                and cue_c is not None
-                and self.stroke_origin_pos is not None
-                and self.initial_stroke_dir is not None
-            ):
-                curr_target_pos = (
-                    self.history[-1].pos[target_color]
-                    if len(self.history) >= 1 and target_color in self.history[-1].pos
-                    else self.initial_positions.get(target_color)
-                )
-                min_rail_d = self.min_rail_dist_before_first_hit
-                for snap_h in self.history:
-                    if cue_c in snap_h.pos:
-                        ph = snap_h.pos[cue_c]
-                        dr = min(float(ph[0]), float(TABLE_W - ph[0]), float(ph[1]), float(TABLE_H - ph[1]))
-                        if dr < min_rail_d:
-                            min_rail_d = dr
-
-                if min_rail_d <= 130.0:
-                    v_hit_pre = v_pre.get(cue_c, np.zeros(2, dtype=np.float64))
-                    deflection_from_init = 0.0
-                    if float(np.linalg.norm(v_hit_pre)) >= 20.0:
-                        cos_init = float(
-                            np.clip(
-                                np.dot(
-                                    self.initial_stroke_dir,
-                                    v_hit_pre / float(np.linalg.norm(v_hit_pre)),
-                                ),
-                                -1.0,
-                                1.0,
-                            )
-                        )
-                        deflection_from_init = float(np.degrees(np.arccos(cos_init)))
-
-                    impact_param = 0.0
-                    if curr_target_pos is not None:
-                        vec_to_target = curr_target_pos - self.stroke_origin_pos
-                        proj_s = float(np.dot(vec_to_target, self.initial_stroke_dir))
-                        perp_vec = vec_to_target - proj_s * self.initial_stroke_dir
-                        impact_param = float(np.linalg.norm(perp_vec))
-                        if proj_s < -10.0:
-                            impact_param = max(impact_param, 100.0)
-
-                    if deflection_from_init >= 8.0 or impact_param > 72.0:
-                        self.cushions_before_first_hit = 1
-                        self.cushion_count = max(1, self.cushion_count)
-                        self.is_bank_shot = True
-                        self.event_log.append(
-                            f"[{t:.2f}s] [1쿠션 넣어치기 기하학적 복원] 선쿠션 1회 확정 "
-                            f"(min_rail={min_rail_d:.1f}mm, angle={deflection_from_init:.1f}°, impact_param={impact_param:.1f}mm)"
-                        )
-
             self.first_target_ball = target_color
             self.first_target_hit_time = t
+            self.first_target_hit_path_idx = max(0, len(self.cue_path) - 3)
             self.first_target_normal = n_ab
+
+            # 1쿠션 넣어치기(원뱅크 걸어치기) 기하학적 보장:
+            # 제1적구 접촉 전 수구가 쿠션 대역(<= 130.0mm)에 진입한 적이 있고,
+            # 초기 스트로크 방향 직선이 제1적구 중심을 비껴나(impact_param > 45.0mm 또는 굴절 >= 8.0도)
+            # 쿠션을 먼저 맞고 들어온 궤적이면 선쿠션 1회를 보장합니다.
+            cue_c = self.active_cue_ball or self.assigned_cue_ball
+            if (
+                cue_c is not None
+                and self.stroke_origin_pos is not None
+                and self.initial_stroke_dir is not None
+                and self.min_rail_dist_before_first_hit <= 130.0
+            ):
+                t1_init = self.initial_positions.get(target_color, f_curr.pos[target_color])
+                to_t1 = t1_init - self.stroke_origin_pos
+                proj_s = float(np.dot(to_t1, self.initial_stroke_dir))
+                perp_vec = to_t1 - proj_s * self.initial_stroke_dir
+                impact_param = float(np.linalg.norm(perp_vec)) if proj_s > 0.0 else 999.0
+
+                vec_to_hit = f_curr.pos[cue_c] - self.stroke_origin_pos
+                deflect_init = self._angle_between_deg(self.initial_stroke_dir, vec_to_hit)
+                if deflect_init >= 8.0 or impact_param > 45.0:
+                    self._geom_one_bank_recovered = True
+
+            self._update_polyline_cushion_counts(self.first_target_hit_path_idx)
             if self.cushions_before_first_hit >= 1:
                 self.is_bank_shot = True
+
             self.event_log.append(
                 f"[{t:.2f}s] 제1적구 접촉 ({target_color.name}, 선쿠션: {self.cushions_before_first_hit}, 총쿠션: {self.cushion_count})"
             )
-            self._check_double_hit_foul(t, v_pre, v_post2, self.history[-1])
-        elif target_color == self.first_target_ball:
-            self.event_log.append(f"[{t:.2f}s] [수구-제1적구 재키스] {target_color.name} 재접촉 (득점 무관)")
-        elif self.second_target_ball is None:
-            # 제2적구 접촉 순간 cushion_count < 3 이라면 역추적 구제(_retroactive_cushion_audit) 실행!
-            if self.cushion_count < 3:
-                audited_count = self._retroactive_cushion_audit()
-                if audited_count > self.cushion_count:
-                    diff = audited_count - self.cushion_count
-                    self.event_log.append(
-                        f"[{t:.2f}s] [궤적 역추적 쿠션 복원] 누락 쿠션 복구 ({self.cushion_count}회 -> {audited_count}회)"
-                    )
-                    self.cushions_after_first_hit += diff
-                    self.cushion_count = self.cushions_before_first_hit + self.cushions_after_first_hit
+            self._check_double_hit_foul(t, f_prev, f_curr, f_post2)
 
+        elif target_color == self.first_target_ball:
+            self.event_log.append(
+                f"[{t:.2f}s] [수구-제1적구 재키스] {target_color.name} 재접촉 (득점 무관)"
+            )
+
+        elif self.second_target_ball is None:
+            # 제2적구 최초 충돌 확정 순간 폴리라인 쿠션 꼭짓점 개수를 최종 집계
+            self._update_polyline_cushion_counts()
             self.second_target_ball = target_color
-            # 득점 즉시 쿠션 수 동결(Freeze): 제2적구 충돌 시점의 쿠션 수로 확정
             self.cushions_at_second_hit = self.cushion_count
+
             if self.state == ShotState.IN_PLAY:
                 if self.cushion_count >= 3 and not self.double_hit_foul:
                     self.state = ShotState.VALID_SCORE_PENDING
-                    self.is_bank_shot = (self.cushions_before_first_hit >= 1)
+                    self.is_bank_shot = self.cushions_before_first_hit >= 1
                     self.event_log.append(
                         f"[{t:.2f}s] ★ 제2적구 정상 접촉 ({target_color.name}) -> 충돌 즉시 실시간 득점(+1) 발송!"
                     )
@@ -1593,36 +1002,49 @@ class CausalKissSafeFSM:
                             self.on_immediate_score(instant_result)
                 else:
                     self.state = ShotState.NO_SCORE_LOCKED
-                    self.fail_reason = f"EARLY_SECOND_BALL_KISS (쿠션 {self.cushion_count}회 < 3회)"
-                    self.event_log.append(f"[{t:.2f}s] ✖ 제2적구 조기 키스 ({target_color.name}) -> 노카운트 잠금")
+                    self.fail_reason = (
+                        f"EARLY_SECOND_BALL_KISS (쿠션 {self.cushion_count}회 < 3회)"
+                    )
+                    self.event_log.append(
+                        f"[{t:.2f}s] ✖ 제2적구 조기 키스 ({target_color.name}) -> 노카운트 잠금"
+                    )
 
     def _check_double_hit_foul(
         self,
         t_eval: float,
-        v_pre: Dict[BallColor, np.ndarray],
-        v_post2: Dict[BallColor, np.ndarray],
-        h5: FrameSnapshot
-    ):
-        if self.double_hit_foul or self.active_cue_ball is None or self.first_target_ball is None:
-            return
-        if self.first_target_hit_time is None or self.first_target_normal is None:
+        f_prev: FrameSnapshot,
+        f_curr: FrameSnapshot,
+        f_post2: FrameSnapshot,
+    ) -> None:
+        """수구와 제1적구가 근접(<= 115mm)해 있을 때 발생하는 투터치(밀어치기) 파울을 감지합니다."""
+        if (
+            self.double_hit_foul
+            or self.active_cue_ball is None
+            or self.first_target_ball is None
+            or self.first_target_hit_time is None
+            or self.first_target_normal is None
+        ):
             return
         if (self.first_target_hit_time - self.stroke_start_time) > self.DOUBLE_HIT_WINDOW_SEC:
             return
-        if not (0.0 <= (t_eval - self.first_target_hit_time) <= 0.08):
+        if not (0.0 <= (t_eval - self.first_target_hit_time) <= 0.09):
             return
 
         cue = self.active_cue_ball
         target = self.first_target_ball
         if cue in self.initial_positions and target in self.initial_positions:
-            init_dist = float(np.linalg.norm(self.initial_positions[target] - self.initial_positions[cue]))
+            init_dist = float(
+                np.linalg.norm(self.initial_positions[target] - self.initial_positions[cue])
+            )
             if init_dist > self.DOUBLE_HIT_INIT_DIST_MAX:
                 return
 
-        v_cue_pre = v_pre[cue]
-        v_cue_post = v_post2[cue]
-        v_target_post = v_post2[target]
-        acc_cue = h5.acc[cue]
+        dt_pre = max(f_curr.t - f_prev.t, 1e-4)
+        dt_post = max(f_post2.t - f_curr.t, 1e-4)
+        v_cue_pre = (f_curr.pos[cue] - f_prev.pos[cue]) / dt_pre
+        v_cue_post = (f_post2.pos[cue] - f_curr.pos[cue]) / dt_post
+        v_target_post = (f_post2.pos[target] - f_curr.pos[target]) / dt_post
+        acc_cue = f_post2.acc[cue]
         n_ab = self.first_target_normal
 
         speed_cue_post = float(np.linalg.norm(v_cue_post))
@@ -1631,10 +1053,17 @@ class CausalKissSafeFSM:
 
         forward_reaccel = float(np.dot(acc_cue, v_cue_post / speed_cue_post))
         normal_reaccel = float(np.dot(acc_cue, n_ab))
-        is_reaccelerating = (forward_reaccel > self.DOUBLE_HIT_REACCEL_THRESH) and (normal_reaccel > self.DOUBLE_HIT_REACCEL_THRESH * 0.7)
+        is_reaccelerating = (
+            forward_reaccel > self.DOUBLE_HIT_REACCEL_THRESH
+            and normal_reaccel > self.DOUBLE_HIT_REACCEL_THRESH * 0.7
+        )
 
         pre_speed = float(np.linalg.norm(v_cue_pre))
-        head_on_cos = float(np.dot(v_cue_pre / max(pre_speed, 1e-6), n_ab)) if pre_speed > 50.0 else 0.0
+        head_on_cos = (
+            float(np.dot(v_cue_pre / max(pre_speed, 1e-6), n_ab))
+            if pre_speed > 50.0
+            else 0.0
+        )
         cue_normal_v_post = float(np.dot(v_cue_post, n_ab))
         target_normal_v_post = float(np.dot(v_target_post, n_ab))
 
@@ -1648,16 +1077,463 @@ class CausalKissSafeFSM:
             self.double_hit_foul = True
             self.state = ShotState.NO_SCORE_LOCKED
             self.fail_reason = "DOUBLE_HIT_FOUL (투터치/밀어치기 파울)"
-            self.event_log.append(f"[{t_eval:.2f}s] ✖ 파울 감지: 투터치(Double Hit) 확정 -> NO_SCORE_LOCKED 전환")
+            self.event_log.append(
+                f"[{t_eval:.2f}s] ✖ 파울 감지: 투터치(Double Hit) 확정 -> NO_SCORE_LOCKED 전환"
+            )
+
+    def _evaluate_frame_with_context(
+        self, subpixel_impacts: Optional[Dict[BallColor, bool]] = None
+    ) -> None:
+        """
+        매 프레임 5프레임 컨텍스트(충돌 3프레임 전 ~ 충돌 2프레임 후)를 이용해
+        1) 적구 간 키스 및 ID 스왑 복원
+        2) 수구-목적구 충돌 판정 (원리 3)
+        3) 폴리라인 꼭짓점 기반 쿠션 카운트 (원리 2)
+        4) 투터치 파울 검사
+        를 순서대로 수행합니다.
+        """
+        if self.score_dispatched or self.active_cue_ball is None or len(self.history) < 3:
+            return
+
+        f_pre2 = self.history[-5] if len(self.history) >= 5 else self.history[0]
+        f_prev = self.history[-4] if len(self.history) >= 4 else self.history[-2]
+        f_curr = self.history[-3] if len(self.history) >= 3 else self.history[-1]
+        f_post2 = self.history[-1]
+        t_eval = f_curr.t
+        cue_color = self.active_cue_ball
+
+        other_balls = [c for c in BallColor if c != cue_color]
+        b1, b2 = other_balls[0], other_balls[1]
+
+        # [Step 0] 적구 정면 키스 시 트래커 ID 스왑(자리바꿈 키스) 감지 및 역스왑
+        self._detect_and_fix_kiss_id_swap(t_eval, b1, b2)
+
+        # [Step 1] 적구 간 키스 감지 (B <-> C)
+        if self._verify_pair_collision(
+            ball_x=b1,
+            ball_y=b2,
+            f_pre2=f_pre2,
+            f_prev=f_prev,
+            f_curr=f_curr,
+            f_post2=f_post2,
+            other_ball=cue_color,
+            is_object_ball_kiss_check=True,
+        ):
+            self.object_ball_kiss_occurred = True
+            self.last_object_kiss_time = t_eval
+            self.event_log.append(
+                f"[{t_eval:.2f}s] [적구 간 키스 감지] {b1.name} <-> {b2.name}"
+            )
+
+        # [Step 2] 폴리라인 꼭짓점 쿠션 카운트 최신화
+        self._update_polyline_cushion_counts()
+
+        # [Step 3] 수구-목적구 충돌 감지 (원리 3: 목적구 위치 이탈 OR 확실한 꼭짓점 굴절)
+        sorted_targets = sorted(
+            other_balls,
+            key=lambda c: 0 if c == self.first_target_ball else 1,
+        )
+        eval_subpixel = f_curr.subpixel_impacts or subpixel_impacts or {}
+
+        for target_color in sorted_targets:
+            third_ball = b2 if target_color == b1 else b1
+            sp_hit = bool(eval_subpixel.get(target_color, False))
+            if self._verify_pair_collision(
+                ball_x=cue_color,
+                ball_y=target_color,
+                f_pre2=f_pre2,
+                f_prev=f_prev,
+                f_curr=f_curr,
+                f_post2=f_post2,
+                other_ball=third_ball,
+                subpixel_phase_hit=sp_hit,
+                is_object_ball_kiss_check=False,
+            ):
+                _, _, n_ab = self._subframe_ccd(
+                    f_prev.pos[cue_color],
+                    f_curr.pos[cue_color],
+                    f_prev.pos[target_color],
+                    f_curr.pos[target_color],
+                )
+                self._register_cue_target_hit(
+                    t_eval, target_color, n_ab, f_prev, f_curr, f_post2
+                )
+
+        # [Step 4] 투터치 파울 검사
+        if not self.score_dispatched:
+            self._check_double_hit_foul(t_eval, f_prev, f_curr, f_post2)
+
+    def update(
+        self,
+        t: float,
+        coords_mm: Dict[BallColor, Optional[Tuple[float, float]]],
+        subpixel_impacts: Optional[Dict[BallColor, bool]] = None,
+        intra_frame_rail_bounce: bool = False,
+    ) -> Optional[ShotResult]:
+        """
+        매 프레임 3구 좌표를 입력받아 4대 원리에 따라 3쿠션 득점 여부를 판정합니다.
+        제2적구 충돌로 3쿠션 득점이 확정되는 순간 즉시 ShotResult를 반환합니다.
+        """
+        stabilized = self._stabilize_blob_merging(t, coords_mm)
+        if stabilized is None:
+            return None
+        pos_map, gpt_vel_override = stabilized
+
+        vel_map: Dict[BallColor, np.ndarray] = {}
+        acc_map: Dict[BallColor, np.ndarray] = {}
+
+        for c in BallColor:
+            p = pos_map[c]
+            if c in self.prev_raw_pos:
+                p_prev, t_prev = self.prev_raw_pos[c]
+                dt = max(t - t_prev, 1e-4)
+                raw_v = (
+                    gpt_vel_override[c]
+                    if gpt_vel_override[c] is not None
+                    else (p - p_prev) / dt
+                )
+                if self.centroid_clamp_cooldown[c] > 0:
+                    self.centroid_clamp_cooldown[c] -= 1
+                    ema_v = self.prev_ema_vel[c].copy()
+                else:
+                    ema_v = 0.65 * raw_v + 0.35 * self.prev_ema_vel[c]
+                acc_map[c] = (ema_v - self.prev_ema_vel[c]) / dt
+                vel_map[c] = ema_v
+                self.prev_ema_vel[c] = ema_v
+            else:
+                vel_map[c] = np.zeros(2, dtype=np.float64)
+                acc_map[c] = np.zeros(2, dtype=np.float64)
+                self.prev_ema_vel[c] = np.zeros(2, dtype=np.float64)
+
+            self.prev_raw_pos[c] = (p, t)
+            self.gpt_buffers[c].append(
+                [float(p[0]), float(p[1]), float(vel_map[c][0]), float(vel_map[c][1])]
+            )
+
+        self.frame_counter += 1
+        self.history.append(
+            FrameSnapshot(
+                frame_idx=self.frame_counter,
+                t=t,
+                pos=pos_map,
+                vel=vel_map,
+                acc=acc_map,
+                subpixel_impacts=dict(subpixel_impacts) if subpixel_impacts else {},
+                intra_frame_rail_bounce=bool(intra_frame_rail_bounce),
+            )
+        )
+
+        # ------------------------------------------------------------------
+        # [원리 1] IDLE 상태에서 정지 위치(rest_pos) 기록 및 가장 먼저 출발한 수구(WHITE/YELLOW) 결정
+        # ------------------------------------------------------------------
+        if self.state == ShotState.IDLE:
+            for c in BallColor:
+                spd_c = float(np.linalg.norm(vel_map[c]))
+                if c not in self.rest_pos:
+                    prev_s = self.history[-2] if len(self.history) >= 2 else self.history[-1]
+                    self.rest_pos[c] = prev_s.pos[c].copy()
+                elif spd_c < 20.0:
+                    self.rest_pos[c] = 0.85 * self.rest_pos[c] + 0.15 * pos_map[c]
+
+            all_colors = list(BallColor)
+            min_pair_dist = min(
+                float(np.linalg.norm(pos_map[all_colors[i]] - pos_map[all_colors[j]]))
+                for i in range(3)
+                for j in range(i + 1, 3)
+            )
+            if min_pair_dist >= 66.0:
+                for cand_c in (BallColor.WHITE, BallColor.YELLOW):
+                    cand_spd = float(np.linalg.norm(vel_map[cand_c]))
+                    cand_anc = self.rest_pos.get(cand_c, self.history[0].pos[cand_c])
+                    cand_disp = float(np.linalg.norm(pos_map[cand_c] - cand_anc))
+                    if cand_disp >= 12.0 and cand_spd >= 65.0:
+                        if self.onset_candidate_time.get(cand_c) is None:
+                            self.onset_candidate_time[cand_c] = t
+                        if self.first_mover_from_idle is None:
+                            self.first_mover_from_idle = cand_c
+                    elif cand_disp < 8.0 and cand_spd < 35.0:
+                        self.onset_candidate_time[cand_c] = None
+                        if self.first_mover_from_idle == cand_c:
+                            other_cand = (
+                                BallColor.YELLOW
+                                if cand_c == BallColor.WHITE
+                                else BallColor.WHITE
+                            )
+                            self.first_mover_from_idle = (
+                                other_cand
+                                if self.onset_candidate_time.get(other_cand) is not None
+                                else None
+                            )
+
+            min_disp_req = self.MIN_STROKE_DISP_MM if len(self.history) >= 4 else 6.0
+            cand_ready: List[BallColor] = []
+            for cand_c in (BallColor.WHITE, BallColor.YELLOW):
+                c_spd = float(np.linalg.norm(vel_map[cand_c]))
+                c_anc = self.rest_pos.get(cand_c, self.history[0].pos[cand_c])
+                c_disp = float(np.linalg.norm(pos_map[cand_c] - c_anc))
+                if c_spd >= self.STROKE_START_SPEED and c_disp >= min_disp_req:
+                    cand_ready.append(cand_c)
+
+            cue = self.assigned_cue_ball
+            stroke_started = False
+            occluded_first_hit_target: Optional[BallColor] = None
+
+            if cand_ready:
+                stroke_started = True
+                if not self.turn_locked_by_previous_shot:
+                    if self.first_mover_from_idle in cand_ready:
+                        cue = self.first_mover_from_idle
+                    elif (
+                        self.first_mover_from_idle is not None
+                        and self.onset_candidate_time.get(self.first_mover_from_idle)
+                        is not None
+                    ):
+                        cue = self.first_mover_from_idle
+                    elif len(cand_ready) == 1:
+                        cue = cand_ready[0]
+                    else:
+                        d_w = float(
+                            np.linalg.norm(
+                                pos_map[BallColor.WHITE] - self.rest_pos[BallColor.WHITE]
+                            )
+                        )
+                        d_y = float(
+                            np.linalg.norm(
+                                pos_map[BallColor.YELLOW] - self.rest_pos[BallColor.YELLOW]
+                            )
+                        )
+                        cue = BallColor.WHITE if d_w >= d_y else BallColor.YELLOW
+                    self.assigned_cue_ball = cue
+                else:
+                    if self.assigned_cue_ball in cand_ready:
+                        cue = self.assigned_cue_ball
+                    elif (
+                        self.first_mover_from_idle == self.assigned_cue_ball
+                        and self.onset_candidate_time.get(self.assigned_cue_ball)
+                        is not None
+                    ):
+                        cue = self.assigned_cue_ball
+                    else:
+                        other_cue = cand_ready[0]
+                        assigned_anc = self.rest_pos.get(
+                            self.assigned_cue_ball, pos_map[self.assigned_cue_ball]
+                        )
+                        assigned_disp = float(
+                            np.linalg.norm(pos_map[self.assigned_cue_ball] - assigned_anc)
+                        )
+                        if (
+                            min_pair_dist >= 66.0
+                            and assigned_disp < 8.0
+                            and self.first_mover_from_idle == other_cue
+                        ):
+                            cue = other_cue
+                            self.assigned_cue_ball = other_cue
+                        else:
+                            cue = self.assigned_cue_ball
+                            occluded_first_hit_target = other_cue
+            else:
+                red_spd = float(np.linalg.norm(vel_map[BallColor.RED]))
+                red_anchor = self.rest_pos.get(BallColor.RED, self.history[0].pos[BallColor.RED])
+                red_disp = float(np.linalg.norm(pos_map[BallColor.RED] - red_anchor))
+                if red_spd >= 350.0 and red_disp >= 35.0:
+                    stroke_started = True
+                    cue = self.first_mover_from_idle or self.assigned_cue_ball
+                    self.assigned_cue_ball = cue
+                    occluded_first_hit_target = BallColor.RED
+
+            if stroke_started:
+                cue_anchor = self.rest_pos.get(cue, self.history[0].pos[cue])
+                cue_disp = float(np.linalg.norm(pos_map[cue] - cue_anchor))
+                saved_anchors = {
+                    c: self.rest_pos[c].copy() for c in BallColor if c in self.rest_pos
+                }
+                self._reset_shot()
+                self.shot_seq_id += 1
+                self.stroke_start_time = t
+                self.active_cue_ball = cue
+                self.assigned_cue_ball = cue
+                self.state = ShotState.IN_PLAY
+                prev_snap = self.history[-2] if len(self.history) >= 2 else self.history[-1]
+                self.initial_positions = (
+                    saved_anchors
+                    if len(saved_anchors) == 3
+                    else {c: prev_snap.pos[c].copy() for c in BallColor}
+                )
+                for c_k, p_init in self.initial_positions.items():
+                    self.rest_pos[c_k] = p_init.copy()
+
+                cue_init_p = self.initial_positions[cue]
+                self.stroke_origin_pos = cue_init_p.copy()
+                init_vec = pos_map[cue] - self.stroke_origin_pos
+                init_norm = float(np.linalg.norm(init_vec))
+                if init_norm >= 5.0:
+                    self.initial_stroke_dir = init_vec / init_norm
+                self._initial_stroke_samples = [pos_map[cue].copy()]
+
+                # 출발 직전 히스토리 프레임을 cue_path에 적재하여 초구 1쿠션 뱅크샷 꼭짓점이 누락되지 않도록 보존
+                other_cs = [c for c in BallColor if c != cue]
+                for s_h in self.history:
+                    p_h = s_h.pos[cue]
+                    d_r_h = min(
+                        float(p_h[0]),
+                        float(TABLE_W - p_h[0]),
+                        float(p_h[1]),
+                        float(TABLE_H - p_h[1]),
+                    )
+                    if d_r_h < self.min_rail_dist_before_first_hit:
+                        self.min_rail_dist_before_first_hit = d_r_h
+                    min_d_t = min(
+                        float(np.linalg.norm(p_h - s_h.pos[oc])) for oc in other_cs
+                    )
+                    self.cue_path.append(
+                        CuePathPoint(
+                            frame_idx=s_h.frame_idx,
+                            t=s_h.t,
+                            pos=p_h.copy(),
+                            min_dist_to_targets=min_d_t,
+                            intra_frame_v_bounce=s_h.intra_frame_rail_bounce,
+                        )
+                    )
+                    for bc in BallColor:
+                        self.all_ball_paths[bc].append(
+                            (s_h.frame_idx, s_h.t, s_h.pos[bc].copy())
+                        )
+
+                self.initial_ball_distances = {
+                    c: float(np.linalg.norm(self.initial_positions[c] - cue_init_p))
+                    for c in BallColor
+                    if c != cue
+                }
+                self.cue_total_travel_mm = max(
+                    cue_disp,
+                    150.0 if occluded_first_hit_target is not None else cue_disp,
+                )
+
+                if occluded_first_hit_target is not None:
+                    self.first_target_ball = occluded_first_hit_target
+                    self.first_target_hit_time = t
+                    self.first_target_hit_path_idx = max(0, len(self.cue_path) - 1)
+                    self.event_log.append(
+                        f"[{t:.2f}s] 스트로크 출발 및 가려짐 중 제1적구({occluded_first_hit_target.name}) 피격 감지 (수구 고정: {cue.name})"
+                    )
+                else:
+                    self.event_log.append(f"[{t:.2f}s] 스트로크 출발 (수구: {cue.name})")
+
+                if len(self.history) >= 3:
+                    self._evaluate_frame_with_context(subpixel_impacts)
+                if self._pending_immediate_result is not None:
+                    instant_res = self._pending_immediate_result
+                    self._pending_immediate_result = None
+                    return instant_res
+            return None
+
+        # ------------------------------------------------------------------
+        # IN_PLAY 상태: 수구 궤적(cue_path) 적재 및 폴리라인/목적구 충돌 평가
+        # ------------------------------------------------------------------
+        if self.active_cue_ball is not None:
+            cue_c = self.active_cue_ball
+            p_cue_now = pos_map[cue_c]
+            other_cs = [c for c in BallColor if c != cue_c]
+            min_d_targets = min(
+                float(np.linalg.norm(p_cue_now - pos_map[oc])) for oc in other_cs
+            )
+            if len(self.cue_path) >= 1:
+                step_travel = float(np.linalg.norm(p_cue_now - self.cue_path[-1].pos))
+                self.cue_total_travel_mm += step_travel
+
+            self.cue_path.append(
+                CuePathPoint(
+                    frame_idx=self.frame_counter,
+                    t=t,
+                    pos=p_cue_now.copy(),
+                    min_dist_to_targets=min_d_targets,
+                    intra_frame_v_bounce=bool(intra_frame_rail_bounce),
+                )
+            )
+            for bc in BallColor:
+                self.all_ball_paths[bc].append(
+                    (self.frame_counter, t, pos_map[bc].copy())
+                )
+
+            if self.first_target_ball is None:
+                d_rail_now = min(
+                    float(p_cue_now[0]),
+                    float(TABLE_W - p_cue_now[0]),
+                    float(p_cue_now[1]),
+                    float(TABLE_H - p_cue_now[1]),
+                )
+                if d_rail_now < self.min_rail_dist_before_first_hit:
+                    self.min_rail_dist_before_first_hit = d_rail_now
+                if (
+                    len(self._initial_stroke_samples) < 3
+                    and self.cushion_count == 0
+                    and d_rail_now > self.RAIL_ENTER_MARGIN
+                    and self.stroke_origin_pos is not None
+                ):
+                    vec_from_origin = p_cue_now - self.stroke_origin_pos
+                    norm_from_origin = float(np.linalg.norm(vec_from_origin))
+                    if norm_from_origin >= 10.0:
+                        cand_dir = vec_from_origin / norm_from_origin
+                        if (
+                            self.initial_stroke_dir is None
+                            or self._angle_between_deg(self.initial_stroke_dir, cand_dir)
+                            <= 6.0
+                        ):
+                            self.initial_stroke_dir = cand_dir
+                            self._initial_stroke_samples.append(p_cue_now.copy())
+
+        if not self.score_dispatched and len(self.history) >= 3:
+            self._evaluate_frame_with_context(subpixel_impacts)
+
+        all_stopped = all(
+            float(np.linalg.norm(v)) < self.STOP_SPEED for v in vel_map.values()
+        )
+        self.stop_counter = (self.stop_counter + 1) if all_stopped else 0
+
+        if self.stop_counter >= self.STOP_HOLD_FRAMES:
+            # 120mm 미만 노이즈 가짜 출발 취소 (턴 유지)
+            if (
+                not self.score_dispatched
+                and self.state != ShotState.VALID_SCORE_PENDING
+                and self.first_target_ball is None
+                and not self.double_hit_foul
+                and self.cue_total_travel_mm < self.MIN_VALID_SHOT_TRAVEL_MM
+            ):
+                self._reset_shot()
+                return None
+            return self._finalize_shot(t)
+
+        if self._pending_immediate_result is not None:
+            instant_res = self._pending_immediate_result
+            self._pending_immediate_result = None
+            return instant_res
+
+        return None
 
     def _finalize_shot(self, t: float) -> ShotResult:
-        scored = (self.state == ShotState.VALID_SCORE_PENDING or self.score_dispatched) and (not self.double_hit_foul)
+        """
+        모든 공이 정지했을 때 최종 샷 결과를 반환하고,
+        득점 시 수구 유지 / 실패 시 반대 수구(WHITE <-> YELLOW)로 전환합니다.
+        """
+        if not self.score_dispatched:
+            self._update_polyline_cushion_counts()
+
+        scored = (
+            self.state == ShotState.VALID_SCORE_PENDING or self.score_dispatched
+        ) and (not self.double_hit_foul)
         was_dispatched = bool(self.score_dispatched)
         shooter = self.active_cue_ball or self.assigned_cue_ball
-        if not scored and self.fail_reason is None:
-            self.fail_reason = "NO_FIRST_BALL_HIT" if self.first_target_ball is None else "SECOND_BALL_MISSED"
 
-        final_cushions = self.cushions_at_second_hit if scored else self.cushion_count
+        if not scored and self.fail_reason is None:
+            self.fail_reason = (
+                "NO_FIRST_BALL_HIT"
+                if self.first_target_ball is None
+                else "SECOND_BALL_MISSED"
+            )
+
+        final_cushions = (
+            self.cushions_at_second_hit if scored else self.cushion_count
+        )
         result = ShotResult(
             scored=scored,
             shooter_ball=shooter,
@@ -1677,14 +1553,16 @@ class CausalKissSafeFSM:
             already_dispatched=was_dispatched,
         )
 
-        # [규칙 2 & 규칙 3]
-        # - 득점(scored == True) 시: 수구(assigned_cue_ball)는 변하지 않고 동일 색상(WHITE -> WHITE, YELLOW -> YELLOW) 유지!
-        # - 득점 실패(scored == False) 시: 즉시 턴이 상대방에게 넘어가며 수구(assigned_cue_ball)가 반대 색상(WHITE <-> YELLOW)으로 변경!
+        # [원리 1-3 & 1-4]
+        # - 득점 성공 시: 수구(assigned_cue_ball) 그대로 유지!
+        # - 득점 실패 시: 반대 색깔(WHITE <-> YELLOW)로 수구 변경!
         if scored:
             self.assigned_cue_ball = shooter
         else:
             self.assigned_cue_ball = (
-                BallColor.YELLOW if shooter == BallColor.WHITE else BallColor.WHITE
+                BallColor.YELLOW
+                if shooter == BallColor.WHITE
+                else BallColor.WHITE
             )
         self.turn_locked_by_previous_shot = True
 
