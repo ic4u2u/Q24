@@ -447,9 +447,39 @@ class LiveStreamReader:
         _, S_ch, V_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         tilt = self.calibrator.camera_tilt_ratio
 
-        red_m = ((A_ch >= 152) & (S_ch >= 110) & (V_ch >= 65)).astype(np.uint8) * 255
-        yel_m = ((B_ch >= 150) & (A_ch < 148) & (L_ch >= 115) & (S_ch >= 90)).astype(np.uint8) * 255
-        whi_m = ((L_ch >= 178) & (S_ch <= 88) & (B_ch < 148) & (A_ch < 140)).astype(np.uint8) * 255
+        red_m = (
+            (A_ch >= 144) & (B_ch >= 118) & (S_ch >= 55) & (V_ch >= 52)
+        ).astype(np.uint8) * 255
+        if self._channel_core_state["RED"]["pos"] is not None:
+            rp = self._channel_core_state["RED"]["pos"]
+            rx_q = int(round(float(rp[0]) * 0.25))
+            ry_q = int(round(float(rp[1]) * 0.25))
+            x0_r, x1_r = max(0, rx_q - 28), min(710, rx_q + 29)
+            y0_r, y1_r = max(0, ry_q - 28), min(355, ry_q + 29)
+            if x1_r > x0_r and y1_r > y0_r:
+                local_red = (
+                    (A_ch[y0_r:y1_r, x0_r:x1_r] >= 140)
+                    & (B_ch[y0_r:y1_r, x0_r:x1_r] >= 114)
+                    & (S_ch[y0_r:y1_r, x0_r:x1_r] >= 48)
+                    & (V_ch[y0_r:y1_r, x0_r:x1_r] >= 40)
+                ).astype(np.uint8) * 255
+                red_m[y0_r:y1_r, x0_r:x1_r] = np.maximum(
+                    red_m[y0_r:y1_r, x0_r:x1_r], local_red
+                )
+        red_m = cv2.morphologyEx(red_m, cv2.MORPH_CLOSE, self._morph_open_k5)
+
+        yel_m = (
+            (B_ch >= 150) & (A_ch < 146) & (L_ch >= 118) & (S_ch >= 82)
+        ).astype(np.uint8) * 255
+        yel_m = cv2.morphologyEx(yel_m, cv2.MORPH_CLOSE, self._morph_kernel)
+
+        whi_m = (
+            (L_ch >= 178)
+            & (S_ch <= 86)
+            & (B_ch >= 112)
+            & (B_ch < 148)
+            & (A_ch < 140)
+        ).astype(np.uint8) * 255
         whi_m = cv2.morphologyEx(whi_m, cv2.MORPH_OPEN, self._morph_open_k5)
 
         out: Dict[str, Dict[str, float]] = {}
@@ -468,10 +498,17 @@ class LiveStreamReader:
 
             for c in cnts:
                 area_q = float(cv2.contourArea(c))
-                if area_q < 12.0 or area_q > 380.0:
+                if area_q < 52.0 or area_q > 360.0:
                     continue
+                x_b, y_b, w_b, h_b = cv2.boundingRect(c)
+                touches_border = (
+                    x_b <= 1
+                    or y_b <= 1
+                    or (x_b + w_b) >= 708
+                    or (y_b + h_b) >= 353
+                )
                 (cx, cy), rad_q = cv2.minEnclosingCircle(c)
-                if rad_q < 2.0 or rad_q > 15.5:
+                if rad_q < 3.8 or rad_q > 15.0:
                     continue
                 perim = float(cv2.arcLength(c, True))
                 circ = (4.0 * math.pi * area_q) / (perim * perim + 1e-5)
@@ -481,19 +518,26 @@ class LiveStreamReader:
                     [float(cx) * 4.0, (float(cy) + float(rad_q) * tilt) * 4.0],
                     dtype=np.float64,
                 )
+                border_penalty = 85.0 if touches_border else 0.0
                 if pred_p is not None and prev_p is not None:
                     dist_pred = float(np.linalg.norm(pt_mm - pred_p))
                     dist_prev = float(np.linalg.norm(pt_mm - prev_p))
                     dist = min(dist_pred, dist_prev)
-                    max_gate = 260.0 + min(300.0, int(st["missing"]) * 60.0)
+                    max_gate = 320.0 + min(900.0, int(st["missing"]) * 220.0)
                     if dist > max_gate:
                         continue
-                    score = circ * 100.0 - abs(area_q - 150.0) * 0.25 - dist * 0.5
+                    score = (
+                        circ * 100.0
+                        - abs(area_q - 150.0) * 0.25
+                        - dist * 0.5
+                        - border_penalty
+                    )
                 else:
-                    # 최초 동기화 시 우측 하단 모서리 선수 신체 진입 구역 배제
-                    if pt_mm[0] > 2400.0 and pt_mm[1] > 1100.0:
-                        continue
-                    score = circ * 100.0 - abs(area_q - 150.0) * 0.25
+                    score = (
+                        circ * 100.0
+                        - abs(area_q - 150.0) * 0.25
+                        - border_penalty
+                    )
 
                 if score > best_score:
                     best_score = score
@@ -506,30 +550,44 @@ class LiveStreamReader:
                 if prev_p is not None and int(st["missing"]) == 0:
                     st["vel"] = 0.6 * (best_pt - prev_p) + 0.4 * prev_v
                 elif prev_p is not None:
-                    st["vel"] = (best_pt - prev_p) / float(int(st["missing"]) + 1)
+                    step_v = (best_pt - prev_p) / float(int(st["missing"]) + 1)
+                    st["vel"] = step_v if float(np.linalg.norm(step_v)) <= 120.0 else np.zeros(2, dtype=np.float64)
                 st["pos"] = best_pt
                 st["missing"] = 0
             elif prev_p is not None:
-                nxt = prev_p + prev_v * 0.94
-                if nxt[0] < 31.0:
-                    nxt[0] = 31.0 + (31.0 - nxt[0])
-                    prev_v[0] *= -0.82
-                elif nxt[0] > 2809.0:
-                    nxt[0] = 2809.0 - (nxt[0] - 2809.0)
-                    prev_v[0] *= -0.82
-                if nxt[1] < 31.0:
-                    nxt[1] = 31.0 + (31.0 - nxt[1])
-                    prev_v[1] *= -0.82
-                elif nxt[1] > 1389.0:
-                    nxt[1] = 1389.0 - (nxt[1] - 1389.0)
-                    prev_v[1] *= -0.82
-                st["pos"] = nxt
-                st["vel"] = prev_v * 0.94
-                st["missing"] = int(st["missing"]) + 1
-                if int(st["missing"]) > 20 and cnts:
+                # 정지해 있던 공(속도 < 8.0mm/frame)이 선수 몸/팔에 가려진 경우 절대 스스로 움직이거나 순간이동하지 않고 제자리 고정!
+                if float(np.linalg.norm(prev_v)) < 8.0:
+                    st["pos"] = prev_p
+                    st["vel"] = np.zeros(2, dtype=np.float64)
+                    st["missing"] = int(st["missing"]) + 1
+                else:
+                    nxt = prev_p + prev_v * 0.94
+                    if nxt[0] < 31.0:
+                        nxt[0] = 31.0 + (31.0 - nxt[0])
+                        prev_v[0] *= -0.82
+                    elif nxt[0] > 2809.0:
+                        nxt[0] = 2809.0 - (nxt[0] - 2809.0)
+                        prev_v[0] *= -0.82
+                    if nxt[1] < 31.0:
+                        nxt[1] = 31.0 + (31.0 - nxt[1])
+                        prev_v[1] *= -0.82
+                    elif nxt[1] > 1389.0:
+                        nxt[1] = 1389.0 - (nxt[1] - 1389.0)
+                        prev_v[1] *= -0.82
+                    st["pos"] = nxt
+                    st["vel"] = prev_v * 0.94
+                    st["missing"] = int(st["missing"]) + 1
+                if int(st["missing"]) > 35 and cnts:
                     for c in cnts:
                         area_q = float(cv2.contourArea(c))
-                        if 20.0 <= area_q <= 340.0:
+                        if 85.0 <= area_q <= 250.0:
+                            x_b, y_b, w_b, h_b = cv2.boundingRect(c)
+                            if x_b <= 2 or y_b <= 2 or (x_b + w_b) >= 706 or (y_b + h_b) >= 351:
+                                continue
+                            perim = float(cv2.arcLength(c, True))
+                            circ = (4.0 * math.pi * area_q) / (perim * perim + 1e-5)
+                            if circ < 0.72:
+                                continue
                             (cx, cy), rad_q = cv2.minEnclosingCircle(c)
                             cand_x = float(cx) * 4.0
                             cand_y = (float(cy) + float(rad_q) * tilt) * 4.0
@@ -1285,11 +1343,11 @@ class LiveStreamReader:
                 if exp_st.speed >= vel_th and exp_disp >= self.VISION_START_DISP_MM:
                     first_moving_id = expected_cue_id
 
-            # 1-B순위: 경기 시작 첫 초구(턴 잠금 전)에 아직 공끼리 충돌하기 전(>= 66mm) 상태에서
-            # WHITE 또는 YELLOW 중 가장 먼저 출발한 공(First-Mover)이 포착되면 그 공을 수구로 결정!
+            # 1-B순위: 경기 시작 첫 초구(턴 잠금 전) 또는 합성 좌표 시뮬레이션(not require_rest_displacement)에서
+            # 아직 공끼리 충돌하기 전(>= 66mm)에 WHITE/YELLOW 중 가장 먼저 출발한 공(First-Mover)을 수구로 결정!
             if (
                 first_moving_id is None
-                and is_opening_unlocked
+                and (is_opening_unlocked or not require_rest_displacement)
                 and min_pair_dist_now >= 66.0
             ):
                 best_onset_id: Optional[int] = None
@@ -1310,12 +1368,10 @@ class LiveStreamReader:
                 if best_onset_id is not None:
                     first_moving_id = best_onset_id
                     mover_color = str(ball_states[best_onset_id].color).upper()
-                    self.match_manager.active_player_id = (
-                        "P2" if mover_color == "YELLOW" else "P1"
-                    )
-                    self.match_manager.active_cue_ball_color = (
-                        "YELLOW" if mover_color == "YELLOW" else "WHITE"
-                    )
+                    if is_opening_unlocked:
+                        self.match_manager.active_player_id = (
+                            "P2" if mover_color == "YELLOW" else "P1"
+                        )
 
             # 2순위: 만약 스트로크 순간 큐대/손 가림으로 인해 지정 수구는 안 보였지만
             # 다른 공(제1적구 또는 상대방 수구)이 강하게(>= 35.0mm) 튀어나간 경우:
@@ -1356,6 +1412,13 @@ class LiveStreamReader:
                 self.match_manager.players["P1"].cue_ball_color = "WHITE"
                 self.match_manager.players["P2"].cue_ball_color = "YELLOW"
                 compensated_prev_shot = False
+                if not require_rest_displacement:
+                    reconcile_res = self.match_manager.reconcile_cue_ball_stroke(
+                        stroked_cue_color=str(cue_state.color).upper(),
+                        compensate_missed_score=True,
+                        force_sync_player=True,
+                    )
+                    compensated_prev_shot = bool(reconcile_res.get("compensated", False))
                 self.match_manager.sync_active_player_to_current_inning(
                     self.match_manager.active_player_id
                 )
@@ -1446,7 +1509,11 @@ class LiveStreamReader:
                 active_cue_color = self.match_manager.active_cue_ball_color
                 cue_ko = COLOR_KO_LABELS.get(active_cue_color, active_cue_color)
                 start_msg = f"수구({cue_ko}) 출발 감지 - 타이머 일시정지 및 5단계 초고속 궤적 추적 중"
-                start_reason = "CUE_MOVING"
+                start_reason = (
+                    "RETROACTIVE_SCORE_COMPENSATED"
+                    if compensated_prev_shot
+                    else "CUE_MOVING"
+                )
 
                 self.match_manager.last_shot_result = {
                     "shot_id": self.match_manager.shot_seq_id,
@@ -1719,7 +1786,7 @@ class LiveStreamReader:
                         shot_eval["reason_code"] = str(causal_res.fail_reason or "SECOND_BALL_MISSED")
                         shot_eval["message"] = (
                             f"공타: 제2목적구 불발 (누적 {causal_res.total_cushions}쿠션)"
-                            if causal_res.first_target_ball is not None or "SECOND_BALL" in str(causal_res.fail_reason)
+                            if "SECOND_BALL" in str(causal_res.fail_reason)
                             else f"공타: {causal_res.fail_reason or '목적구 불발'} (누적 {causal_res.total_cushions}쿠션)"
                         )
                 elif bool(shot_eval.get("already_dispatched", False)):
@@ -1818,7 +1885,8 @@ class LiveStreamReader:
                                 max_net_disp = d_net
 
                     is_short_noise_stroke = (
-                        self.scoring_engine.first_object_ball_id is None
+                        require_rest_displacement
+                        and self.scoring_engine.first_object_ball_id is None
                         and self.scoring_engine.cue_travel_distance_mm < 120.0
                     )
                     is_phantom_occlusion = is_short_noise_stroke or (

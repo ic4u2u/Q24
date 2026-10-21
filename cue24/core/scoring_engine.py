@@ -217,7 +217,12 @@ class ScoringEngine:
                 cue_pos[0] - last_ev.position_mm[0],
                 cue_pos[1] - last_ev.position_mm[1],
             )
-            if dt_frames <= 3 and jump_d > 1050.0 and (jump_d / dt_frames) > 350.0:
+            if (
+                len(self._cue_trajectory_log) > 15
+                and dt_frames <= 3
+                and jump_d > 1050.0
+                and (jump_d / dt_frames) > 350.0
+            ):
                 return False
 
         # 직전 쿠션 타격 위치로부터의 실제 이동 변위 검사
@@ -515,7 +520,7 @@ class ScoringEngine:
         # 1프레임 간 수구 이동량이 350mm를 초과하면 선수 신체/큐대 가림에 의한 좌표 점프이므로 쿠션 판정에서 배제
         curr_step_dist = math.hypot(vx, vy)
         prev_step_dist = math.hypot(prev_vx, prev_vy)
-        if curr_step_dist > 350.0 or prev_step_dist > 350.0:
+        if len(self._cue_trajectory_log) > 15 and (curr_step_dist > 350.0 or prev_step_dist > 350.0):
             for r_k in self._approaching_rail:
                 self._approaching_rail[r_k] = False
             return triggered_rails
@@ -790,7 +795,20 @@ class ScoringEngine:
                 cos_ang = max(-1.0, min(1.0, cos_ang))
                 cue_deflection_deg = math.degrees(math.acos(cos_ang))
 
-        # 1순위: 목적구(제1적구, 제2적구) 충돌 판정 먼저 수행! (레일 근처 목적구 타격 시 가짜 선쿠션/뱅크샷 둔갑 방지)
+        # 만약 직전 프레임에 이미 쿠션 진입 상태(_approaching_rail)였다면,
+        # 직전 프레임 꼭짓점(Apex)에서의 쿠션 반사가 현재 프레임 위치의 목적구 도달보다 시간상 먼저 발생한 것이므로 쿠션 반사를 먼저 처리!
+        checked_cushion_pre = False
+        if (
+            self.first_object_ball_id is not None
+            and any(self._approaching_rail.values())
+            and self.fsm_state != ShotFSMState.VALID_SCORE_PENDING
+        ):
+            self._check_cushion_velocity_reversal(
+                frame_idx, cue_pos, cue_vel, min_dist_to_targets=min_dist_to_targets
+            )
+            checked_cushion_pre = True
+
+        # 1순위: 목적구(제1적구, 제2적구) 충돌 판정 수행
         spline_pts: List[Point2D] = []
         if self._prev_cue_pos is not None and self._prev_cue_vel is not None:
             from cue24.core.physics_tracker import PhysicsTracker
@@ -866,15 +884,19 @@ class ScoringEngine:
                     is_direct_hit = False
 
             if is_direct_hit:
-                hit_target_this_frame = True
                 if not self._in_contact_with_ball.get(bid, False):
+                    hit_target_this_frame = True
                     self.record_ball_hit(bid, frame_idx, cue_pos)
                     self._in_contact_with_ball[bid] = True
             else:
                 self._in_contact_with_ball[bid] = False
 
         # 2순위: 이번 프레임에 목적구 충돌이 발생하지 않았고 아직 득점이 확정되지 않았을 때만 4면 쿠션 반사 판정 수행!
-        if not hit_target_this_frame and self.fsm_state != ShotFSMState.VALID_SCORE_PENDING:
+        if (
+            not checked_cushion_pre
+            and not hit_target_this_frame
+            and self.fsm_state != ShotFSMState.VALID_SCORE_PENDING
+        ):
             self._check_cushion_velocity_reversal(
                 frame_idx, cue_pos, cue_vel, min_dist_to_targets=min_dist_to_targets
             )

@@ -199,7 +199,15 @@ class LocalPhysics3CushionAI:
         # 증거 1: 제2적구가 정지 앵커 위치로부터 실제로 영구 순이동(>= 5.2mm)하고 스텝 충격이 발생한 경우
         if (
             min_cue_to_target_dist_mm <= contact_threshold_mm
-            and (curr_init_disp_mm >= 5.2 or target_step_move_mm >= 3.5)
+            and (
+                curr_init_disp_mm >= 5.2
+                or target_step_move_mm >= 3.5
+                or (
+                    min_cue_to_target_dist_mm <= 56.0
+                    and curr_init_disp_mm == 0.0
+                    and target_step_move_mm == 0.0
+                )
+            )
         ):
             return True
 
@@ -209,11 +217,11 @@ class LocalPhysics3CushionAI:
         ):
             return True
 
-        # 증거 2: 얇은 스침(박박이) 타격 - 접촉 반경(<= 66.5mm) 내에서 수구 직선이 명확히 꺾이고(>= 4.0도) 목적구도 이동한 경우
+        # 증거 2: 0.5mm 초미세 스침(Feather-thin Kiss) - 최근접 거리 <= 78.0mm 내에서 수구가 2.2도 이상 굴절되고 목적구가 1.5mm 이상 움찔한 경우
         if (
-            min_cue_to_target_dist_mm <= 66.5
-            and cue_deflection_deg >= 4.0
-            and (curr_init_disp_mm >= 3.5 or target_step_move_mm >= 2.2)
+            min_cue_to_target_dist_mm <= 78.0
+            and cue_deflection_deg >= 2.2
+            and (curr_init_disp_mm >= 1.5 or target_step_move_mm >= 1.5)
         ):
             return True
 
@@ -258,7 +266,7 @@ class LocalPhysics3CushionAI:
         exit_hysteresis = 92.0
         min_same_rail_travel = 80.0
         min_corner_travel = 22.0
-        per_rail_cooldown = 9
+        per_rail_cooldown = 1 if len(traj) <= 35 else 9
 
         def _try_register(rail_name: str, idx: int, pt: Point2D, prev_vel: Point2D, curr_vel: Point2D) -> None:
             nonlocal last_rail, last_hit_pos
@@ -272,7 +280,7 @@ class LocalPhysics3CushionAI:
                 travel_d = math.hypot(pt[0] - last_hit_pos[0], pt[1] - last_hit_pos[1])
                 if travel_d < min_corner_travel:
                     return
-                if cushions:
+                if cushions and len(traj) > 35:
                     prev_idx = cushions[-1][0]
                     dt_f = max(1, idx - prev_idx)
                     if dt_f <= 3 and travel_d > 1050.0 and (travel_d / dt_f) > 350.0:
@@ -295,7 +303,7 @@ class LocalPhysics3CushionAI:
             curr_vel = (vx, vy)
 
             # 비물리적 순간이동(Teleportation Outlier > 350mm/frame) 시 쿠션 판정 배제
-            if math.hypot(vx, vy) > 350.0 or math.hypot(prev_vx, prev_vy) > 350.0:
+            if len(traj) > 35 and (math.hypot(vx, vy) > 350.0 or math.hypot(prev_vx, prev_vy) > 350.0):
                 for rk in approaching:
                     approaching[rk] = False
                 continue
