@@ -322,11 +322,13 @@ class LocalPhysics3CushionAI:
                 if vx < -0.5 or prev_vx < -0.5:
                     approaching["LEFT"] = True
                 if approaching["LEFT"] and vx > 0.5:
-                    _try_register("LEFT", idx, (x, y), prev_vel, curr_vel)
+                    apex = (x_prev, y_prev) if x_prev < x else (x, y)
+                    _try_register("LEFT", idx, apex, prev_vel, curr_vel)
                     approaching["LEFT"] = False
             else:
-                if approaching["LEFT"] and vx > 0.5 and x <= eff_left + 25.0:
-                    _try_register("LEFT", idx, (x, y), prev_vel, curr_vel)
+                if approaching["LEFT"] and vx > 0.5 and min(x, x_prev) <= eff_left + 25.0:
+                    apex = (x_prev, y_prev) if x_prev < x else (x, y)
+                    _try_register("LEFT", idx, apex, prev_vel, curr_vel)
                 approaching["LEFT"] = False
 
             # RIGHT
@@ -334,11 +336,13 @@ class LocalPhysics3CushionAI:
                 if vx > 0.5 or prev_vx > 0.5:
                     approaching["RIGHT"] = True
                 if approaching["RIGHT"] and vx < -0.5:
-                    _try_register("RIGHT", idx, (x, y), prev_vel, curr_vel)
+                    apex = (x_prev, y_prev) if x_prev > x else (x, y)
+                    _try_register("RIGHT", idx, apex, prev_vel, curr_vel)
                     approaching["RIGHT"] = False
             else:
-                if approaching["RIGHT"] and vx < -0.5 and x >= eff_right - 25.0:
-                    _try_register("RIGHT", idx, (x, y), prev_vel, curr_vel)
+                if approaching["RIGHT"] and vx < -0.5 and max(x, x_prev) >= eff_right - 25.0:
+                    apex = (x_prev, y_prev) if x_prev > x else (x, y)
+                    _try_register("RIGHT", idx, apex, prev_vel, curr_vel)
                 approaching["RIGHT"] = False
 
             # TOP
@@ -346,11 +350,13 @@ class LocalPhysics3CushionAI:
                 if vy < -0.5 or prev_vy < -0.5:
                     approaching["TOP"] = True
                 if approaching["TOP"] and vy > 0.5:
-                    _try_register("TOP", idx, (x, y), prev_vel, curr_vel)
+                    apex = (x_prev, y_prev) if y_prev < y else (x, y)
+                    _try_register("TOP", idx, apex, prev_vel, curr_vel)
                     approaching["TOP"] = False
             else:
-                if approaching["TOP"] and vy > 0.5 and y <= eff_top + 25.0:
-                    _try_register("TOP", idx, (x, y), prev_vel, curr_vel)
+                if approaching["TOP"] and vy > 0.5 and min(y, y_prev) <= eff_top + 25.0:
+                    apex = (x_prev, y_prev) if y_prev < y else (x, y)
+                    _try_register("TOP", idx, apex, prev_vel, curr_vel)
                 approaching["TOP"] = False
 
             # BOTTOM
@@ -358,11 +364,13 @@ class LocalPhysics3CushionAI:
                 if vy > 0.5 or prev_vy > 0.5:
                     approaching["BOTTOM"] = True
                 if approaching["BOTTOM"] and vy < -0.5:
-                    _try_register("BOTTOM", idx, (x, y), prev_vel, curr_vel)
+                    apex = (x_prev, y_prev) if y_prev > y else (x, y)
+                    _try_register("BOTTOM", idx, apex, prev_vel, curr_vel)
                     approaching["BOTTOM"] = False
             else:
-                if approaching["BOTTOM"] and vy < -0.5 and y >= eff_bottom - 25.0:
-                    _try_register("BOTTOM", idx, (x, y), prev_vel, curr_vel)
+                if approaching["BOTTOM"] and vy < -0.5 and max(y, y_prev) >= eff_bottom - 25.0:
+                    apex = (x_prev, y_prev) if y_prev > y else (x, y)
+                    _try_register("BOTTOM", idx, apex, prev_vel, curr_vel)
                 approaching["BOTTOM"] = False
 
         return cushions

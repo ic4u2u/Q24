@@ -526,8 +526,16 @@ class ScoringEngine:
             "TOP": y,
             "BOTTOM": self.table_height_mm - y,
         }
+        prev_x = self._prev_cue_pos[0] if self._prev_cue_pos is not None else x
+        prev_y = self._prev_cue_pos[1] if self._prev_cue_pos is not None else y
+        prev_rail_dists = {
+            "LEFT": prev_x,
+            "RIGHT": self.table_width_mm - prev_x,
+            "TOP": prev_y,
+            "BOTTOM": self.table_height_mm - prev_y,
+        }
         if self.first_object_ball_id is None:
-            min_r_now = min(rail_dists.values())
+            min_r_now = min(min(rail_dists.values()), min(prev_rail_dists.values()))
             if min_r_now < self._min_rail_dist_before_first_hit:
                 self._min_rail_dist_before_first_hit = min_r_now
 
@@ -572,12 +580,18 @@ class ScoringEngine:
             self._first_hit_frame is not None and abs(frame_idx - self._first_hit_frame) <= 2
         )
 
-        def _can_accept_in_zone(rail_name: str, v_in: float, v_out: float) -> Tuple[bool, bool]:
-            d_rail = rail_dists[rail_name]
+        def _can_accept_in_zone(rail_name: str, v_in: float, v_out: float) -> Tuple[bool, bool, Point2D]:
+            # 속도 부호가 반전된 순간 실제 쿠션 충돌 꼭짓점(Apex)은 직전 프레임(_prev_cue_pos) 또는 현재 프레임(cue_pos) 중 레일에 더 가까운 위치임
+            if prev_rail_dists[rail_name] < rail_dists[rail_name]:
+                d_rail = prev_rail_dists[rail_name]
+                apex_pt = (prev_x, prev_y)
+            else:
+                d_rail = rail_dists[rail_name]
+                apex_pt = cue_pos
             clear_rev = v_in > 1.2 and v_out > 1.0
             # 레일 최대 반사 허용 대역을 벗어난 허공(예: x=229mm, x=2201mm)에서는 절대 쿠션으로 인정하지 않음!
             if d_rail > rail_max_zones[rail_name]:
-                return False, clear_rev
+                return False, clear_rev, apex_pt
             # [규칙 4 핵심] 제1적구 접촉 전(self.first_object_ball_id is None)에는 아직 어떤 공과도 충돌하지 않았으므로,
             # 제1적구가 쿠션 바로 앞에 서 있는 '1쿠션 넣어치기(원뱅크 걸어치기)' 샷에서 min_dist_to_targets 때문에 선쿠션이 씹히지 않도록 마스킹 해제!
             if d_rail <= self.RAIL_ENTER_MARGIN:
@@ -592,8 +606,8 @@ class ScoringEngine:
                     or min_dist_to_targets >= 68.0
                     or d_rail <= 42.0
                 ) and (not just_hit_target or is_one_cushion_entry or d_rail <= 42.0):
-                    return True, clear_rev
-                return False, clear_rev
+                    return True, clear_rev, apex_pt
+                return False, clear_rev, apex_pt
             # 광역 궤적 반사 대역(54.0mm ~ 경계)에서는 제1적구 접촉 전이거나 목적구와 85mm 이상 떨어져 있을 때 쿠션 반사로 인정
             if (
                 self.first_object_ball_id is None
@@ -604,24 +618,24 @@ class ScoringEngine:
                 )
                 or min_dist_to_targets >= 85.0
             ):
-                return True, clear_rev
-            return False, clear_rev
+                return True, clear_rev, apex_pt
+            return False, clear_rev, apex_pt
 
         # 1. LEFT 레일 검사
         if x <= self.left_bound:
             if vx < -1e-4 or prev_vx < -1e-4:
                 self._approaching_rail["LEFT"] = True
             if self._approaching_rail["LEFT"] and vx > 1e-4:
-                ok_zone, clear_rev = _can_accept_in_zone("LEFT", -prev_vx, vx)
-                if ok_zone and physics_ai_engine.verify_cushion_impulse("LEFT", cue_pos, prev_vel_tuple, cue_vel):
-                    if self.record_cushion_touch("LEFT", frame_idx, cue_pos, clear_rev):
+                ok_zone, clear_rev, apex_pt = _can_accept_in_zone("LEFT", -prev_vx, vx)
+                if ok_zone and physics_ai_engine.verify_cushion_impulse("LEFT", apex_pt, prev_vel_tuple, cue_vel):
+                    if self.record_cushion_touch("LEFT", frame_idx, apex_pt, clear_rev):
                         triggered_rails.append("LEFT")
                 self._approaching_rail["LEFT"] = False
         else:
             if self._approaching_rail["LEFT"] and vx > 1e-4:
-                ok_zone, clear_rev = _can_accept_in_zone("LEFT", -prev_vx, vx)
-                if ok_zone and physics_ai_engine.verify_cushion_impulse("LEFT", cue_pos, prev_vel_tuple, cue_vel):
-                    if self.record_cushion_touch("LEFT", frame_idx, cue_pos, clear_rev):
+                ok_zone, clear_rev, apex_pt = _can_accept_in_zone("LEFT", -prev_vx, vx)
+                if ok_zone and physics_ai_engine.verify_cushion_impulse("LEFT", apex_pt, prev_vel_tuple, cue_vel):
+                    if self.record_cushion_touch("LEFT", frame_idx, apex_pt, clear_rev):
                         triggered_rails.append("LEFT")
             self._approaching_rail["LEFT"] = False
 
@@ -630,16 +644,16 @@ class ScoringEngine:
             if vx > 1e-4 or prev_vx > 1e-4:
                 self._approaching_rail["RIGHT"] = True
             if self._approaching_rail["RIGHT"] and vx < -1e-4:
-                ok_zone, clear_rev = _can_accept_in_zone("RIGHT", prev_vx, -vx)
-                if ok_zone and physics_ai_engine.verify_cushion_impulse("RIGHT", cue_pos, prev_vel_tuple, cue_vel):
-                    if self.record_cushion_touch("RIGHT", frame_idx, cue_pos, clear_rev):
+                ok_zone, clear_rev, apex_pt = _can_accept_in_zone("RIGHT", prev_vx, -vx)
+                if ok_zone and physics_ai_engine.verify_cushion_impulse("RIGHT", apex_pt, prev_vel_tuple, cue_vel):
+                    if self.record_cushion_touch("RIGHT", frame_idx, apex_pt, clear_rev):
                         triggered_rails.append("RIGHT")
                 self._approaching_rail["RIGHT"] = False
         else:
             if self._approaching_rail["RIGHT"] and vx < -1e-4:
-                ok_zone, clear_rev = _can_accept_in_zone("RIGHT", prev_vx, -vx)
-                if ok_zone and physics_ai_engine.verify_cushion_impulse("RIGHT", cue_pos, prev_vel_tuple, cue_vel):
-                    if self.record_cushion_touch("RIGHT", frame_idx, cue_pos, clear_rev):
+                ok_zone, clear_rev, apex_pt = _can_accept_in_zone("RIGHT", prev_vx, -vx)
+                if ok_zone and physics_ai_engine.verify_cushion_impulse("RIGHT", apex_pt, prev_vel_tuple, cue_vel):
+                    if self.record_cushion_touch("RIGHT", frame_idx, apex_pt, clear_rev):
                         triggered_rails.append("RIGHT")
             self._approaching_rail["RIGHT"] = False
 
@@ -648,16 +662,16 @@ class ScoringEngine:
             if vy < -1e-4 or prev_vy < -1e-4:
                 self._approaching_rail["TOP"] = True
             if self._approaching_rail["TOP"] and vy > 1e-4:
-                ok_zone, clear_rev = _can_accept_in_zone("TOP", -prev_vy, vy)
-                if ok_zone and physics_ai_engine.verify_cushion_impulse("TOP", cue_pos, prev_vel_tuple, cue_vel):
-                    if self.record_cushion_touch("TOP", frame_idx, cue_pos, clear_rev):
+                ok_zone, clear_rev, apex_pt = _can_accept_in_zone("TOP", -prev_vy, vy)
+                if ok_zone and physics_ai_engine.verify_cushion_impulse("TOP", apex_pt, prev_vel_tuple, cue_vel):
+                    if self.record_cushion_touch("TOP", frame_idx, apex_pt, clear_rev):
                         triggered_rails.append("TOP")
                 self._approaching_rail["TOP"] = False
         else:
             if self._approaching_rail["TOP"] and vy > 1e-4:
-                ok_zone, clear_rev = _can_accept_in_zone("TOP", -prev_vy, vy)
-                if ok_zone and physics_ai_engine.verify_cushion_impulse("TOP", cue_pos, prev_vel_tuple, cue_vel):
-                    if self.record_cushion_touch("TOP", frame_idx, cue_pos, clear_rev):
+                ok_zone, clear_rev, apex_pt = _can_accept_in_zone("TOP", -prev_vy, vy)
+                if ok_zone and physics_ai_engine.verify_cushion_impulse("TOP", apex_pt, prev_vel_tuple, cue_vel):
+                    if self.record_cushion_touch("TOP", frame_idx, apex_pt, clear_rev):
                         triggered_rails.append("TOP")
             self._approaching_rail["TOP"] = False
 
@@ -666,16 +680,16 @@ class ScoringEngine:
             if vy > 1e-4 or prev_vy > 1e-4:
                 self._approaching_rail["BOTTOM"] = True
             if self._approaching_rail["BOTTOM"] and vy < -1e-4:
-                ok_zone, clear_rev = _can_accept_in_zone("BOTTOM", prev_vy, -vy)
-                if ok_zone and physics_ai_engine.verify_cushion_impulse("BOTTOM", cue_pos, prev_vel_tuple, cue_vel):
-                    if self.record_cushion_touch("BOTTOM", frame_idx, cue_pos, clear_rev):
+                ok_zone, clear_rev, apex_pt = _can_accept_in_zone("BOTTOM", prev_vy, -vy)
+                if ok_zone and physics_ai_engine.verify_cushion_impulse("BOTTOM", apex_pt, prev_vel_tuple, cue_vel):
+                    if self.record_cushion_touch("BOTTOM", frame_idx, apex_pt, clear_rev):
                         triggered_rails.append("BOTTOM")
                 self._approaching_rail["BOTTOM"] = False
         else:
             if self._approaching_rail["BOTTOM"] and vy < -1e-4:
-                ok_zone, clear_rev = _can_accept_in_zone("BOTTOM", prev_vy, -vy)
-                if ok_zone and physics_ai_engine.verify_cushion_impulse("BOTTOM", cue_pos, prev_vel_tuple, cue_vel):
-                    if self.record_cushion_touch("BOTTOM", frame_idx, cue_pos, clear_rev):
+                ok_zone, clear_rev, apex_pt = _can_accept_in_zone("BOTTOM", prev_vy, -vy)
+                if ok_zone and physics_ai_engine.verify_cushion_impulse("BOTTOM", apex_pt, prev_vel_tuple, cue_vel):
+                    if self.record_cushion_touch("BOTTOM", frame_idx, apex_pt, clear_rev):
                         triggered_rails.append("BOTTOM")
             self._approaching_rail["BOTTOM"] = False
 
