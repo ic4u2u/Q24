@@ -903,6 +903,21 @@ class CausalKissSafeFSM:
                     and y_bend_deg >= 3.5
                 ):
                     phenomenon_b_hit = True
+                else:
+                    # 수구가 고속(>= 400mm/s)으로 목적구 중심 거리 56.0mm 이내까지 정면 진입한 뒤
+                    # 통과하지 못하고 목적구 앞에서 급감속 정지(Stop-Shot)한 경우 충돌 인정
+                    v_x_pre = (f_curr.pos[ball_x] - f_prev.pos[ball_x]) / max(f_curr.t - f_prev.t, 1e-4)
+                    v_x_post = (f_post2.pos[ball_x] - f_curr.pos[ball_x]) / max(f_post2.t - f_curr.t, 1e-4)
+                    s_x_pre = float(np.linalg.norm(v_x_pre))
+                    s_x_post = float(np.linalg.norm(v_x_post))
+                    if (
+                        d_min <= 56.0
+                        and s_x_pre >= 400.0
+                        and s_x_post <= s_x_pre * 0.15
+                        and not is_bouncing_on_rail
+                        and d_x_other > 72.0
+                    ):
+                        phenomenon_b_hit = True
 
         if phenomenon_a_hit or phenomenon_b_hit:
             self.pair_last_hit_time[pair_key] = t_eval

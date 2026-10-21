@@ -128,9 +128,9 @@ class LiveStreamReader:
     VISION_START_SPEED_TH: float = 4.5
     VISION_START_DISP_MM: float = 14.0
     MOTION_BLUR_CIRC_TH: float = 0.42
-    # 테스트 녹화 영상(H:\OBS녹화\new1020.mp4)에서 경기 초기화/화면 리플레시 즉시 3구 색상 잠금 ->
+    # 테스트 녹화 영상(J:\내 드라이브\L-billiard.mp4)에서 경기 초기화/화면 리플레시 즉시 3구 색상 잠금 ->
     # 1이닝 선공(흰공) 초구 브레이크샷 -> 1이닝 후공(노란공) 쓰리뱅크샷 득점 -> 연속 경기가 이어지는 시작 프레임
-    ACTIVE_SHOT_START_FRAME: int = 0
+    ACTIVE_SHOT_START_FRAME: int = 620
 
     def __init__(
         self,
