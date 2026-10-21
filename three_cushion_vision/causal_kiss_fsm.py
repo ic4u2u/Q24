@@ -692,12 +692,55 @@ class CausalKissSafeFSM:
             else:
                 c_before = 1
 
+        if valid_vertices:
+            self.last_hit_rail = valid_vertices[-1][2]
+
         return c_before, c_after, valid_vertices
+
+    def _sync_shot_event_tokens(self) -> None:
+        """
+        [기술 5: arXiv:2407.19686 이벤트 시퀀스 문법 파서]
+        이닝 진행 중 확정된 이벤트를 self.shot_event_tokens 리스트에
+        "C"(쿠션), "B1"(제1적구), "KISS_12"(적구 간 키스), "B2"(제2적구) 토큰으로 순서대로 동기화합니다.
+        """
+        tokens: List[str] = []
+        for _ in range(self.cushions_before_first_hit):
+            tokens.append("C")
+        if self.first_target_ball is not None:
+            tokens.append("B1")
+        for _ in range(self._kiss_token_count):
+            tokens.append("KISS_12")
+        for _ in range(self.cushions_after_first_hit):
+            tokens.append("C")
+        if self.second_target_ball is not None:
+            tokens.append("B2")
+        self.shot_event_tokens = tokens
+
+    def _parse_event_grammar_on_b2(self) -> Tuple[bool, bool, int, int]:
+        """
+        [기술 5: arXiv:2407.19686 문법 검증]
+        "B2" 토큰이 최초로 기록된 시점에 self.shot_event_tokens를 파싱하여:
+        - "B2" 앞선 토큰들 중 "B1"이 존재하고 "C"의 개수가 3개 이상이면 scored = True
+        - "B1" 토큰보다 앞에 있는 "C" 토큰이 1개 이상이면 is_bank_shot = True
+        반환값: (is_valid_score, is_bank_shot, total_c_before_b2, c_before_b1)
+        """
+        self._sync_shot_event_tokens()
+        if "B2" not in self.shot_event_tokens:
+            return False, False, self.cushion_count, self.cushions_before_first_hit
+
+        b2_idx = self.shot_event_tokens.index("B2")
+        prefix = self.shot_event_tokens[:b2_idx]
+        has_b1 = "B1" in prefix
+        total_c = prefix.count("C")
+        c_before_b1 = prefix[: prefix.index("B1")].count("C") if has_b1 else total_c
+        is_valid = has_b1 and (total_c >= 3) and (not self.double_hit_foul)
+        is_bank = c_before_b1 >= 1
+        return is_valid, is_bank, total_c, c_before_b1
 
     def _update_polyline_cushion_counts(
         self, up_to_path_idx: Optional[int] = None
     ) -> None:
-        """폴리라인 꼭짓점 분석 결과를 FSM 쿠션 카운터 및 이벤트 로그에 동기화합니다."""
+        """폴리라인 꼭짓점 및 충돌 평면 광선 교차 분석 결과를 FSM 쿠션 카운터 및 이벤트 토큰에 동기화합니다."""
         if self.score_dispatched:
             return
         c_before, c_after, vertices = self._extract_polyline_cushions(up_to_path_idx)
@@ -706,6 +749,7 @@ class CausalKissSafeFSM:
         self.cushion_count = c_before + c_after
         if self.cushions_before_first_hit >= 1:
             self.is_bank_shot = True
+        self._sync_shot_event_tokens()
 
         for f_idx, t_v, rail, pos_v in vertices:
             if f_idx not in self._logged_cushion_frames:
@@ -716,6 +760,23 @@ class CausalKissSafeFSM:
                     f"[선쿠션:{self.cushions_before_first_hit} + 후쿠션:{self.cushions_after_first_hit} = 총:{self.cushion_count}]"
                 )
 
+    @staticmethod
+    def _compute_line_fit_rmse(pts: np.ndarray) -> float:
+        """
+        [기술 4: 빈 공대 TU Wien 논문]
+        주어진 2D 궤적 점들(N x 2)에 단일 직선을 최소자승법(SVD/PCA)으로 피팅했을 때의
+        수직 잔차 RMSE(mm)를 계산합니다. 직선 등속 주행이면 0에 수렴하고, 미세 충돌 시 >= 1.6mm로 증가합니다.
+        """
+        if len(pts) < 3:
+            return 0.0
+        pts_f = np.asarray(pts, dtype=np.float64)
+        mean_pt = np.mean(pts_f, axis=0)
+        centered = pts_f - mean_pt
+        cov = centered.T @ centered
+        eigvals, _ = np.linalg.eigh(cov)
+        min_eig = max(0.0, float(eigvals[0]))
+        return float(np.sqrt(min_eig / len(pts_f)))
+
     def _check_cue_polyline_vertex_at_target(
         self,
         target_pos: np.ndarray,
@@ -724,23 +785,27 @@ class CausalKissSafeFSM:
         f_curr: FrameSnapshot,
         f_post2: FrameSnapshot,
         cue_color: BallColor,
-    ) -> Tuple[bool, float]:
+    ) -> Tuple[bool, float, float]:
         """
-        [원리 3 - 현상 B 보조]:
-        수구가 목적구와 최근접한 시점(f_curr) 전후 궤적에 cv2.approxPolyDP를 적용하여,
-        목적구 바로 옆에서 실제로 4.2도 이상 꺾인 꼭짓점이 발생했는지 확인합니다.
+        [원리 3 & 기술 4 - 증거 B 보조]:
+        수구가 목적구와 최근접한 시점(f_curr) 전후 궤적에 대해
+        1) cv2.approxPolyDP 꼭짓점 굴절각(kink_deg)과
+        2) 단일 직선 회귀 잔차(line_rmse)를 함께 계산하여 반환합니다.
+        반환값: (is_broken_line, best_bend_deg, line_rmse_mm)
         """
         p0 = f_pre2.pos[cue_color]
         p1 = f_prev.pos[cue_color]
         p2 = f_curr.pos[cue_color]
         p3 = f_post2.pos[cue_color]
 
-        # 현재 최근접 프레임(f_curr = p2)에서 궤적이 실제로 꺾였는지 확인
         bend_at_curr = self._angle_between_deg(p2 - p1, p3 - p2)
         if bend_at_curr < 1.8:
-            return False, 0.0
+            return False, 0.0, 0.0
 
-        local_pts = np.array([p0, p1, p2, p3], dtype=np.float32).reshape(-1, 1, 2)
+        pts_4 = np.array([p0, p1, p2, p3], dtype=np.float64)
+        line_rmse = self._compute_line_fit_rmse(pts_4)
+
+        local_pts = pts_4.astype(np.float32).reshape(-1, 1, 2)
         approx = cv2.approxPolyDP(local_pts, epsilon=1.8, closed=False).reshape(-1, 2)
 
         max_bend = 0.0
@@ -755,7 +820,10 @@ class CausalKissSafeFSM:
                 max_bend = bend
 
         best_bend = max(max_bend, bend_at_curr)
-        return best_bend >= self.THIN_HIT_MIN_BEND_DEG, best_bend
+        is_valid_kink = (best_bend >= self.THIN_HIT_MIN_BEND_DEG) and (
+            line_rmse >= self.THIN_HIT_MIN_LINE_RMSE_MM or best_bend >= 4.2
+        )
+        return is_valid_kink, best_bend, line_rmse
 
     def _verify_pair_collision(
         self,
@@ -795,8 +863,11 @@ class CausalKissSafeFSM:
         if is_object_ball_kiss_check:
             disp_b1 = float(np.linalg.norm(f_post2.pos[ball_x] - f_pre2.pos[ball_x]))
             disp_b2 = float(np.linalg.norm(f_post2.pos[ball_y] - f_pre2.pos[ball_y]))
-            if d_min <= 66.0 and (disp_b1 >= 5.5 or disp_b2 >= 5.5):
+            if d_min <= 66.0 and (disp_b1 >= 5.2 or disp_b2 >= 5.2):
                 self.pair_last_hit_time[pair_key] = t_eval
+                # [기술 2-3] 적구 간 키스 발생 즉시 두 목적구의 정지 앵커를 키스 후 위치로 갱신
+                self.target_rest_anchor[ball_x] = f_post2.pos[ball_x].copy()
+                self.target_rest_anchor[ball_y] = f_post2.pos[ball_y].copy()
                 return True
             return False
 
@@ -826,14 +897,27 @@ class CausalKissSafeFSM:
         p_y_after = f_post2.pos[ball_y]
 
         dt_before = max(f_prev.t - f_pre2.t, 1e-4)
+        dt_after = max(f_post2.t - f_curr.t, 1e-4)
         dt_total = max(f_post2.t - f_pre2.t, 1e-4)
         v_y_before = (p_y_mid - p_y_before) / dt_before
+        v_y_after = (p_y_after - f_curr.pos[ball_y]) / dt_after
+        delta_v_y = v_y_after - v_y_before
+        delta_v_y_mag = float(np.linalg.norm(delta_v_y))
         speed_y_before = float(np.linalg.norm(v_y_before))
 
+        v_x_before = (f_curr.pos[ball_x] - f_pre2.pos[ball_x]) / max(f_curr.t - f_pre2.t, 1e-4)
+        v_x_after = (f_post2.pos[ball_x] - f_curr.pos[ball_x]) / dt_after
+        delta_v_x = v_x_after - v_x_before
+
+        v_z_before = (f_prev.pos[other_ball] - f_pre2.pos[other_ball]) / dt_before
+        v_z_after = (f_post2.pos[other_ball] - f_curr.pos[other_ball]) / dt_after
+        delta_v_z = v_z_after - v_z_before
+        delta_v_z_mag = float(np.linalg.norm(delta_v_z))
+
         # ------------------------------------------------------------------
-        # [현상 A] 목적구 위치 이탈(Displacement) 확인
+        # [기술 4 - 증거 A] 정지 앵커 이탈(Pre/Post Stationary Anchor Diffing) + 직접 타격
         # ------------------------------------------------------------------
-        has_cue_vertex, cue_bend_deg = self._check_cue_polyline_vertex_at_target(
+        has_cue_vertex, cue_bend_deg, line_rmse = self._check_cue_polyline_vertex_at_target(
             f_curr.pos[ball_y], f_pre2, f_prev, f_curr, f_post2, ball_x
         )
         recent_ob_kiss = abs(t_eval - self.last_object_kiss_time) <= 0.08
@@ -841,11 +925,15 @@ class CausalKissSafeFSM:
         phenomenon_a_hit = False
         if speed_y_before < 40.0 and not recent_ob_kiss:
             # 목적구가 정지해 있었고 직전 적구 간 키스가 없었던 경우:
-            # 수구 통과 후 목적구가 정지 위치(p_y_before)로부터 5.5mm 이상 밀려났는지 확인!
+            # 직전 정지 앵커(p_y_before) 대비 5.2mm 이상 이동하고 국소 속도 변화(||Delta v_Y|| >= 42.0mm/s)가 발생했는지 확인!
             net_disp_y = float(np.linalg.norm(p_y_after - p_y_before))
             step_after_hit = float(np.linalg.norm(p_y_after - f_curr.pos[ball_y]))
-            if net_disp_y >= self.TARGET_MOVED_DISP_TH_MM and step_after_hit >= 1.5:
-                # 다른 목적구(other_ball)가 친 것이 아닌지 확인 (수구가 다른 목적구보다 더 가깝게 타격)
+            if (
+                net_disp_y >= self.TARGET_MOVED_DISP_TH_MM
+                and step_after_hit >= 1.5
+                and delta_v_y_mag >= self.TARGET_MIN_DELTA_V_MM_S
+            ):
+                # 제3의 공 Z가 친 간접 충격(J_ZY > J_AY)이 아닌지 확인
                 if d_min <= d_x_other + 6.0 or d_y_other > 68.0:
                     phenomenon_a_hit = True
         else:
@@ -854,7 +942,6 @@ class CausalKissSafeFSM:
             # 동시에 수구도 반작용으로 꼭짓점 굴절이 동반되었을 때만 진짜 타격으로 인정!
             expected_y_after = p_y_before + v_y_before * dt_total
             deviation_from_coast = float(np.linalg.norm(p_y_after - expected_y_after))
-            v_y_after = (p_y_after - f_curr.pos[ball_y]) / max(f_post2.t - f_curr.t, 1e-4)
             y_bend_deg = self._angle_between_deg(v_y_before, v_y_after)
             if (
                 deviation_from_coast >= 12.0
@@ -867,7 +954,7 @@ class CausalKissSafeFSM:
                 phenomenon_a_hit = True
 
         # ------------------------------------------------------------------
-        # [현상 B] 목적구가 안 밀린 얇은 스침 (수구 꼭짓점 확인 또는 SubPixel 위상 진동)
+        # [기술 4 - 증거 B] 초미세 스침에 의한 수구 직선 파괴(Line-Fit RMSE) 및 운동량 흡수 검증
         # ------------------------------------------------------------------
         phenomenon_b_hit = False
         if subpixel_phase_hit and d_min <= 95.0 and d_y_other > 72.0:
@@ -878,27 +965,34 @@ class CausalKissSafeFSM:
             d_rail_now = min(px, TABLE_W - px, py, TABLE_H - py)
             is_bouncing_on_rail = d_rail_now <= self.RAIL_ENTER_MARGIN
 
-            other_moved = float(np.linalg.norm(f_post2.pos[other_ball] - f_pre2.pos[other_ball])) >= 5.5
+            other_moved = float(np.linalg.norm(f_post2.pos[other_ball] - f_pre2.pos[other_ball])) >= 5.2
+
+            # [기술 4-2 핵심 방어: 2적구 위치에서의 1적구 재충돌 운동량 흡수 차단]
+            # 만약 제1적구(Z=other_ball)가 수구(A) 근방(<= 74.0mm)에 있으면서
+            # 반작용 운동량을 흡수(||Delta v_Z|| >= 28.0 mm/s 및 ||Delta v_A + Delta v_Z|| < ||Delta v_A + Delta v_Y||)했다면,
+            # 수구(A)를 꺾이게 만든 범인은 제2적구(Y)가 아니라 제1적구(Z)이므로 증거 B를 즉시 무효화합니다!
+            first_ball_absorbed_momentum = False
+            if self.first_target_ball is not None and ball_y != self.first_target_ball:
+                res_az = float(np.linalg.norm(delta_v_x + delta_v_z))
+                res_ay = float(np.linalg.norm(delta_v_x + delta_v_y))
+                if (
+                    d_x_other <= 74.0
+                    and delta_v_z_mag >= 28.0
+                    and res_az < res_ay
+                ):
+                    first_ball_absorbed_momentum = True
 
             if self.first_target_ball is None:
                 # 제1적구 최초 타격 시:
-                # 1쿠션 넣어치기(Test 6)에서 쿠션 입사 꼭짓점(d_rail <= 45mm)일 때 바로 옆 정지 적구(disp < 2mm)를
-                # 쿠션보다 먼저 맞혔다고 오판하지 않도록, 레일 밀착 시에는 적구가 실제로 밀렸을 때만 인정
                 if (
                     d_min <= self.THIN_HIT_MAX_DIST_MM
                     and has_cue_vertex
                     and (not is_bouncing_on_rail or float(np.linalg.norm(p_y_after - p_y_before)) >= 3.0)
                 ):
                     phenomenon_b_hit = True
-            else:
+            elif not first_ball_absorbed_momentum:
                 # 제2적구 얇은 스침 시:
-                # 수구 꼭짓점이 목적구 옆(d_min <= 65.5mm)에서 4.2도 이상 꺾였고,
-                # 다른 목적구(제1적구)와 충돌한 것이 아니며(d_x_other > 72mm & not other_moved),
-                # 쿠션 반사 중이 아니고, 목적구도 최소 1.5mm 이상 움찔했을 때만 미세 스침으로 인정!
-                # 단, 목적구가 이미 적구 간 키스로 이동 중(speed_y_before >= 40.0)이라면
-                # 목적구의 진행 방향도 최소 3.5도 이상 꺾였을 때만 인정하여 이동 중 비접촉 통과 착시를 차단합니다.
                 net_disp_y = float(np.linalg.norm(p_y_after - p_y_before))
-                v_y_after = (p_y_after - f_curr.pos[ball_y]) / max(f_post2.t - f_curr.t, 1e-4)
                 y_bend_deg = (
                     self._angle_between_deg(v_y_before, v_y_after)
                     if speed_y_before >= 40.0
@@ -908,6 +1002,7 @@ class CausalKissSafeFSM:
                     d_min <= self.THIN_HIT_MAX_DIST_MM
                     and has_cue_vertex
                     and cue_bend_deg >= self.THIN_HIT_MIN_BEND_DEG
+                    and line_rmse >= self.THIN_HIT_MIN_LINE_RMSE_MM
                     and not is_bouncing_on_rail
                     and d_x_other > 72.0
                     and not other_moved
@@ -919,7 +1014,7 @@ class CausalKissSafeFSM:
                     # 수구가 고속(>= 400mm/s)으로 목적구 중심 거리 56.0mm 이내까지 정면 진입한 뒤
                     # 통과하지 못하고 목적구 앞에서 급감속 정지(Stop-Shot)한 경우 충돌 인정
                     v_x_pre = (f_curr.pos[ball_x] - f_prev.pos[ball_x]) / max(f_curr.t - f_prev.t, 1e-4)
-                    v_x_post = (f_post2.pos[ball_x] - f_curr.pos[ball_x]) / max(f_post2.t - f_curr.t, 1e-4)
+                    v_x_post = (f_post2.pos[ball_x] - f_curr.pos[ball_x]) / dt_after
                     s_x_pre = float(np.linalg.norm(v_x_pre))
                     s_x_post = float(np.linalg.norm(v_x_post))
                     if (
@@ -933,6 +1028,7 @@ class CausalKissSafeFSM:
 
         if phenomenon_a_hit or phenomenon_b_hit:
             self.pair_last_hit_time[pair_key] = t_eval
+            self.target_rest_anchor[ball_y] = p_y_after.copy()
             return True
 
         return False
@@ -996,13 +1092,21 @@ class CausalKissSafeFSM:
             self._update_polyline_cushion_counts()
             self.second_target_ball = target_color
             self.cushions_at_second_hit = self.cushion_count
+            self._sync_shot_event_tokens()
+            grammar_valid, grammar_bank, _, _ = self._parse_event_grammar_on_b2()
 
             if self.state == ShotState.IN_PLAY:
-                if self.cushion_count >= 3 and not self.double_hit_foul:
+                if (
+                    grammar_valid
+                    and self.cushion_count >= 3
+                    and not self.double_hit_foul
+                ):
                     self.state = ShotState.VALID_SCORE_PENDING
-                    self.is_bank_shot = self.cushions_before_first_hit >= 1
+                    self.is_bank_shot = bool(
+                        grammar_bank or self.cushions_before_first_hit >= 1
+                    )
                     self.event_log.append(
-                        f"[{t:.2f}s] ★ 제2적구 정상 접촉 ({target_color.name}) -> 충돌 즉시 실시간 득점(+1) 발송!"
+                        f"[{t:.2f}s] ★ 제2적구 정상 접촉 ({target_color.name}) -> 충돌 즉시 실시간 득점(+1) 발송! (Tokens: {self.shot_event_tokens})"
                     )
                     if not self.score_dispatched:
                         self.score_dispatched = True
@@ -1023,6 +1127,7 @@ class CausalKissSafeFSM:
                             shot_id=self.shot_seq_id,
                             is_turn_end=False,
                             already_dispatched=False,
+                            shot_event_tokens=list(self.shot_event_tokens),
                         )
                         self._pending_immediate_result = instant_result
                         if self.on_immediate_score is not None:
@@ -1135,7 +1240,7 @@ class CausalKissSafeFSM:
         # [Step 0] 적구 정면 키스 시 트래커 ID 스왑(자리바꿈 키스) 감지 및 역스왑
         self._detect_and_fix_kiss_id_swap(t_eval, b1, b2)
 
-        # [Step 1] 적구 간 키스 감지 (B <-> C)
+        # [Step 1] 적구 간 키스 감지 (B <-> C) 및 제2적구 정지 앵커(target_rest_anchor) 즉시 갱신
         if self._verify_pair_collision(
             ball_x=b1,
             ball_y=b2,
@@ -1148,8 +1253,12 @@ class CausalKissSafeFSM:
         ):
             self.object_ball_kiss_occurred = True
             self.last_object_kiss_time = t_eval
+            self._kiss_token_count += 1
+            self.target_rest_anchor[b1] = f_post2.pos[b1].copy()
+            self.target_rest_anchor[b2] = f_post2.pos[b2].copy()
+            self._sync_shot_event_tokens()
             self.event_log.append(
-                f"[{t_eval:.2f}s] [적구 간 키스 감지] {b1.name} <-> {b2.name}"
+                f"[{t_eval:.2f}s] [적구 간 키스 감지] {b1.name} <-> {b2.name} (앵커 갱신 완료)"
             )
 
         # [Step 2] 폴리라인 꼭짓점 쿠션 카운트 최신화
@@ -1388,6 +1497,7 @@ class CausalKissSafeFSM:
                 )
                 for c_k, p_init in self.initial_positions.items():
                     self.rest_pos[c_k] = p_init.copy()
+                    self.target_rest_anchor[c_k] = p_init.copy()
 
                 cue_init_p = self.initial_positions[cue]
                 self.stroke_origin_pos = cue_init_p.copy()
@@ -1544,6 +1654,7 @@ class CausalKissSafeFSM:
         """
         if not self.score_dispatched:
             self._update_polyline_cushion_counts()
+        self._sync_shot_event_tokens()
 
         scored = (
             self.state == ShotState.VALID_SCORE_PENDING or self.score_dispatched
@@ -1578,6 +1689,7 @@ class CausalKissSafeFSM:
             shot_id=self.shot_seq_id,
             is_turn_end=(not scored),
             already_dispatched=was_dispatched,
+            shot_event_tokens=list(self.shot_event_tokens),
         )
 
         # [원리 1-3 & 1-4]

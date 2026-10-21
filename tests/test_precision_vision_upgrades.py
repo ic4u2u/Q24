@@ -256,9 +256,62 @@ def test_motion_streak_v_apex_detection():
 
     assert instant_res is not None and instant_res.scored is True, "V-Apex 쿠션 반사 복원으로 3쿠션 득점이 인정되어야 합니다."
     assert instant_res.cushions_at_second_hit >= 3
+    assert "B1" in instant_res.shot_event_tokens and "B2" in instant_res.shot_event_tokens
+    assert instant_res.shot_event_tokens.count("C") >= 3
     print(
         f"[PASS] Test 3 (MotionStreakVApexDetector & CushionRimPixelTrigger): "
         f"V자 잔상 꼭짓점={apex_ev.apex_offset_px}, 굴절각={apex_ev.intra_frame_bend_deg:.1f}° 검출 및 3쿠션 득점 연동 완료"
+    )
+
+
+def test_literature_5_algorithms_integration() -> None:
+    """
+    4. 문헌 기반 5대 핵심 알고리즘(YCbCr 크로마키 + 타원 장축 분해 split_merged_oval_blob,
+    직선 회귀 잔차 Line-Fit RMSE, 이벤트 시퀀스 문법 파서 shot_event_tokens) 통합 검증.
+    """
+    from ball_identity_tracker import LabHungarianBallIdentifier, split_merged_oval_blob
+
+    # (1) 두 공이 키스하여 하나로 합쳐진 가로형 타원 블롭(가로 68px, 세로 32px -> 장단축비 2.125 >= 1.45) 생성
+    frame_bgr = np.zeros((200, 300, 3), dtype=np.uint8)
+    frame_bgr[:, :] = (190, 95, 20)  # 파란색 당구대 라사지 배경 (B가 높음 -> Cb 마스킹 대상)
+    cv2.circle(frame_bgr, (134, 100), 15, (235, 235, 235), -1)  # 왼쪽 흰공
+    cv2.circle(frame_bgr, (166, 100), 15, (25, 215, 245), -1)   # 오른쪽 노란공
+    cv2.circle(frame_bgr, (240, 100), 15, (20, 25, 225), -1)    # 적구
+
+    sub_boxes = split_merged_oval_blob((116.0, 84.0, 184.0, 116.0))
+    assert len(sub_boxes) == 2, f"중첩 타원 블롭은 2개의 서브 박스로 분할되어야 합니다: len={len(sub_boxes)}"
+    c1_x = 0.5 * (sub_boxes[0][0] + sub_boxes[0][2])
+    c2_x = 0.5 * (sub_boxes[1][0] + sub_boxes[1][2])
+    assert abs(c2_x - c1_x) >= 20.0, f"분할된 두 서브 박스 중심 간격이 충분해야 합니다: {c1_x:.1f} vs {c2_x:.1f}"
+
+    # 분할된 박스를 LabHungarianBallIdentifier에 넣었을 때 YCbCr 마스킹 + 상대 색도 랭킹으로 3구 정확히 식별하는지 검증
+    identifier = LabHungarianBallIdentifier()
+    id_res = identifier.assign_ball_identities(
+        frame_bgr,
+        [
+            (116.0, 84.0, 184.0, 116.0),
+            (224.0, 84.0, 256.0, 116.0),
+        ],
+    )
+    assert set(id_res.keys()) == {BallColor.WHITE, BallColor.YELLOW, BallColor.RED}
+
+    # (2) 직선 회귀 잔차(Line-Fit RMSE) 검증: 완벽한 직선(0.0mm) vs 꺾인 궤적(>= 1.6mm)
+    straight_pts = np.array(
+        [[100.0, 100.0], [150.0, 100.0], [200.0, 100.0], [250.0, 100.0], [300.0, 100.0]],
+        dtype=np.float64,
+    )
+    kinked_pts = np.array(
+        [[100.0, 100.0], [150.0, 100.0], [200.0, 100.0], [250.0, 112.0], [300.0, 125.0]],
+        dtype=np.float64,
+    )
+    rmse_straight = CausalKissSafeFSM._compute_line_fit_rmse(straight_pts)
+    rmse_kinked = CausalKissSafeFSM._compute_line_fit_rmse(kinked_pts)
+    assert rmse_straight < 0.01, f"직선 등속 궤적의 Line-Fit RMSE는 0에 수렴해야 합니다: {rmse_straight}"
+    assert rmse_kinked >= 1.6, f"충돌로 꺾인 궤적의 Line-Fit RMSE는 1.6mm 이상이어야 합니다: {rmse_kinked}"
+
+    print(
+        f"[PASS] Test 4 (문헌 기반 5대 핵심 기술): split_merged_oval_blob 2구 분할 완료 "
+        f"(c1_x={c1_x:.1f}, c2_x={c2_x:.1f}) | Line-Fit RMSE 직선={rmse_straight:.4f}mm vs 굴절={rmse_kinked:.2f}mm 검증 완료"
     )
 
 
@@ -266,4 +319,5 @@ if __name__ == "__main__":
     test_3d_ray_plane_vs_2d_homography()
     test_subpixel_phase_correlate_0_1px_kiss()
     test_motion_streak_v_apex_detection()
-    print("\n=== 4대 고성능 비전 판독 기술(Sub-Pixel & 3D Ray-Plane) 통합 검증 전체 PASS 완료! ===")
+    test_literature_5_algorithms_integration()
+    print("\n=== 4대 고성능 비전 판독 기술 + 문헌 기반 5대 핵심 알고리즘 통합 검증 전체 PASS 완료! ===")
