@@ -235,6 +235,16 @@ class CausalKissSafeFSM:
 
         self.stop_counter: int = 0
         self.cue_path: List[CuePathPoint] = []
+        self.cue_lifecycle_path: List[
+            Tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ] = []
+        self.rail_valley_min_dist: Dict[Rail, float] = {r: 9999.0 for r in Rail}
+        self.rail_valley_min_pos: Dict[Rail, Optional[np.ndarray]] = {
+            r: None for r in Rail
+        }
+        self.rail_valley_min_time: Dict[Rail, float] = {r: 0.0 for r in Rail}
+        self.rail_valley_entry_dist: Dict[Rail, float] = {r: 9999.0 for r in Rail}
+        self.rail_valley_locked: Dict[Rail, bool] = {r: False for r in Rail}
         self.all_ball_paths: Dict[BallColor, List[Tuple[int, float, np.ndarray]]] = {
             c: [] for c in BallColor
         }
@@ -529,7 +539,11 @@ class CausalKissSafeFSM:
         수구는 충돌 지점에 멈추거나 감속하고 1적구가 수구의 진행 방향으로 튕겨 나갔을 때
         트래커가 튕겨 나간 1적구를 수구로 오인(ID 스왑)한 경우 즉시 역스왑하여 수구 궤적을 복원합니다.
         """
-        if (t_eval - self._last_id_swap_check_time) < 0.12 or len(self.history) < 5:
+        if (
+            self.first_target_ball is not None
+            or (t_eval - self._last_id_swap_check_time) < 0.12
+            or len(self.history) < 5
+        ):
             return False
 
         f_pre2 = self.history[-5]
@@ -549,7 +563,7 @@ class CausalKissSafeFSM:
             f_pre2.pos[target_color],
             f_pre2.pos[target_color],
         )
-        if min(d_min, d_pass) > 42.0:
+        if d_min > 18.0:
             return False
 
         dt_pre = max(f_prev.t - f_pre2.t, 1e-4)
@@ -574,12 +588,12 @@ class CausalKissSafeFSM:
         tar_stay_disp = float(
             np.linalg.norm(f_post.pos[target_color] - f_pre2.pos[target_color])
         )
-        # 물리적으로 수구가 정지 적구 중심(<= 42mm)을 관통해 직진(cos_dir > 0.88)하면서 정지 적구가 제자리에 머물 수는 없음 -> 100% ID 스왑!
+        # 물리적으로 수구가 정지 적구 중심(<= 18mm)을 관통해 직진(cos_dir > 0.96)하면서 정지 적구가 제자리에 머물 수는 없음 -> 100% ID 스왑!
         if (
-            s_cue_post > s_cue_pre * 0.55
-            and s_tar_post < max(60.0, s_cue_post * 0.35)
-            and tar_stay_disp <= 32.0
-            and cos_dir > 0.88
+            s_cue_post > s_cue_pre * 0.65
+            and s_tar_post < 55.0
+            and 4.5 <= tar_stay_disp <= 15.0
+            and cos_dir > 0.96
         ):
             self.id_swap_map[cue_color], self.id_swap_map[target_color] = (
                 self.id_swap_map[target_color],
@@ -770,6 +784,21 @@ class CausalKissSafeFSM:
             rail_candidates.sort(key=lambda item: item[0])
             d_rail_min, hit_rail = rail_candidates[0]
 
+            # [극소점 돌출도(Valley Prominence) 검증]: 벽면 근처 ±5mm 미세 떨림(돌출도 < 9.5mm)은 쿠션에서 즉시 배제
+            prom_lo = max(0, idx_curr - 4)
+            prom_hi = min(len(path) - 1, idx_curr + 4)
+            if hit_rail == Rail.LEFT:
+                d_seq = [float(path[i].pos[0]) for i in range(prom_lo, prom_hi + 1)]
+            elif hit_rail == Rail.RIGHT:
+                d_seq = [float(TABLE_W - path[i].pos[0]) for i in range(prom_lo, prom_hi + 1)]
+            elif hit_rail == Rail.TOP:
+                d_seq = [float(path[i].pos[1]) for i in range(prom_lo, prom_hi + 1)]
+            else:
+                d_seq = [float(TABLE_H - path[i].pos[1]) for i in range(prom_lo, prom_hi + 1)]
+            local_prominence = max(d_seq) - min(d_seq) if d_seq else 0.0
+            if local_prominence < 9.5:
+                continue
+
             # 목적구 충돌 꼭짓점과 쿠션 반사 꼭짓점 분리:
             # 1) 꼭짓점 시점이 제1적구 최초 충돌 시점과 겹치는 경우(전후 3프레임 이내):
             #    - 장거리 고속 타구에서는 충돌 1프레임 전(idx_curr = first_target_hit_path_idx - 1)에
@@ -911,13 +940,13 @@ class CausalKissSafeFSM:
             ):
                 continue
 
-            w_lo_s = max(0, idx_s - 2)
-            w_hi_s = min(len(path) - 1, idx_s + 2)
+            w_lo_s = max(0, idx_s - 3)
+            w_hi_s = min(len(path) - 1, idx_s + 3)
             v_in_s = path[idx_s].pos - path[w_lo_s].pos
             v_out_s = path[w_hi_s].pos - path[idx_s].pos
-            if float(np.linalg.norm(v_in_s)) < 25.0 or float(np.linalg.norm(v_out_s)) < 25.0:
+            if float(np.linalg.norm(v_in_s)) < 20.0 or float(np.linalg.norm(v_out_s)) < 20.0:
                 continue
-            if self._angle_between_deg(v_in_s, v_out_s) < self.POLY_MIN_CUSHION_BEND_DEG:
+            if self._angle_between_deg(v_in_s, v_out_s) < 8.0:
                 continue
 
             zone_x = min(230.0, max(self.RAIL_VERTEX_ZONE_MM, 75.0 + 0.85 * dx_step))
@@ -928,14 +957,45 @@ class CausalKissSafeFSM:
             d_t = float(pt_s.pos[1])
             d_b = float(TABLE_H - pt_s.pos[1])
 
+            dt_out_s = max(path[w_hi_s].t - path[idx_s].t, 1e-4)
+            v_norm_s = v_out_s / dt_out_s
+
             sub_cands: List[Tuple[float, Rail]] = []
-            if d_l <= zone_x and v_in_s[0] < -12.0 and v_out_s[0] > 12.0 and pt_s.pos[0] <= path[idx_s - 1].pos[0] and pt_s.pos[0] <= path[idx_s + 1].pos[0]:
+            if (
+                d_l <= zone_x
+                and v_in_s[0] < -10.5
+                and v_out_s[0] > 10.5
+                and v_norm_s[0] > 25.0
+                and pt_s.pos[0] <= path[idx_s - 1].pos[0]
+                and pt_s.pos[0] <= path[idx_s + 1].pos[0]
+            ):
                 sub_cands.append((d_l, Rail.LEFT))
-            if d_r <= zone_x and v_in_s[0] > 12.0 and v_out_s[0] < -12.0 and pt_s.pos[0] >= path[idx_s - 1].pos[0] and pt_s.pos[0] >= path[idx_s + 1].pos[0]:
+            if (
+                d_r <= zone_x
+                and v_in_s[0] > 10.5
+                and v_out_s[0] < -10.5
+                and -v_norm_s[0] > 25.0
+                and pt_s.pos[0] >= path[idx_s - 1].pos[0]
+                and pt_s.pos[0] >= path[idx_s + 1].pos[0]
+            ):
                 sub_cands.append((d_r, Rail.RIGHT))
-            if d_t <= zone_y and v_in_s[1] < -12.0 and v_out_s[1] > 12.0 and pt_s.pos[1] <= path[idx_s - 1].pos[1] and pt_s.pos[1] <= path[idx_s + 1].pos[1]:
+            if (
+                d_t <= zone_y
+                and v_in_s[1] < -10.5
+                and v_out_s[1] > 10.5
+                and v_norm_s[1] > 25.0
+                and pt_s.pos[1] <= path[idx_s - 1].pos[1]
+                and pt_s.pos[1] <= path[idx_s + 1].pos[1]
+            ):
                 sub_cands.append((d_t, Rail.TOP))
-            if d_b <= zone_y and v_in_s[1] > 12.0 and v_out_s[1] < -12.0 and pt_s.pos[1] >= path[idx_s - 1].pos[1] and pt_s.pos[1] >= path[idx_s + 1].pos[1]:
+            if (
+                d_b <= zone_y
+                and v_in_s[1] > 10.5
+                and v_out_s[1] < -10.5
+                and -v_norm_s[1] > 25.0
+                and pt_s.pos[1] >= path[idx_s - 1].pos[1]
+                and pt_s.pos[1] >= path[idx_s + 1].pos[1]
+            ):
                 sub_cands.append((d_b, Rail.BOTTOM))
 
             if sub_cands:
@@ -961,6 +1021,39 @@ class CausalKissSafeFSM:
                 existing_indices.add(idx_s)
 
         valid_vertices.sort(key=lambda item: item[0])
+
+        # 정렬된 전체 꼭짓점에 대해 동일 레일 220mm 심층 이탈 잠금 규칙 최종 적용
+        dedup_vertices: List[Tuple[int, float, Rail, np.ndarray]] = []
+        prev_r_lock: Optional[Rail] = None
+        prev_p_idx: int = -1
+        frame_to_path_idx = {pt.frame_idx: i for i, pt in enumerate(path)}
+        for f_v, t_v, r_v, pos_v in valid_vertices:
+            cur_p_idx = frame_to_path_idx.get(f_v, 0)
+            if r_v == prev_r_lock and prev_p_idx >= 0:
+                crossed_t1 = (
+                    self.first_target_hit_path_idx is not None
+                    and prev_p_idx < self.first_target_hit_path_idx < cur_p_idx
+                )
+                if not crossed_t1:
+                    max_away_d = 0.0
+                    for m_i in range(prev_p_idx, cur_p_idx + 1):
+                        mp = path[m_i].pos
+                        if r_v == Rail.LEFT:
+                            rd = float(mp[0])
+                        elif r_v == Rail.RIGHT:
+                            rd = float(TABLE_W - mp[0])
+                        elif r_v == Rail.TOP:
+                            rd = float(mp[1])
+                        else:
+                            rd = float(TABLE_H - mp[1])
+                        if rd > max_away_d:
+                            max_away_d = rd
+                    if max_away_d < self.SAME_RAIL_DEEP_EXIT_MM:
+                        continue
+            dedup_vertices.append((f_v, t_v, r_v, pos_v))
+            prev_r_lock = r_v
+            prev_p_idx = cur_p_idx
+        valid_vertices = dedup_vertices
 
         # 제1적구가 정지 위치에서 실제로 밀려나기 시작한 최초 시각(t_b1_moved) 및
         # 수구가 레일 반사 없이 제1적구로 곧장 직진했는지(is_direct_shot_to_t1) 판별:
@@ -1025,6 +1118,8 @@ class CausalKissSafeFSM:
                     # 100% 수구가 쿠션을 맞추지 않고 1적구를 먼저 충돌한 샷(is_direct_shot_to_t1 = True)으로 확정합니다.
                     if self.min_rail_dist_before_first_hit > 72.0:
                         is_direct_shot_to_t1 = True
+                    if self._geom_one_bank_recovered and self.min_rail_dist_before_first_hit <= 48.0:
+                        is_direct_shot_to_t1 = False
 
         cue_now_c = self.active_cue_ball or self.assigned_cue_ball
         obj_init_positions = [
@@ -1116,6 +1211,7 @@ class CausalKissSafeFSM:
                     can_convert_first_v
                     and self.stroke_origin_pos is not None
                     and t1_init_pos is not None
+                    and not (first_v_t < self.first_target_hit_time and self.min_rail_dist_before_first_hit <= 48.0)
                 ):
                     if (
                         float(np.linalg.norm(first_v_pos - self.stroke_origin_pos))
@@ -1305,8 +1401,13 @@ class CausalKissSafeFSM:
         disp_vec_post1 = f_post1.pos[ball_y] - p_y_anchor
         disp_vec_post2 = f_post2.pos[ball_y] - p_y_anchor
         net_disp_y = float(np.linalg.norm(disp_vec_post2))
+        if ball_y in self.target_rest_anchor:
+            disp_from_true_rest = float(
+                np.linalg.norm(f_post2.pos[ball_y] - self.target_rest_anchor[ball_y])
+            )
+            net_disp_y = min(net_disp_y, disp_from_true_rest)
 
-        if net_disp_y < 1.1:
+        if net_disp_y < 1.1 or self.centroid_clamp_cooldown.get(ball_y, 0) > 0:
             return False, 0.0, "ZERO_TARGET_DISPLACEMENT"
 
         # [증거 1] 인과적 법선 반발 코사인 검증 (Push-Only Physics)
@@ -1413,7 +1514,15 @@ class CausalKissSafeFSM:
         d_min_post, _, n_xy_post = self._subframe_ccd(
             f_curr.pos[ball_x], f_post2.pos[ball_x], f_curr.pos[ball_y], f_post2.pos[ball_y]
         )
-        if self.first_target_ball is None and not is_object_ball_kiss_check and d_min_post < d_min_pre:
+        if (
+            self.first_target_ball is None
+            and not is_object_ball_kiss_check
+            and d_min_post < d_min_pre
+            and (
+                float(np.linalg.norm(f_post2.pos[ball_y] - f_pre2.pos[ball_y])) >= 5.2
+                or d_min_pre <= 82.0
+            )
+        ):
             d_min = d_min_post
             n_xy = n_xy_post
         else:
@@ -1599,21 +1708,36 @@ class CausalKissSafeFSM:
                     cue_bend_deg,
                     self._angle_between_deg(v_x_before, v_x_after),
                 )
-                if d_min <= 70.0 and (
-                    cue_deflect_t1 >= 1.8
-                    or max_disp_t1 >= 1.0
-                    or has_cue_vertex
-                ):
-                    phenomenon_b_hit = True
-                elif (
-                    d_min <= 82.0
-                    and (has_cue_vertex or cue_deflect_t1 >= 2.5 or max_disp_t1 >= 1.8)
-                    and (not is_bouncing_on_rail or max_disp_t1 >= 1.2 or d_min <= 74.0)
-                ):
-                    phenomenon_b_hit = True
+                pyx, pyy = float(f_curr.pos[ball_y][0]), float(f_curr.pos[ball_y][1])
+                d_rail_y = min(pyx, TABLE_W - pyx, pyy, TABLE_H - pyy)
+                cue_deeper_in_rail_than_t1 = (
+                    d_rail_now <= 48.0
+                    and d_rail_y >= d_rail_now + 14.0
+                    and max_disp_t1 < 1.0
+                )
+                if not cue_deeper_in_rail_than_t1:
+                    if d_min <= 70.0 and (
+                        cue_deflect_t1 >= 1.8
+                        or max_disp_t1 >= 1.0
+                        or has_cue_vertex
+                    ):
+                        phenomenon_b_hit = True
+                    elif (
+                        d_min <= 82.0
+                        and (has_cue_vertex or cue_deflect_t1 >= 2.5 or max_disp_t1 >= 1.8)
+                        and (not is_bouncing_on_rail or max_disp_t1 >= 1.2 or d_min <= 74.0)
+                    ):
+                        phenomenon_b_hit = True
             elif not first_ball_absorbed_momentum:
                 # 제2적구 얇은 스침(0.1mm ~ 1.0mm 초미세 접촉) vs 아슬아슬한 불발(Near-Miss) 4중 교차 감식:
                 net_disp_y = float(np.linalg.norm(p_y_after - p_y_before))
+                if ball_y in self.target_rest_anchor and speed_y_before < 45.0:
+                    net_disp_y = min(
+                        net_disp_y,
+                        float(np.linalg.norm(p_y_after - self.target_rest_anchor[ball_y])),
+                    )
+                if self.centroid_clamp_cooldown.get(ball_y, 0) > 0:
+                    net_disp_y = 0.0
                 normal_disp_y = float(np.dot(p_y_after - p_y_before, n_xy))
                 y_bend_deg = (
                     self._angle_between_deg(v_y_before, v_y_after)
@@ -1660,13 +1784,26 @@ class CausalKissSafeFSM:
                     if micro_ok:
                         self.event_log.append(f"[{t_eval:.2f}s] [초미세 접촉 4중 감식 확정] {ball_y.name}: {micro_detail}")
                 else:
-                    # 수구가 고속(>= 400mm/s)으로 목적구 중심 거리 56.0mm 이내까지 정면 진입한 뒤
-                    # 통과하지 못하고 목적구 앞에서 급감속 정지(Stop-Shot)한 경우 충돌 인정
+                    # [형태 3: 수구 정면 감속 — 각도 변화 없는 정면 밀어치기/죽여치기 타격]
+                    # 수구가 목적구 Y를 정면(cos(theta) > 0.90, d_min <= 64.0mm)으로 타격하여
+                    # 수구 진행 각도는 안 꺾였지만(Delta theta ~ 0도), 충돌 직후 수구 속력이 120.0 mm/s 이상 급감하고
+                    # 목적구 Y가 수구 진행 방향으로 가속된 경우, 또는 Stop-Shot 급감속인 경우 충돌 확정!
                     v_x_pre = (f_curr.pos[ball_x] - f_prev.pos[ball_x]) / max(f_curr.t - f_prev.t, 1e-4)
                     v_x_post = (f_post2.pos[ball_x] - f_curr.pos[ball_x]) / dt_after
                     s_x_pre = float(np.linalg.norm(v_x_pre))
                     s_x_post = float(np.linalg.norm(v_x_post))
+                    u_x_pre = v_x_pre / max(s_x_pre, 1e-6)
+                    cos_head_on = float(np.dot(u_x_pre, n_xy))
+                    target_accel_forward = float(np.dot(delta_v_y, u_x_pre))
                     if (
+                        d_min <= 64.0
+                        and cos_head_on > 0.90
+                        and (s_x_pre - s_x_post) >= 120.0
+                        and target_accel_forward >= 42.0
+                        and d_x_other > 72.0
+                    ):
+                        phenomenon_b_hit = True
+                    elif (
                         d_min <= 58.0
                         and s_x_pre >= 350.0
                         and s_x_post <= s_x_pre * 0.20
@@ -1680,6 +1817,41 @@ class CausalKissSafeFSM:
             return True
 
         return False
+
+    def _extract_regression_directions(
+        self, idx: int, window: int = 3
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """전방/후방 3~4프레임 선형 회귀 방향 벡터 (u_in, u_out) 추출."""
+        n = len(self.cue_path)
+        if idx < 1 or idx >= n - 1:
+            return None, None
+        i0 = max(0, idx - window)
+        pts_in = np.array([self.cue_path[k].pos for k in range(i0, idx + 1)], dtype=np.float64)
+        ts_in = np.array([self.cue_path[k].t for k in range(i0, idx + 1)], dtype=np.float64)
+        tc_in = ts_in - np.mean(ts_in)
+        denom_in = float(np.dot(tc_in, tc_in))
+        v_in = (pts_in.T @ tc_in) / denom_in if denom_in > 1e-9 else (pts_in[-1] - pts_in[0])
+        norm_in = float(np.linalg.norm(v_in))
+        u_in = (v_in / norm_in) if norm_in > 1e-6 else None
+
+        i1 = min(n - 1, idx + window)
+        pts_out = np.array([self.cue_path[k].pos for k in range(idx, i1 + 1)], dtype=np.float64)
+        ts_out = np.array([self.cue_path[k].t for k in range(idx, i1 + 1)], dtype=np.float64)
+        tc_out = ts_out - np.mean(ts_out)
+        denom_out = float(np.dot(tc_out, tc_out))
+        v_out = (pts_out.T @ tc_out) / denom_out if denom_out > 1e-9 else (pts_out[-1] - pts_out[0])
+        norm_out = float(np.linalg.norm(v_out))
+        u_out = (v_out / norm_out) if norm_out > 1e-6 else None
+        return u_in, u_out
+
+    def _retroactive_cushion_audit(self, up_to_path_idx: Optional[int] = None) -> int:
+        """
+        전생애 궤적 역추적 감사:
+        제1적구 접촉 순간 및 제2적구 접촉 순간에 출발 시점부터 현재까지 쌓인 수구 전생애 궤적을 스캔하여
+        벽면 거리 극소점(Valley) + 방향 꺾임(>= 8도) 횟수를 재검산합니다.
+        """
+        self._update_polyline_cushion_counts(up_to_path_idx=up_to_path_idx)
+        return self.cushion_count
 
     def _register_cue_target_hit(
         self,
@@ -1792,17 +1964,49 @@ class CausalKissSafeFSM:
                     float(self.stroke_origin_pos[1]),
                     float(TABLE_H - self.stroke_origin_pos[1]),
                 )
+                t1_rail_dists = (
+                    float(t1_init[0]),
+                    float(TABLE_W - t1_init[0]),
+                    float(t1_init[1]),
+                    float(TABLE_H - t1_init[1]),
+                )
+                p_hit_c = self.cue_path[min(len(self.cue_path) - 1, best_hit_idx)].pos
+                hit_rail_dists = (
+                    float(p_hit_c[0]),
+                    float(TABLE_W - p_hit_c[0]),
+                    float(p_hit_c[1]),
+                    float(TABLE_H - p_hit_c[1]),
+                )
+                put_in_1bank_detected = False
                 for idx_pre in range(0, best_hit_idx):
                     p_pre = self.cue_path[idx_pre].pos
                     disp_orig = float(np.linalg.norm(p_pre - self.stroke_origin_pos))
                     dist_to_t1 = float(np.linalg.norm(p_pre - t1_init))
+                    cand_rail_dists = (
+                        float(p_pre[0]),
+                        float(TABLE_W - p_pre[0]),
+                        float(p_pre[1]),
+                        float(TABLE_H - p_pre[1]),
+                    )
+                    # [1쿠션 넣어치기(Put-in) 정밀 감지]:
+                    # 제1적구 바로 앞(dist_to_t1 < dyn_t1_excl)이라도 제1적구 접촉 이전(idx_pre < best_hit_idx)에
+                    # 수구가 제1적구 중심보다 레일 안쪽(<= 48mm & d_t1 - 14mm)까지 깊숙이 파고들어 쿠션을 찍은 뒤
+                    # 제1적구 타격 프레임(best_hit_idx)에서 이미 레일 바깥쪽으로 12mm 이상 튀어나와 타격했다면 100% 1쿠션 넣어치기!
+                    if disp_orig >= 50.0:
+                        for d_c, d_o, d_t1_r, d_hit_r in zip(
+                            cand_rail_dists, orig_rail_dists, t1_rail_dists, hit_rail_dists
+                        ):
+                            if (
+                                d_c <= 48.0
+                                and d_o - d_c >= 35.0
+                                and d_c <= d_t1_r - 14.0
+                                and d_hit_r - d_c >= 12.0
+                            ):
+                                put_in_1bank_detected = True
+                                if d_c < pre_hit_min_rail:
+                                    pre_hit_min_rail = d_c
+                                    pre_hit_rail_pt = p_pre.copy()
                     if disp_orig >= 25.0 and dist_to_t1 >= dyn_t1_excl:
-                        cand_rail_dists = (
-                            float(p_pre[0]),
-                            float(TABLE_W - p_pre[0]),
-                            float(p_pre[1]),
-                            float(TABLE_H - p_pre[1]),
-                        )
                         # 출발 단쿠션 근처에서 출발해 단쿠션에서 멀어지는 초기 좌표가 선행 레일 접근으로 오인되지 않도록,
                         # 실제로 출발점보다 해당 레일 쪽으로 12mm 이상 다가간 레일 거리만 인정합니다.
                         approached_dists = [
@@ -1816,6 +2020,9 @@ class CausalKissSafeFSM:
                                 pre_hit_min_rail = d_r_pre
                                 if disp_orig < d_orig_t1 - max(65.0, 45.0 + 0.85 * max_pre_step) or not is_direct_corridor_pre:
                                     pre_hit_rail_pt = p_pre.copy()
+                if put_in_1bank_detected:
+                    is_direct_corridor_pre = False
+                    self._geom_one_bank_recovered = True
             # 수구가 실제 쿠션 반사 대역(<= 72mm, 또는 원거리 <= 120mm 명확 반사)에 들어간 적이 없는데
             # 1적구가 움직였다면 수구가 쿠션을 맞추지 않고 1적구를 먼저 충돌한 것이므로 선쿠션 잠금을 0으로 강제합니다.
             if pre_hit_min_rail > 72.0:
@@ -1887,8 +2094,8 @@ class CausalKissSafeFSM:
                 ):
                     self._geom_one_bank_recovered = True
 
-            # 제1적구 충돌 직후 반사 벡터가 형성될 수 있도록 전체 현재 cue_path(f_post2 포함)를 기준으로 평가
-            self._update_polyline_cushion_counts()
+            # 제1적구 충돌 직후 반사 벡터가 형성될 수 있도록 전체 현재 cue_path(f_post2 포함)를 기준으로 역추적 감사 및 평가
+            self._retroactive_cushion_audit()
             self.is_bank_shot = bool(self.cushions_before_first_hit >= 1)
 
             self.event_log.append(
@@ -1902,8 +2109,8 @@ class CausalKissSafeFSM:
             )
 
         elif self.second_target_ball is None:
-            # 제2적구 최초 충돌 확정 순간 폴리라인 쿠션 꼭짓점 개수를 최종 집계
-            self._update_polyline_cushion_counts()
+            # 제2적구 최초 충돌 확정 순간 전생애 궤적 역추적 감사(_retroactive_cushion_audit)로 쿠션 개수를 최종 집계
+            self._retroactive_cushion_audit()
             self.second_target_ball = target_color
             self.cushions_at_second_hit = self.cushion_count
             self._sync_shot_event_tokens()
@@ -1962,8 +2169,73 @@ class CausalKissSafeFSM:
         f_curr: FrameSnapshot,
         f_post2: FrameSnapshot,
     ) -> None:
-        """투터치(밀어치기) 파울 감지는 사용자 요청에 따라 비활성화(타임아웃 파울만 유지)합니다."""
-        return
+        """
+        투터치(Double-Hit / Push) 파울 정밀 검사:
+        수구와 제1적구가 초근접(<= 50mm)한 상태에서 제1적구 충돌 직후 수구가 감속되지 않고
+        오히려 큐대에 의해 재가속되거나 초기 속력을 92% 이상 유지하며 제1적구와 완전히 동일 방향(cos >= 0.992)으로
+        밀고 나가는 푸시 파울만 정확히 검출합니다 (정상적인 정면 타격 감속 Form 3는 절대 오탐하지 않음).
+        """
+        if (
+            self.double_hit_foul
+            or self.active_cue_ball is None
+            or self.first_target_ball is None
+            or self.first_target_hit_time is None
+            or self.first_target_normal is None
+            or self.cushion_count > 0
+        ):
+            return
+
+        dt_since_b1 = t_eval - self.first_target_hit_time
+        if dt_since_b1 < 0.0 or dt_since_b1 > 0.14:
+            return
+
+        cue = self.active_cue_ball
+        b1 = self.first_target_ball
+        init_dist = self.initial_ball_distances.get(b1, 999.0)
+        if init_dist > 115.0:
+            return
+
+        dt_post = max(f_post2.t - f_curr.t, 1e-4)
+        v_cue_post = (f_post2.pos[cue] - f_curr.pos[cue]) / dt_post
+        v_b1_post = (f_post2.pos[b1] - f_curr.pos[b1]) / dt_post
+        speed_cue_post = float(np.linalg.norm(v_cue_post))
+        speed_b1_post = float(np.linalg.norm(v_b1_post))
+        if speed_cue_post < 320.0 or speed_b1_post < 320.0:
+            return
+
+        # 충돌 직전 수구 속력 대비 감속 여부 확인 (정상 정면 타격 Form 3는 속력이 급감하므로 파울 아님)
+        f_pre_ref = self.history[-5] if len(self.history) >= 5 else self.history[0]
+        dt_pre_ref = max(f_curr.t - f_pre_ref.t, 1e-4)
+        speed_cue_pre = float(np.linalg.norm((f_curr.pos[cue] - f_pre_ref.pos[cue]) / dt_pre_ref))
+        if speed_cue_pre > 100.0 and speed_cue_post < speed_cue_pre * 0.85:
+            return
+
+        u_cue = v_cue_post / speed_cue_post
+        u_b1 = v_b1_post / speed_b1_post
+        cos_follow = float(np.dot(u_cue, u_b1))
+        cos_normal = float(np.dot(u_cue, self.first_target_normal))
+        post_dist = float(np.linalg.norm(f_post2.pos[cue] - f_post2.pos[b1]))
+        acc_cue = f_post2.acc[cue]
+        is_reaccelerating = (
+            speed_cue_post >= max(850.0, speed_cue_pre * 1.18)
+            and float(np.dot(acc_cue, u_cue)) > 0.0
+            and float(np.dot(acc_cue, self.first_target_normal)) > 1500.0
+            and cos_normal >= 0.85
+            and post_dist <= 125.0
+        )
+
+        if is_reaccelerating or (
+            cos_follow >= 0.992
+            and cos_normal >= 0.975
+            and speed_cue_post >= speed_b1_post * 0.68
+            and post_dist <= 82.0
+        ):
+            self.double_hit_foul = True
+            self.state = ShotState.NO_SCORE_LOCKED
+            self.fail_reason = "DOUBLE_HIT_FOUL"
+            self.event_log.append(
+                f"[{t_eval:.2f}s] ✖ 투터치(밀어치기) 파울 감지 (cos={cos_follow:.3f})"
+            )
 
     def _evaluate_frame_with_context(
         self, subpixel_impacts: Optional[Dict[BallColor, bool]] = None
@@ -2348,6 +2620,15 @@ class CausalKissSafeFSM:
                         self.all_ball_paths[bc].append(
                             (s_h.frame_idx, s_h.t, s_h.pos[bc].copy())
                         )
+                    self.cue_lifecycle_path.append(
+                        (
+                            s_h.t,
+                            p_h.copy(),
+                            s_h.vel[cue].copy(),
+                            s_h.pos[other_cs[0]].copy(),
+                            s_h.pos[other_cs[1]].copy(),
+                        )
+                    )
 
                 self.initial_ball_distances = {
                     c: float(np.linalg.norm(self.initial_positions[c] - cue_init_p))
@@ -2404,6 +2685,28 @@ class CausalKissSafeFSM:
                 self.all_ball_paths[bc].append(
                     (self.frame_counter, t, pos_map[bc].copy())
                 )
+            self.cue_lifecycle_path.append(
+                (
+                    t,
+                    p_cue_now.copy(),
+                    vel_map[cue_c].copy(),
+                    pos_map[other_cs[0]].copy(),
+                    pos_map[other_cs[1]].copy(),
+                )
+            )
+            rail_dists_now = {
+                Rail.LEFT: float(p_cue_now[0]),
+                Rail.RIGHT: float(TABLE_W - p_cue_now[0]),
+                Rail.TOP: float(p_cue_now[1]),
+                Rail.BOTTOM: float(TABLE_H - p_cue_now[1]),
+            }
+            for r_enum, d_r_val in rail_dists_now.items():
+                if d_r_val >= 220.0:
+                    self.rail_valley_locked[r_enum] = False
+                if d_r_val <= 115.0 and d_r_val < self.rail_valley_min_dist[r_enum]:
+                    self.rail_valley_min_dist[r_enum] = d_r_val
+                    self.rail_valley_min_pos[r_enum] = p_cue_now.copy()
+                    self.rail_valley_min_time[r_enum] = t
 
             if self.first_target_ball is None:
                 disp_from_origin_now = (
