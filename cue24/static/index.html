@@ -4194,33 +4194,46 @@
     }
 
     // ------------------------------------------------------------------
-    // [3. 브라우저 내장 실시간 AI 3구 클러스터 추적 & 3쿠션 인과 판독 엔진]
-    // 로컬 파이썬 서버와 동일하게 파란색 라사지 내측 쿠션 경계를 자동 캘리브레이션하고,
-    // 2D 연결 블롭(Blob) 클러스터링 + 유색구 반사광 차폐 + 수구↔1적구 충돌 스왑 방어 + 관성 법칙 1적구 판정을 수행합니다.
+    // [3. 브라우저 내장 실시간 AI 3구 클러스터 추적 & 3쿠션 인과 판독 엔진 (로컬 Python 엔진 1:1 이식)]
+    // - TableCalibrator: 파란 라사지 밀도 프로파일(>0.35) + 고무 쿠션 코 그림자 골(Shadow Trench) 스캔 -> 2840x1420mm 물리 평면 매핑
+    // - 3-Channel Core Detector: CIE LAB + HSV 3색 분리 + 유색구 팽창 차폐 + 모폴로지 열림(MORPH_OPEN)으로 하얀 큐대/손 100% 절단
+    // - CausalKissSafeFSM: approxPolyDP(epsilon=18mm) 꼭짓점 굴절(>=10도) & 법선 반전 쿠션 카운트 + 동일 레일 220mm 이탈 검증
+    // - 목적구 충돌 판정: 정지 앵커 이탈(증거 A, >=5.2mm) + 얇은 스침 수구 폴리라인 꺾임(증거 B, >=4.0도 & RMSE>=1.6mm)
     // ------------------------------------------------------------------
+    const TABLE_W_MM = 2840.0;
+    const TABLE_H_MM = 1420.0;
+    const BALL_R_MM = 30.75;
+    const GRID_W = 355; // 2840mm / 8mm = 355 (1셀 = 8mm)
+    const GRID_H = 178; // 1420mm / 8mm ≈ 178
+
     const browserVisionState = {
       balls: {
-        WHITE: { x: 0, y: 0, prevX: 0, prevY: 0, vx: 0, vy: 0, speed: 0, detected: false, missing: 0 },
-        YELLOW: { x: 0, y: 0, prevX: 0, prevY: 0, vx: 0, vy: 0, speed: 0, detected: false, missing: 0 },
-        RED: { x: 0, y: 0, prevX: 0, prevY: 0, vx: 0, vy: 0, speed: 0, detected: false, missing: 0 },
+        WHITE: { x: 710, y: 710, vx: 0, vy: 0, speed: 0, detected: false, missing: 0 },
+        YELLOW: { x: 710, y: 355, vx: 0, vy: 0, speed: 0, detected: false, missing: 0 },
+        RED: { x: 2130, y: 710, vx: 0, vy: 0, speed: 0, detected: false, missing: 0 },
       },
-      restPos: {
-        WHITE: null,
-        YELLOW: null,
-        RED: null,
-      },
-      trail: [],
+      restPos: { WHITE: null, YELLOW: null, RED: null },
+      initialPositions: { WHITE: null, YELLOW: null, RED: null },
+      strokeOriginPos: null,
+      history: [],
+      cuePath: [],
+      allBallPaths: { WHITE: [], YELLOW: [], RED: [] },
+      idSwapMap: { WHITE: 'WHITE', YELLOW: 'YELLOW', RED: 'RED' },
+      lastIdSwapTime: -999,
+      pairLastHitTime: {},
+      lastObjectKissTime: -999,
       fsmState: 'WAIT_SHOT',
       shotId: 1,
       activeCueColor: 'WHITE',
       cushionCount: 0,
       cushionsBeforeFirstHit: 0,
+      cushionsAfterFirstHit: 0,
       cushionsBeforeSecondHit: 0,
-      minRailDistBeforeFirstHit: 999,
-      lastCushionSide: '',
-      lastCushionFrame: -20,
+      minRailDistBeforeFirstHit: 9999,
       firstTargetBall: null,
       secondTargetBall: null,
+      firstTargetHitTime: null,
+      firstTargetHitPathIdx: null,
       hitBalls: [],
       firstContactIsCushion: false,
       firstContactDecided: false,
@@ -4228,22 +4241,31 @@
       stillFrames: 0,
       frameCounter: 0,
       shotActiveFrames: 0,
-      cooldownFrames: 8,
-      tableBounds: { left: 66, right: 574, top: 44, bottom: 312 },
+      cooldownFrames: 6,
+      lastVideoTime: -1,
+      simClockSec: 0,
+      tableBounds: { left: 48, right: 592, top: 32, bottom: 328 },
       boundsCalibrated: false,
     };
 
     function resetBrowserVisionShotState() {
-      browserVisionState.trail = [];
+      browserVisionState.history = [];
+      browserVisionState.cuePath = [];
+      browserVisionState.allBallPaths = { WHITE: [], YELLOW: [], RED: [] };
+      browserVisionState.idSwapMap = { WHITE: 'WHITE', YELLOW: 'YELLOW', RED: 'RED' };
+      browserVisionState.lastIdSwapTime = -999;
+      browserVisionState.pairLastHitTime = {};
+      browserVisionState.lastObjectKissTime = -999;
       browserVisionState.fsmState = 'WAIT_SHOT';
       browserVisionState.cushionCount = 0;
       browserVisionState.cushionsBeforeFirstHit = 0;
+      browserVisionState.cushionsAfterFirstHit = 0;
       browserVisionState.cushionsBeforeSecondHit = 0;
-      browserVisionState.minRailDistBeforeFirstHit = 999;
-      browserVisionState.lastCushionSide = '';
-      browserVisionState.lastCushionFrame = -20;
+      browserVisionState.minRailDistBeforeFirstHit = 9999;
       browserVisionState.firstTargetBall = null;
       browserVisionState.secondTargetBall = null;
+      browserVisionState.firstTargetHitTime = null;
+      browserVisionState.firstTargetHitPathIdx = null;
       browserVisionState.hitBalls = [];
       browserVisionState.firstContactIsCushion = false;
       browserVisionState.firstContactDecided = false;
@@ -4258,175 +4280,348 @@
       });
     }
 
+    // RGB(0~255) -> OpenCV 호환 HSV(H:0~180, S:0~255, V:0~255) 및 CIE LAB(L:0~255, A:0~255, B:0~255) 고속 변환
+    function rgbToOpenCvHsvAndLab(r, g, b) {
+      const maxC = r > g ? (r > b ? r : b) : g > b ? g : b;
+      const minC = r < g ? (r < b ? r : b) : g < b ? g : b;
+      const delta = maxC - minC;
+      const v = maxC;
+      const s = maxC === 0 ? 0 : Math.round((delta * 255) / maxC);
+      let h = 0;
+      if (delta > 0) {
+        if (maxC === r) h = 30 * (((g - b) / delta) % 6);
+        else if (maxC === g) h = 30 * ((b - r) / delta + 2);
+        else h = 30 * ((r - g) / delta + 4);
+        if (h < 0) h += 180;
+      }
+
+      // sRGB -> XYZ -> CIE LAB (OpenCV 8-bit 스케일: L*255/100, A+128, B+128)
+      const rn = r / 255.0;
+      const gn = g / 255.0;
+      const bn = b / 255.0;
+      const rl = rn <= 0.04045 ? rn / 12.92 : Math.pow((rn + 0.055) / 1.055, 2.4);
+      const gl = gn <= 0.04045 ? gn / 12.92 : Math.pow((gn + 0.055) / 1.055, 2.4);
+      const bl = bn <= 0.04045 ? bn / 12.92 : Math.pow((bn + 0.055) / 1.055, 2.4);
+
+      const x = (rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375) / 0.95047;
+      const y = rl * 0.2126729 + gl * 0.7151522 + bl * 0.072175;
+      const z = (rl * 0.0193339 + gl * 0.119192 + bl * 0.9503041) / 1.08883;
+
+      const fx = x > 0.008856 ? Math.cbrt(x) : 7.787 * x + 0.137931;
+      const fy = y > 0.008856 ? Math.cbrt(y) : 7.787 * y + 0.137931;
+      const fz = z > 0.008856 ? Math.cbrt(z) : 7.787 * z + 0.137931;
+
+      const L = Math.max(0, Math.min(255, Math.round((116.0 * fy - 16.0) * 2.55)));
+      const A = Math.max(0, Math.min(255, Math.round(500.0 * (fx - fy) + 128.0)));
+      const B = Math.max(0, Math.min(255, Math.round(200.0 * (fy - fz) + 128.0)));
+
+      return { h, s, v, L, A, B };
+    }
+
+    // 로컬 TableCalibrator.auto_detect_table_corners 1:1 이식:
+    // HSV 파란 라사지 밀도(>0.35)로 당구대 외곽을 찾고, 고무 쿠션 코 아래 그림자 골(Shadow Trench)로 정밀 내경을 산출합니다.
     function calibrateTableBoundsFromCloth(imgData, W, H) {
-      const colBlue = new Int32Array(W);
-      const rowBlue = new Int32Array(H);
-      const step = 4;
-      for (let y = 12; y < H - 12; y += step) {
-        for (let x = 12; x < W - 12; x += step) {
+      const colBlue = new Float32Array(W);
+      const rowBlue = new Float32Array(H);
+      const vGrid = new Uint8Array(W * H);
+
+      for (let y = 0; y < H; y += 2) {
+        for (let x = 0; x < W; x += 2) {
           const i = (y * W + x) * 4;
           const r = imgData[i];
           const g = imgData[i + 1];
           const b = imgData[i + 2];
-          if (b > r + 35 && b > g + 10 && b > 95) {
+          const maxC = r > g ? (r > b ? r : b) : g > b ? g : b;
+          const minC = r < g ? (r < b ? r : b) : g < b ? g : b;
+          const delta = maxC - minC;
+          const s = maxC === 0 ? 0 : (delta * 255) / maxC;
+          let h = 0;
+          if (delta > 0) {
+            if (maxC === r) h = 30 * (((g - b) / delta) % 6);
+            else if (maxC === g) h = 30 * ((b - r) / delta + 2);
+            else h = 30 * ((r - g) / delta + 4);
+            if (h < 0) h += 180;
+          }
+          vGrid[y * W + x] = maxC;
+          if (h >= 92 && h <= 135 && s >= 70 && maxC >= 50) {
             colBlue[x] += 1;
             rowBlue[y] += 1;
           }
         }
       }
-      const minColHits = Math.max(8, Math.floor(((H - 24) / step) * 0.36));
-      const minRowHits = Math.max(14, Math.floor(((W - 24) / step) * 0.36));
 
-      let left = 0;
-      let right = W - 1;
-      let top = 0;
-      let bottom = H - 1;
+      const nRowsSampled = Math.floor(H / 2);
+      const nColsSampled = Math.floor(W / 2);
+      let x0 = -1;
+      let x1 = -1;
+      let y0 = -1;
+      let y1 = -1;
 
-      for (let x = 12; x < W - 12; x += step) {
-        if (colBlue[x] >= minColHits) {
-          left = x;
-          break;
+      for (let x = 0; x < W; x += 2) {
+        if (colBlue[x] / nRowsSampled > 0.35) {
+          if (x0 < 0) x0 = x;
+          x1 = x;
         }
       }
-      for (let x = W - 16; x >= 12; x -= step) {
-        if (colBlue[x] >= minColHits) {
-          right = x;
-          break;
-        }
-      }
-      for (let y = 12; y < H - 12; y += step) {
-        if (rowBlue[y] >= minRowHits) {
-          top = y;
-          break;
-        }
-      }
-      for (let y = H - 16; y >= 12; y -= step) {
-        if (rowBlue[y] >= minRowHits) {
-          bottom = y;
-          break;
+      for (let y = 0; y < H; y += 2) {
+        if (rowBlue[y] / nColsSampled > 0.35) {
+          if (y0 < 0) y0 = y;
+          y1 = y;
         }
       }
 
-      if (right - left >= W * 0.55 && bottom - top >= H * 0.45) {
-        // 외곽 파란 레일 폭(약 8px)만큼 안쪽이 실제 당구공 중심이 닿는 내측 쿠션 코(Nose) 경계
-        const insetX = 9;
-        const insetY = 9;
-        const newBounds = {
-          left: left + insetX,
-          right: right - insetX,
-          top: top + insetY,
-          bottom: bottom - insetY,
-        };
-        if (!browserVisionState.boundsCalibrated) {
-          browserVisionState.tableBounds = newBounds;
-          browserVisionState.boundsCalibrated = true;
-        } else {
-          const tb = browserVisionState.tableBounds;
-          tb.left = tb.left * 0.85 + newBounds.left * 0.15;
-          tb.right = tb.right * 0.85 + newBounds.right * 0.15;
-          tb.top = tb.top * 0.85 + newBounds.top * 0.15;
-          tb.bottom = tb.bottom * 0.85 + newBounds.bottom * 0.15;
+      if (x0 < 0 || y0 < 0 || x1 - x0 < W * 0.45 || y1 - y0 < H * 0.4) {
+        return;
+      }
+
+      const wBox = x1 - x0;
+      const hBox = y1 - y0;
+      if (wBox >= W * 0.96 && hBox >= H * 0.96) {
+        browserVisionState.tableBounds = { left: 0, right: W, top: 0, bottom: H };
+        browserVisionState.boundsCalibrated = true;
+        return;
+      }
+
+      let leftX = x0 + wBox * 0.022;
+      let rightX = x1 - wBox * 0.021;
+      let topY = y0 + hBox * 0.038;
+      let bottomY = y1 - hBox * 0.036;
+
+      // 그림자 골(Shadow Trench: V 채널 급감 지점) 스캔으로 쿠션 코 끝 내경 정밀 보정
+      const padX = Math.max(8, Math.floor(wBox * 0.055));
+      const padY = Math.max(8, Math.floor(hBox * 0.075));
+      const minInX = Math.max(4, Math.floor(wBox * 0.008));
+      const minInY = Math.max(4, Math.floor(hBox * 0.012));
+
+      const avgVCol = (xCol) => {
+        let sum = 0;
+        let cnt = 0;
+        for (let y = y0 + padY; y <= y1 - padY; y += 2) {
+          sum += vGrid[y * W + (xCol & ~1)];
+          cnt += 1;
         }
+        return cnt > 0 ? sum / cnt : 255;
+      };
+      const avgVRow = (yRow) => {
+        let sum = 0;
+        let cnt = 0;
+        for (let x = x0 + padX; x <= x1 - padX; x += 2) {
+          sum += vGrid[(yRow & ~1) * W + x];
+          cnt += 1;
+        }
+        return cnt > 0 ? sum / cnt : 255;
+      };
+
+      let lxCand = leftX;
+      let minVL = 999;
+      for (let x = x0 + minInX; x <= x0 + padX; x += 2) {
+        const vVal = avgVCol(x);
+        if (vVal < minVL) {
+          minVL = vVal;
+          lxCand = x;
+        }
+      }
+      let rxCand = rightX;
+      let minVR = 999;
+      for (let x = x1 - padX; x <= x1 - minInX; x += 2) {
+        const vVal = avgVCol(x);
+        if (vVal < minVR) {
+          minVR = vVal;
+          rxCand = x;
+        }
+      }
+      let tyCand = topY;
+      let minVT = 999;
+      for (let y = y0 + minInY; y <= y0 + padY; y += 2) {
+        const vVal = avgVRow(y);
+        if (vVal < minVT) {
+          minVT = vVal;
+          tyCand = y;
+        }
+      }
+      let byCand = bottomY;
+      let minVB = 999;
+      for (let y = y1 - padY; y <= y1 - minInY; y += 2) {
+        const vVal = avgVRow(y);
+        if (vVal < minVB) {
+          minVB = vVal;
+          byCand = y;
+        }
+      }
+
+      const innerW = rxCand - lxCand;
+      const innerH = byCand - tyCand;
+      if (innerH > 80 && innerW / innerH >= 1.85 && innerW / innerH <= 2.15) {
+        leftX = lxCand;
+        rightX = rxCand;
+        topY = tyCand;
+        bottomY = byCand;
+      }
+
+      if (!browserVisionState.boundsCalibrated) {
+        browserVisionState.tableBounds = { left: leftX, right: rightX, top: topY, bottom: bottomY };
+        browserVisionState.boundsCalibrated = true;
+      } else {
+        const tb = browserVisionState.tableBounds;
+        tb.left = tb.left * 0.85 + leftX * 0.15;
+        tb.right = tb.right * 0.85 + rightX * 0.15;
+        tb.top = tb.top * 0.85 + topY * 0.15;
+        tb.bottom = tb.bottom * 0.85 + bottomY * 0.15;
       }
     }
 
-    function clusterPointsIntoBlobs(pts, maxLinkDist = 6.5) {
-      const n = pts.length;
-      if (n === 0) return [];
-      const visited = new Uint8Array(n);
-      const blobs = [];
-
-      for (let i = 0; i < n; i++) {
-        if (visited[i]) continue;
-        visited[i] = 1;
-        const queue = [i];
-        let sumX = 0;
-        let sumY = 0;
-        let sumW = 0;
-        let minX = 9999;
-        let maxX = -9999;
-        let minY = 9999;
-        let maxY = -9999;
-        let count = 0;
-
-        while (queue.length > 0) {
-          const curIdx = queue.pop();
-          const p = pts[curIdx];
-          sumX += p.x * p.w;
-          sumY += p.y * p.w;
-          sumW += p.w;
-          if (p.x < minX) minX = p.x;
-          if (p.x > maxX) maxX = p.x;
-          if (p.y < minY) minY = p.y;
-          if (p.y > maxY) maxY = p.y;
-          count += 1;
-
-          for (let j = 0; j < n; j++) {
-            if (visited[j]) continue;
-            const q = pts[j];
-            if (Math.abs(p.x - q.x) <= maxLinkDist && Math.abs(p.y - q.y) <= maxLinkDist) {
-              visited[j] = 1;
-              queue.push(j);
-            }
+    // 2D 바이너리 마스크 모폴로지 팽창(Dilate 3x3)
+    function morphDilate3x3(src, gw, gh) {
+      const dst = new Uint8Array(gw * gh);
+      for (let y = 1; y < gh - 1; y++) {
+        const row = y * gw;
+        for (let x = 1; x < gw - 1; x++) {
+          const idx = row + x;
+          if (
+            src[idx] ||
+            src[idx - 1] ||
+            src[idx + 1] ||
+            src[idx - gw] ||
+            src[idx + gw] ||
+            src[idx - gw - 1] ||
+            src[idx - gw + 1] ||
+            src[idx + gw - 1] ||
+            src[idx + gw + 1]
+          ) {
+            dst[idx] = 1;
           }
         }
+      }
+      return dst;
+    }
 
-        const spanX = maxX - minX + 2;
-        const spanY = maxY - minY + 2;
-        const maxSpan = Math.max(spanX, spanY);
-        const minSpan = Math.max(2, Math.min(spanX, spanY));
-        const aspect = maxSpan / minSpan;
+    // 2D 바이너리 마스크 모폴로지 침식(Erode 십자 5-방향: 가느다란 하얀 큐대 샤프트 및 손 절단용)
+    function morphErodeCross(src, gw, gh) {
+      const dst = new Uint8Array(gw * gh);
+      for (let y = 1; y < gh - 1; y++) {
+        const row = y * gw;
+        for (let x = 1; x < gw - 1; x++) {
+          const idx = row + x;
+          if (src[idx] && src[idx - 1] && src[idx + 1] && src[idx - gw] && src[idx + gw]) {
+            dst[idx] = 1;
+          }
+        }
+      }
+      return dst;
+    }
 
-        // 당구공 크기(지름 약 10~16px)에 부합하고 길쭉한 큐대/손이 아닌 원형 블롭만 채택
-        if (count >= 2 && count <= 75 && maxSpan <= 28 && aspect <= 2.4) {
-          blobs.push({
-            x: sumX / sumW,
-            y: sumY / sumW,
-            count,
-            score: sumW,
-            aspect,
+    // 모폴로지 열림(MORPH_OPEN = 침식 후 팽창) 및 닫힘(MORPH_CLOSE = 팽창 후 침식)
+    function morphOpenCross(src, gw, gh) {
+      return morphDilate3x3(morphErodeCross(src, gw, gh), gw, gh);
+    }
+
+    function morphClose3x3(src, gw, gh) {
+      return morphErodeCross(morphDilate3x3(src, gw, gh), gw, gh);
+    }
+
+    // 2D 연결 컴포넌트(Contour) 추출 및 원형도(Circularity)·물리 좌표(2840x1420mm) 산출
+    function extractMaskComponentsMm(mask, gw, gh) {
+      const visited = new Uint8Array(gw * gh);
+      const components = [];
+      const qx = new Int16Array(gw * gh);
+      const qy = new Int16Array(gw * gh);
+
+      for (let y = 1; y < gh - 1; y++) {
+        for (let x = 1; x < gw - 1; x++) {
+          const startIdx = y * gw + x;
+          if (!mask[startIdx] || visited[startIdx]) continue;
+
+          visited[startIdx] = 1;
+          let head = 0;
+          let tail = 0;
+          qx[tail] = x;
+          qy[tail] = y;
+          tail++;
+
+          let sumX = 0;
+          let sumY = 0;
+          let minX = x;
+          let maxX = x;
+          let minY = y;
+          let maxY = y;
+          let boundaryCount = 0;
+
+          while (head < tail) {
+            const cx = qx[head];
+            const cy = qy[head];
+            head++;
+
+            sumX += cx;
+            sumY += cy;
+            if (cx < minX) minX = cx;
+            if (cx > maxX) maxX = cx;
+            if (cy < minY) minY = cy;
+            if (cy > maxY) maxY = cy;
+
+            let isBoundary = false;
+            for (let dy = -1; dy <= 1; dy++) {
+              const ny = cy + dy;
+              if (ny < 0 || ny >= gh) {
+                isBoundary = true;
+                continue;
+              }
+              for (let dx = -1; dx <= 1; dx++) {
+                if (dx === 0 && dy === 0) continue;
+                const nx = cx + dx;
+                if (nx < 0 || nx >= gw) {
+                  isBoundary = true;
+                  continue;
+                }
+                const nIdx = ny * gw + nx;
+                if (!mask[nIdx]) {
+                  if (dx === 0 || dy === 0) isBoundary = true;
+                } else if (!visited[nIdx]) {
+                  visited[nIdx] = 1;
+                  qx[tail] = nx;
+                  qy[tail] = ny;
+                  tail++;
+                }
+              }
+            }
+            if (isBoundary) boundaryCount++;
+          }
+
+          const areaGrid = tail; // 355x178 그리드에서의 픽셀 수 (710x355 기준 area_q = areaGrid * 4)
+          const areaQ = areaGrid * 4.0;
+          if (areaQ < 36.0 || areaQ > 420.0) continue;
+
+          const wB = maxX - minX + 1;
+          const hB = maxY - minY + 1;
+          const radGrid = 0.5 * Math.max(wB, hB);
+          const radQ = radGrid * 2.0;
+          if (radQ < 3.4 || radQ > 16.5) continue;
+
+          const aspect = Math.max(wB, hB) / Math.max(1, Math.min(wB, hB));
+          if (aspect > 2.35) continue;
+
+          const perimGrid = Math.max(4.0, boundaryCount * 1.12);
+          const rawCirc = (4.0 * Math.PI * areaGrid) / (perimGrid * perimGrid);
+          const circ = Math.min(1.0, Math.max(0.35, rawCirc / Math.max(1.0, (aspect - 1.0) * 0.6 + 1.0)));
+          if (circ < 0.38) continue;
+
+          const touchesBorder = minX <= 1 || minY <= 1 || maxX >= gw - 2 || maxY >= gh - 2;
+          const cxGrid = sumX / areaGrid;
+          const cyGrid = sumY / areaGrid;
+
+          components.push({
+            xMm: (cxGrid / (gw - 1)) * TABLE_W_MM,
+            yMm: (cyGrid / (gh - 1)) * TABLE_H_MM,
+            areaQ,
+            radMm: radQ * 4.0,
+            circ,
+            touchesBorder,
           });
         }
       }
-      return blobs;
+      return components;
     }
 
-    function pickBestBlobForChannel(blobs, ballState, excludedCenters, nearCollision) {
-      if (!blobs || blobs.length === 0) return null;
-      let best = null;
-      let bestScore = -1e9;
-      const predX = ballState.detected ? ballState.x + (nearCollision ? 0 : ballState.vx * 0.85) : 0;
-      const predY = ballState.detected ? ballState.y + (nearCollision ? 0 : ballState.vy * 0.85) : 0;
-
-      for (const b of blobs) {
-        // 이미 확정된 다른 색 공 중심(11px 이내)과 겹치는 반사광 블롭은 철저히 배제
-        let tooCloseToOther = false;
-        for (const ex of excludedCenters) {
-          if (Math.hypot(b.x - ex.x, b.y - ex.y) < 11.5) {
-            tooCloseToOther = true;
-            break;
-          }
-        }
-        if (tooCloseToOther) continue;
-
-        const sizeDiff = Math.abs(b.count - 14);
-        let sc = b.score * 2.2 - sizeDiff * 1.5 - (b.aspect - 1.0) * 8.0;
-        if (ballState.detected) {
-          const dPrev = Math.hypot(b.x - ballState.x, b.y - ballState.y);
-          const dPred = Math.hypot(b.x - predX, b.y - predY);
-          const d = nearCollision ? dPrev : Math.min(dPrev, dPred);
-          const maxGate = 95 + ballState.missing * 45;
-          if (d > maxGate && ballState.missing < 12) continue;
-          sc -= d * 1.35;
-        }
-        if (sc > bestScore) {
-          bestScore = sc;
-          best = b;
-        }
-      }
-      return best;
-    }
-
+    // 로컬 server.py의 _extract_3_channel_ball_cores 1:1 이식
     function detectTableAndBallsOnOffscreen(videoEl, W, H) {
       if (!offscreenVisionCanvas) {
         offscreenVisionCanvas = document.createElement('canvas');
@@ -4437,222 +4632,1011 @@
       try {
         offscreenVisionCtx.drawImage(videoEl, 0, 0, W, H);
       } catch (_) {
-        return;
+        return false;
       }
       const imgData = offscreenVisionCtx.getImageData(0, 0, W, H).data;
 
-      if (!browserVisionState.boundsCalibrated || browserVisionState.frameCounter % 30 === 0) {
+      if (!browserVisionState.boundsCalibrated || browserVisionState.frameCounter % 45 === 0) {
         calibrateTableBoundsFromCloth(imgData, W, H);
       }
 
-      const bounds = browserVisionState.tableBounds;
-      const scanLeft = Math.max(8, Math.floor(bounds.left - 4));
-      const scanRight = Math.min(W - 8, Math.ceil(bounds.right + 4));
-      const scanTop = Math.max(8, Math.floor(bounds.top - 4));
-      const scanBottom = Math.min(H - 8, Math.ceil(bounds.bottom + 4));
+      const tb = browserVisionState.tableBounds;
+      const innerW = Math.max(100, tb.right - tb.left);
+      const innerH = Math.max(60, tb.bottom - tb.top);
 
-      const ptsR = [];
-      const ptsY = [];
-      const ptsW = [];
+      const redM = new Uint8Array(GRID_W * GRID_H);
+      const yelM = new Uint8Array(GRID_W * GRID_H);
+      const LCh = new Uint8Array(GRID_W * GRID_H);
+      const ACh = new Uint8Array(GRID_W * GRID_H);
+      const BCh = new Uint8Array(GRID_W * GRID_H);
+      const SCh = new Uint8Array(GRID_W * GRID_H);
+      const VCh = new Uint8Array(GRID_W * GRID_H);
 
-      const step = 2;
-      for (let y = scanTop; y <= scanBottom; y += step) {
-        for (let x = scanLeft; x <= scanRight; x += step) {
-          const i = (y * W + x) * 4;
-          const r = imgData[i];
-          const g = imgData[i + 1];
-          const b = imgData[i + 2];
+      for (let gy = 0; gy < GRID_H; gy++) {
+        const py = Math.min(H - 1, Math.max(0, Math.round(tb.top + (gy / (GRID_H - 1)) * innerH)));
+        const rowOff = gy * GRID_W;
+        for (let gx = 0; gx < GRID_W; gx++) {
+          const px = Math.min(W - 1, Math.max(0, Math.round(tb.left + (gx / (GRID_W - 1)) * innerW)));
+          const pIdx = (py * W + px) * 4;
+          const r = imgData[pIdx];
+          const g = imgData[pIdx + 1];
+          const b = imgData[pIdx + 2];
+          const idx = rowOff + gx;
 
-          // 파란색/초록색 당구대 바닥 픽셀 스킵
-          if (b > r + 18 && b > g + 6) continue;
-          if (g > r + 20 && g > b + 12) continue;
+          const { s, v, L, A, B } = rgbToOpenCvHsvAndLab(r, g, b);
+          LCh[idx] = L;
+          ACh[idx] = A;
+          BCh[idx] = B;
+          SCh[idx] = s;
+          VCh[idx] = v;
 
-          const maxC = Math.max(r, g, b);
-          const minC = Math.min(r, g, b);
-          if (maxC < 95) continue;
-
-          // 1) 빨간공 (RED): R이 강하고 G, B 대비 적색 편차가 큼
-          const redDiff = r - Math.max(g, b);
-          if (r >= 130 && redDiff >= 42 && g < 115 && b < 115) {
-            ptsR.push({ x, y, w: 1.0 + redDiff * 0.02 });
+          if (A >= 144 && B >= 118 && s >= 55 && v >= 52) {
+            redM[idx] = 1;
           }
-          // 2) 노란공 (YELLOW): R, G가 모두 높고 B가 낮음
-          else if (r >= 145 && g >= 115 && b < 135 && Math.min(r, g) - b >= 32) {
-            const yelDiff = Math.min(r, g) - b;
-            ptsY.push({ x, y, w: 1.0 + yelDiff * 0.02 });
-          }
-          // 3) 흰공 (WHITE): R, G, B 모두 밝고 채도 편차가 낮음
-          else if (r >= 170 && g >= 170 && b >= 158 && maxC - minC <= 46) {
-            ptsW.push({ x, y, w: 1.0 + (minC - 150) * 0.02 });
+          if (B >= 150 && A < 146 && L >= 118 && s >= 82) {
+            yelM[idx] = 1;
           }
         }
       }
 
-      const blobsR = clusterPointsIntoBlobs(ptsR, 5.0);
-      const blobsY = clusterPointsIntoBlobs(ptsY, 5.0);
-
-      const bR = browserVisionState.balls.RED;
-      const bY = browserVisionState.balls.YELLOW;
-      const bW = browserVisionState.balls.WHITE;
-
-      const nearCollisionRY = bR.detected && bY.detected && Math.hypot(bR.x - bY.x, bR.y - bY.y) <= 32;
-      const chosenR = pickBestBlobForChannel(blobsR, bR, [], nearCollisionRY);
-      const excludedForY = chosenR ? [{ x: chosenR.x, y: chosenR.y }] : [];
-      const chosenY = pickBestBlobForChannel(blobsY, bY, excludedForY, nearCollisionRY);
-
-      // RED / YELLOW로 확정된 공 반경(9.5px) 내부의 조명 하이라이트 픽셀은 WHITE 후보에서 원천 제거!
-      const excludedForW = [];
-      if (chosenR) excludedForW.push({ x: chosenR.x, y: chosenR.y });
-      else if (bR.detected) excludedForW.push({ x: bR.x, y: bR.y });
-      if (chosenY) excludedForW.push({ x: chosenY.x, y: chosenY.y });
-      else if (bY.detected) excludedForW.push({ x: bY.x, y: bY.y });
-
-      const filteredPtsW = ptsW.filter((p) =>
-        excludedForW.every((ex) => Math.hypot(p.x - ex.x, p.y - ex.y) >= 9.5)
-      );
-      const blobsW = clusterPointsIntoBlobs(filteredPtsW, 5.0);
-      const nearCollisionW =
-        bW.detected &&
-        excludedForW.some((ex) => Math.hypot(bW.x - ex.x, bW.y - ex.y) <= 34);
-      const chosenW = pickBestBlobForChannel(blobsW, bW, excludedForW, nearCollisionW);
-
-      const wasStationaryPre = {
-        WHITE: bW.speed < 0.85,
-        YELLOW: bY.speed < 0.85,
-        RED: bR.speed < 0.85,
-      };
-      const prePos = {
-        WHITE: { x: bW.x, y: bW.y, detected: bW.detected },
-        YELLOW: { x: bY.x, y: bY.y, detected: bY.detected },
-        RED: { x: bR.x, y: bR.y, detected: bR.detected },
-      };
-
-      const applyBlobUpdate = (key, blob) => {
-        const st = browserVisionState.balls[key];
-        if (blob) {
-          const prevX = st.detected ? st.x : blob.x;
-          const prevY = st.detected ? st.y : blob.y;
-          const alpha = st.detected ? 0.78 : 1.0;
-          const nx = prevX + (blob.x - prevX) * alpha;
-          const ny = prevY + (blob.y - prevY) * alpha;
-          st.prevX = prevX;
-          st.prevY = prevY;
-          st.vx = nx - prevX;
-          st.vy = ny - prevY;
-          st.speed = Math.hypot(st.vx, st.vy);
-          st.x = nx;
-          st.y = ny;
-          st.detected = true;
-          st.missing = 0;
-        } else if (st.detected) {
-          st.missing += 1;
-          st.prevX = st.x;
-          st.prevY = st.y;
-          // 정지 공이거나 다른 공과 근접 충돌 중일 때는 관성 투사로 상대 공을 덮어쓰지 않고 제자리 유지
-          const nearOtherNow = ['WHITE', 'YELLOW', 'RED'].some(
-            (ok) =>
-              ok !== key &&
-              browserVisionState.balls[ok].detected &&
-              Math.hypot(st.x - browserVisionState.balls[ok].x, st.y - browserVisionState.balls[ok].y) <= 34
-          );
-          if (st.speed >= 1.6 && st.missing <= 4 && !nearOtherNow) {
-            st.x = Math.max(bounds.left, Math.min(bounds.right, st.x + st.vx * 0.85));
-            st.y = Math.max(bounds.top, Math.min(bounds.bottom, st.y + st.vy * 0.85));
-            st.vx *= 0.85;
-            st.vy *= 0.85;
-            st.speed = Math.hypot(st.vx, st.vy);
-          } else {
-            st.vx = 0;
-            st.vy = 0;
-            st.speed = 0;
-          }
-        }
-      };
-
-      applyBlobUpdate('RED', chosenR);
-      applyBlobUpdate('YELLOW', chosenY);
-      applyBlobUpdate('WHITE', chosenW);
-
-      // [수구 ↔ 1적구 충돌 시 ID 스왑 방어 가드]
-      // 주행 중이던 수구가 정지해 있던 1적구를 정면 타격한 직후,
-      // 1적구 라벨은 제자리에 머물고 수구 라벨이 법선 방향으로 튀어나간 경우 즉시 두 공 좌표를 역스왑!
-      if (browserVisionState.fsmState === 'SHOT_IN_PROGRESS') {
-        const cueKey = browserVisionState.activeCueColor || 'WHITE';
-        const cueSt = browserVisionState.balls[cueKey];
-        const preCue = prePos[cueKey];
-        if (cueSt.detected && preCue && preCue.detected) {
-          for (const targetKey of ['WHITE', 'YELLOW', 'RED']) {
-            if (targetKey === cueKey || !wasStationaryPre[targetKey]) continue;
-            const tarSt = browserVisionState.balls[targetKey];
-            const preTar = prePos[targetKey];
-            if (!tarSt.detected || !preTar || !preTar.detected) continue;
-            const dxPre = preTar.x - preCue.x;
-            const dyPre = preTar.y - preCue.y;
-            const distPre = Math.hypot(dxPre, dyPre);
-            if (distPre > 1e-3 && distPre <= 38) {
-              const nx = dxPre / distPre;
-              const ny = dyPre / distPre;
-              const tarStayDist = Math.hypot(tarSt.x - preTar.x, tarSt.y - preTar.y);
-              const cueDepartX = cueSt.x - preTar.x;
-              const cueDepartY = cueSt.y - preTar.y;
-              const cueDepartDist = Math.hypot(cueDepartX, cueDepartY);
-              const cueDepartCos =
-                cueDepartDist > 1e-3 ? (cueDepartX * nx + cueDepartY * ny) / cueDepartDist : 0;
-              if (
-                tarStayDist <= 6.5 &&
-                cueDepartDist >= 4.0 &&
-                cueDepartCos >= 0.72 &&
-                cueSt.speed > Math.max(1.5, tarSt.speed * 1.4)
-              ) {
-                const tmpX = cueSt.x;
-                const tmpY = cueSt.y;
-                cueSt.x = tarSt.x;
-                cueSt.y = tarSt.y;
-                cueSt.vx = cueSt.x - preCue.x;
-                cueSt.vy = cueSt.y - preCue.y;
-                cueSt.speed = Math.hypot(cueSt.vx, cueSt.vy);
-
-                tarSt.x = tmpX;
-                tarSt.y = tmpY;
-                tarSt.vx = tarSt.x - preTar.x;
-                tarSt.vy = tarSt.y - preTar.y;
-                tarSt.speed = Math.hypot(tarSt.vx, tarSt.vy);
-                break;
-              }
+      // 직전 위치 로컬 ROI(±14셀 = ±112mm) 완화 탐색으로 고속 모션 블러 대응
+      const stR = browserVisionState.balls.RED;
+      if (stR.detected) {
+        const rxG = Math.round((stR.x / TABLE_W_MM) * (GRID_W - 1));
+        const ryG = Math.round((stR.y / TABLE_H_MM) * (GRID_H - 1));
+        const x0 = Math.max(0, rxG - 14);
+        const x1 = Math.min(GRID_W - 1, rxG + 14);
+        const y0 = Math.max(0, ryG - 14);
+        const y1 = Math.min(GRID_H - 1, ryG + 14);
+        for (let gy = y0; gy <= y1; gy++) {
+          for (let gx = x0; gx <= x1; gx++) {
+            const idx = gy * GRID_W + gx;
+            if (ACh[idx] >= 140 && BCh[idx] >= 114 && SCh[idx] >= 48 && VCh[idx] >= 40) {
+              redM[idx] = 1;
             }
           }
         }
       }
-    }
 
-    function segmentToSegmentMinDist(ax, ay, bx, by, cx, cy, dx, dy) {
-      let minD = 9999;
-      const steps = 6;
-      for (let i = 0; i <= steps; i++) {
-        const t = i / steps;
-        const px = ax + (bx - ax) * t;
-        const py = ay + (by - ay) * t;
-        const qx = cx + (dx - cx) * t;
-        const qy = cy + (dy - cy) * t;
-        const d = Math.hypot(px - qx, py - qy);
-        if (d < minD) minD = d;
+      const stY = browserVisionState.balls.YELLOW;
+      if (stY.detected) {
+        const yxG = Math.round((stY.x / TABLE_W_MM) * (GRID_W - 1));
+        const yyG = Math.round((stY.y / TABLE_H_MM) * (GRID_H - 1));
+        const x0 = Math.max(0, yxG - 15);
+        const x1 = Math.min(GRID_W - 1, yxG + 15);
+        const y0 = Math.max(0, yyG - 15);
+        const y1 = Math.min(GRID_H - 1, yyG + 15);
+        for (let gy = y0; gy <= y1; gy++) {
+          for (let gx = x0; gx <= x1; gx++) {
+            const idx = gy * GRID_W + gx;
+            if (BCh[idx] >= 138 && ACh[idx] < 146 && LCh[idx] >= 112 && SCh[idx] >= 54) {
+              yelM[idx] = 1;
+            }
+          }
+        }
       }
-      return minD;
+
+      const redClosed = redM;
+      const yelClosed = yelM;
+
+      // RED/YELLOW 영역을 3x3 팽창시켜 유색구 표면의 조명 하이라이트가 WHITE 마스크로 침범하는 현상 원천 차폐
+      const unionRY = new Uint8Array(GRID_W * GRID_H);
+      for (let i = 0; i < unionRY.length; i++) {
+        if (redClosed[i] || yelClosed[i]) unionRY[i] = 1;
+      }
+      const coloredExcl = morphDilate3x3(unionRY, GRID_W, GRID_H);
+
+      const whiRaw = new Uint8Array(GRID_W * GRID_H);
+      for (let i = 0; i < whiRaw.length; i++) {
+        if (
+          !coloredExcl[i] &&
+          LCh[i] >= 178 &&
+          SCh[i] <= 86 &&
+          BCh[i] >= 112 &&
+          BCh[i] < 146 &&
+          ACh[i] < 140
+        ) {
+          whiRaw[i] = 1;
+        }
+      }
+
+      // 모폴로지 열림(MORPH_OPEN)으로 수구에 닿은 하얀 큐대 샤프트/손가락 100% 절단
+      const whiM = morphOpenCross(whiRaw, GRID_W, GRID_H);
+
+      const stW = browserVisionState.balls.WHITE;
+      if (stW.detected && browserVisionState.fsmState === 'SHOT_IN_PROGRESS') {
+        const wxG = Math.round((stW.x / TABLE_W_MM) * (GRID_W - 1));
+        const wyG = Math.round((stW.y / TABLE_H_MM) * (GRID_H - 1));
+        const x0 = Math.max(1, wxG - 18);
+        const x1 = Math.min(GRID_W - 2, wxG + 18);
+        const y0 = Math.max(1, wyG - 18);
+        const y1 = Math.min(GRID_H - 2, wyG + 18);
+        for (let gy = y0; gy <= y1; gy++) {
+          for (let gx = x0; gx <= x1; gx++) {
+            const idx = gy * GRID_W + gx;
+            if (
+              !coloredExcl[idx] &&
+              LCh[idx] >= 158 &&
+              SCh[idx] <= 92 &&
+              BCh[idx] >= 104 &&
+              BCh[idx] < 138 &&
+              ACh[idx] < 138
+            ) {
+              whiM[idx] = 1;
+            }
+          }
+        }
+      }
+
+      const prevAllPos = {};
+      ['WHITE', 'YELLOW', 'RED'].forEach((k) => {
+        if (browserVisionState.balls[k].detected) {
+          prevAllPos[k] = { x: browserVisionState.balls[k].x, y: browserVisionState.balls[k].y };
+        }
+      });
+
+      const chosenOut = {};
+      const masksByCol = [
+        ['RED', redClosed, null],
+        ['YELLOW', yelClosed, null],
+        ['WHITE', whiM, whiRaw],
+      ];
+
+      // RED -> YELLOW -> WHITE 순서로 매칭하여 적구 하이라이트를 수구로 오인하는 현상 차단
+      for (const [col, mask, fallbackMask] of masksByCol) {
+        let cands = extractMaskComponentsMm(mask, GRID_W, GRID_H);
+        if (cands.length === 0 && fallbackMask) {
+          cands = extractMaskComponentsMm(fallbackMask, GRID_W, GRID_H);
+        }
+        const st = browserVisionState.balls[col];
+        const hasPrev = st.detected;
+        const predX = hasPrev ? st.x + st.vx * 0.95 : 0;
+        const predY = hasPrev ? st.y + st.vy * 0.95 : 0;
+
+        let nearOtherBall = false;
+        if (hasPrev) {
+          for (const ok of Object.keys(prevAllPos)) {
+            if (ok === col) continue;
+            const op = prevAllPos[ok];
+            if (
+              Math.hypot(st.x - op.x, st.y - op.y) <= 135.0 ||
+              Math.hypot(predX - op.x, predY - op.y) <= 95.0
+            ) {
+              nearOtherBall = true;
+              break;
+            }
+          }
+        }
+
+        let bestCand = null;
+        let bestScore = -1e9;
+
+        for (const c of cands) {
+          // 이미 확정된 다른 색 공 중심(44mm 이내)과 겹치는 후보는 배제
+          let overlapsChosen = false;
+          for (const chosenCol of Object.keys(chosenOut)) {
+            const ch = chosenOut[chosenCol];
+            if (Math.hypot(c.xMm - ch.x, c.yMm - ch.y) < 44.0) {
+              overlapsChosen = true;
+              break;
+            }
+          }
+          if (overlapsChosen) continue;
+
+          const borderPenalty = c.touchesBorder ? 85.0 : 0.0;
+          let sc = 0;
+          if (hasPrev) {
+            const distPred = Math.hypot(c.xMm - predX, c.yMm - predY);
+            const distPrev = Math.hypot(c.xMm - st.x, c.yMm - st.y);
+            const dist = nearOtherBall ? distPrev : Math.min(distPred, distPrev);
+            const maxGate = 320.0 + Math.min(900.0, st.missing * 220.0);
+            if (dist > maxGate && st.missing < 15) continue;
+            sc = c.circ * 100.0 - Math.abs(c.areaQ - 150.0) * 0.25 - dist * 0.5 - borderPenalty;
+          } else {
+            sc = c.circ * 100.0 - Math.abs(c.areaQ - 150.0) * 0.25 - borderPenalty;
+          }
+
+          if (sc > bestScore) {
+            bestScore = sc;
+            bestCand = c;
+          }
+        }
+
+        if (bestCand) {
+          if (hasPrev && st.missing === 0) {
+            st.vx = 0.65 * (bestCand.xMm - st.x) + 0.35 * st.vx;
+            st.vy = 0.65 * (bestCand.yMm - st.y) + 0.35 * st.vy;
+          } else if (hasPrev) {
+            const stepVx = (bestCand.xMm - st.x) / (st.missing + 1);
+            const stepVy = (bestCand.yMm - st.y) / (st.missing + 1);
+            if (Math.hypot(stepVx, stepVy) <= 140.0) {
+              st.vx = stepVx;
+              st.vy = stepVy;
+            } else {
+              st.vx = 0;
+              st.vy = 0;
+            }
+          }
+          st.x = bestCand.xMm;
+          st.y = bestCand.yMm;
+          st.speed = Math.hypot(st.vx, st.vy);
+          st.detected = true;
+          st.missing = 0;
+        } else if (hasPrev) {
+          const prevSpd = Math.hypot(st.vx, st.vy);
+          if (prevSpd < 8.0 || nearOtherBall || st.missing > 8) {
+            st.vx = nearOtherBall ? st.vx * 0.25 : 0;
+            st.vy = nearOtherBall ? st.vy * 0.25 : 0;
+            st.speed = Math.hypot(st.vx, st.vy);
+            st.missing += 1;
+          } else {
+            let nxtX = st.x + st.vx * 0.94;
+            let nxtY = st.y + st.vy * 0.94;
+            let hitChosen = false;
+            for (const chosenCol of Object.keys(chosenOut)) {
+              const ch = chosenOut[chosenCol];
+              if (Math.hypot(nxtX - ch.x, nxtY - ch.y) < 68.0) {
+                hitChosen = true;
+                break;
+              }
+            }
+            if (hitChosen) {
+              st.vx *= 0.25;
+              st.vy *= 0.25;
+              st.speed = Math.hypot(st.vx, st.vy);
+              st.missing += 1;
+            } else {
+              if (nxtX < 31.0) {
+                nxtX = 31.0 + (31.0 - nxtX);
+                st.vx *= -0.82;
+              } else if (nxtX > 2809.0) {
+                nxtX = 2809.0 - (nxtX - 2809.0);
+                st.vx *= -0.82;
+              }
+              if (nxtY < 31.0) {
+                nxtY = 31.0 + (31.0 - nxtY);
+                st.vy *= -0.82;
+              } else if (nxtY > 1389.0) {
+                nxtY = 1389.0 - (nxtY - 1389.0);
+                st.vy *= -0.82;
+              }
+              st.x = nxtX;
+              st.y = nxtY;
+              st.vx *= 0.94;
+              st.vy *= 0.94;
+              st.speed = Math.hypot(st.vx, st.vy);
+              st.missing += 1;
+            }
+          }
+        }
+
+        if (st.detected) {
+          chosenOut[col] = { x: st.x, y: st.y };
+        }
+      }
+      return Object.keys(chosenOut).length === 3;
     }
 
-    function stepBrowserVisionFSM() {
-      browserVisionState.frameCounter += 1;
-      const st = lastScoreboardData || cloudState;
-      const bounds = browserVisionState.tableBounds;
+    // 두 2D 벡터 사이의 각도(도, 0 ~ 180)
+    function angleBetweenDeg(v1x, v1y, v2x, v2y) {
+      const n1 = Math.hypot(v1x, v1y);
+      const n2 = Math.hypot(v2x, v2y);
+      if (n1 < 1e-6 || n2 < 1e-6) return 0.0;
+      const cosT = Math.max(-1.0, Math.min(1.0, (v1x * v2x + v1y * v2y) / (n1 * n2)));
+      return (Math.acos(cosT) * 180.0) / Math.PI;
+    }
 
-      // 대기 상태(WAIT_SHOT) -> 정지 앵커(restPos) 갱신 및 실제 출발한 수구(WHITE/YELLOW) 감지
+    // 서브프레임 연속 충돌 검출(Sub-frame Continuous Collision Detection)
+    function subframeCcd(pA0, pA1, pB0, pB1) {
+      const r0x = pB0.x - pA0.x;
+      const r0y = pB0.y - pA0.y;
+      const vRelX = pB1.x - pB0.x - (pA1.x - pA0.x);
+      const vRelY = pB1.y - pB0.y - (pA1.y - pA0.y);
+      const vRelSq = vRelX * vRelX + vRelY * vRelY;
+      const tau =
+        vRelSq < 1e-6 ? 0.0 : Math.max(0.0, Math.min(1.0, -(r0x * vRelX + r0y * vRelY) / vRelSq));
+      const ax = pA0.x + tau * (pA1.x - pA0.x);
+      const ay = pA0.y + tau * (pA1.y - pA0.y);
+      const bx = pB0.x + tau * (pB1.x - pB0.x);
+      const by = pB0.y + tau * (pB1.y - pB0.y);
+      const dx = bx - ax;
+      const dy = by - ay;
+      const dist = Math.hypot(dx, dy);
+      const denom = Math.max(dist, 1e-6);
+      return { dist, tau, nx: dx / denom, ny: dy / denom };
+    }
+
+    // OpenCV cv2.approxPolyDP (Ramer-Douglas-Peucker 알고리즘) 1:1 구현
+    function approxPolyDP(pts, epsilon) {
+      if (!pts || pts.length <= 2) return pts ? pts.slice() : [];
+      let dmax = 0;
+      let index = 0;
+      const start = pts[0];
+      const end = pts[pts.length - 1];
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const lenSq = dx * dx + dy * dy;
+
+      for (let i = 1; i < pts.length - 1; i++) {
+        let d = 0;
+        if (lenSq < 1e-6) {
+          d = Math.hypot(pts[i].x - start.x, pts[i].y - start.y);
+        } else {
+          const t = Math.max(0, Math.min(1, ((pts[i].x - start.x) * dx + (pts[i].y - start.y) * dy) / lenSq));
+          d = Math.hypot(pts[i].x - (start.x + t * dx), pts[i].y - (start.y + t * dy));
+        }
+        if (d > dmax) {
+          index = i;
+          dmax = d;
+        }
+      }
+
+      if (dmax > epsilon) {
+        const left = approxPolyDP(pts.slice(0, index + 1), epsilon);
+        const right = approxPolyDP(pts.slice(index), epsilon);
+        return left.slice(0, left.length - 1).concat(right);
+      }
+      return [start, end];
+    }
+
+    // 2D 점 집합의 단일 직선 최소자승법(PCA) 수직 잔차 RMSE(mm)
+    function computeLineFitRmse(pts) {
+      const n = pts.length;
+      if (n < 3) return 0.0;
+      let mx = 0;
+      let my = 0;
+      for (const p of pts) {
+        mx += p.x;
+        my += p.y;
+      }
+      mx /= n;
+      my /= n;
+      let sxx = 0;
+      let syy = 0;
+      let sxy = 0;
+      for (const p of pts) {
+        const dx = p.x - mx;
+        const dy = p.y - my;
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+      }
+      const trace = sxx + syy;
+      const det = sxx * syy - sxy * sxy;
+      const disc = Math.sqrt(Math.max(0, trace * trace - 4 * det));
+      const minEig = Math.max(0, 0.5 * (trace - disc));
+      return Math.sqrt(minEig / n);
+    }
+
+    // 수구 ↔ 1적구 정면 충돌 순간 단일 프레임 좌표 뒤바뀜 복원 (3채널 색상 고정 구조이므로 idSwapMap은 절대 영구 변경하지 않음)
+    function detectAndFixCueTargetIdSwap(tEval, cueColor, targetColor) {
+      const hist = browserVisionState.history;
+      if (tEval - browserVisionState.lastIdSwapTime < 0.15 || hist.length < 5) return false;
+
+      const fPre2 = hist[hist.length - 5];
+      const fPrev = hist[hist.length - 4];
+      const fCurr = hist[hist.length - 3];
+      const fPost = hist[hist.length - 1];
+
+      const dMin = subframeCcd(fPrev.pos[cueColor], fCurr.pos[cueColor], fPrev.pos[targetColor], fCurr.pos[targetColor]).dist;
+      const dPass = subframeCcd(fPrev.pos[cueColor], fPost.pos[cueColor], fPre2.pos[targetColor], fPre2.pos[targetColor]).dist;
+      if (Math.min(dMin, dPass) > 32.0) return false;
+
+      const dtPre = Math.max(fPrev.t - fPre2.t, 1e-3);
+      const dtPost = Math.max(fPost.t - fCurr.t, 1e-3);
+      const vCuePreX = (fPrev.pos[cueColor].x - fPre2.pos[cueColor].x) / dtPre;
+      const vCuePreY = (fPrev.pos[cueColor].y - fPre2.pos[cueColor].y) / dtPre;
+      const vTarPreX = (fPrev.pos[targetColor].x - fPre2.pos[targetColor].x) / dtPre;
+      const vTarPreY = (fPrev.pos[targetColor].y - fPre2.pos[targetColor].y) / dtPre;
+
+      const vCuePostX = (fPost.pos[cueColor].x - fCurr.pos[cueColor].x) / dtPost;
+      const vCuePostY = (fPost.pos[cueColor].y - fCurr.pos[cueColor].y) / dtPost;
+      const vTarPostX = (fPost.pos[targetColor].x - fCurr.pos[targetColor].x) / dtPost;
+      const vTarPostY = (fPost.pos[targetColor].y - fCurr.pos[targetColor].y) / dtPost;
+
+      const sCuePre = Math.hypot(vCuePreX, vCuePreY);
+      const sTarPre = Math.hypot(vTarPreX, vTarPreY);
+      const sCuePost = Math.hypot(vCuePostX, vCuePostY);
+      const sTarPost = Math.hypot(vTarPostX, vTarPostY);
+
+      if (sCuePre <= 240.0 || sTarPre >= 35.0) return false;
+
+      const cosDir = (vCuePreX * vCuePostX + vCuePreY * vCuePostY) / Math.max(sCuePre * sCuePost, 1e-6);
+      const tarStayDisp = Math.hypot(
+        fPost.pos[targetColor].x - fPre2.pos[targetColor].x,
+        fPost.pos[targetColor].y - fPre2.pos[targetColor].y
+      );
+
+      if (
+        sCuePost > sCuePre * 0.65 &&
+        sTarPost < 45.0 &&
+        tarStayDisp <= 16.0 &&
+        cosDir > 0.92
+      ) {
+        for (const snap of hist) {
+          if (snap.t >= fCurr.t) {
+            const tp = snap.pos[cueColor];
+            snap.pos[cueColor] = snap.pos[targetColor];
+            snap.pos[targetColor] = tp;
+            const tv = snap.vel[cueColor];
+            snap.vel[cueColor] = snap.vel[targetColor];
+            snap.vel[targetColor] = tv;
+          }
+        }
+        const bCue = browserVisionState.balls[cueColor];
+        const bTar = browserVisionState.balls[targetColor];
+        const tx = bCue.x;
+        const ty = bCue.y;
+        bCue.x = bTar.x;
+        bCue.y = bTar.y;
+        bTar.x = tx;
+        bTar.y = ty;
+
+        const otherCs = ['WHITE', 'YELLOW', 'RED'].filter((c) => c !== cueColor);
+        for (const ptItem of browserVisionState.cuePath) {
+          if (ptItem.t >= fCurr.t) {
+            const mSnap = hist.find((s) => Math.abs(s.t - ptItem.t) < 1e-4);
+            if (mSnap) {
+              ptItem.x = mSnap.pos[cueColor].x;
+              ptItem.y = mSnap.pos[cueColor].y;
+              ptItem.minDistToTargets = Math.min(
+                ...otherCs.map((oc) => Math.hypot(ptItem.x - mSnap.pos[oc].x, ptItem.y - mSnap.pos[oc].y))
+              );
+            }
+          }
+        }
+        browserVisionState.lastIdSwapTime = tEval;
+        return true;
+      }
+      return false;
+    }
+
+    // 로컬 CausalKissSafeFSM._extract_polyline_cushions 1:1 이식:
+    // approxPolyDP(epsilon=18mm) 꼭짓점 + 10도 이상 굴절 + 레일 법선 부호 반전 + 동일 레일 220mm 이탈 검증
+    function extractPolylineCushions() {
+      const path = browserVisionState.cuePath;
+      if (path.length < 3) {
+        return { cBefore: 0, cAfter: 0, vertices: [] };
+      }
+
+      const approx = approxPolyDP(path, 18.0);
+      if (approx.length < 3) {
+        return { cBefore: 0, cAfter: 0, vertices: [] };
+      }
+
+      const origIndices = [];
+      let searchStart = 0;
+      for (const vPt of approx) {
+        let bestI = searchStart;
+        let bestD = 1e9;
+        for (let idx = searchStart; idx < path.length; idx++) {
+          const d = Math.hypot(path[idx].x - vPt.x, path[idx].y - vPt.y);
+          if (d < bestD) {
+            bestD = d;
+            bestI = idx;
+          }
+          if (d < 1e-3) break;
+        }
+        origIndices.push(bestI);
+        searchStart = bestI;
+      }
+
+      const validVertices = [];
+      let lastRail = null;
+      let lastVertexPathIdx = -1;
+
+      for (let k = 1; k < approx.length - 1; k++) {
+        const pPrev = approx[k - 1];
+        const pCurr = approx[k];
+        const pNext = approx[k + 1];
+        const idxCurr = origIndices[k];
+        const ptInfo = path[idxCurr];
+
+        const vecInX = pCurr.x - pPrev.x;
+        const vecInY = pCurr.y - pPrev.y;
+        const vecOutX = pNext.x - pCurr.x;
+        const vecOutY = pNext.y - pCurr.y;
+        const lenIn = Math.hypot(vecInX, vecInY);
+        const lenOut = Math.hypot(vecOutX, vecOutY);
+
+        const minSegLen = k === 1 || k === approx.length - 2 ? 8.0 : 14.0;
+        if (lenIn < minSegLen || lenOut < minSegLen) continue;
+
+        const wLo = Math.max(0, idxCurr - 1);
+        const wHi = Math.min(path.length - 1, idxCurr + 1);
+        const wLo2 = Math.max(0, idxCurr - 2);
+        const wHi2 = Math.min(path.length - 1, idxCurr + 2);
+
+        const locInX = path[idxCurr].x - path[wLo2].x;
+        const locInY = path[idxCurr].y - path[wLo2].y;
+        const locOutX = path[wHi2].x - path[idxCurr].x;
+        const locOutY = path[wHi2].y - path[idxCurr].y;
+
+        const bendPoly = angleBetweenDeg(vecInX, vecInY, vecOutX, vecOutY);
+        const bendLoc =
+          Math.hypot(locInX, locInY) >= 12.0 && Math.hypot(locOutX, locOutY) >= 12.0
+            ? angleBetweenDeg(locInX, locInY, locOutX, locOutY)
+            : 0.0;
+        const bendDeg = Math.max(bendPoly, bendLoc);
+        if (bendDeg < 10.0) continue;
+
+        const stepDxMax = Math.max(
+          Math.abs(path[idxCurr].x - path[wLo].x),
+          Math.abs(path[wHi].x - path[idxCurr].x)
+        );
+        const stepDyMax = Math.max(
+          Math.abs(path[idxCurr].y - path[wLo].y),
+          Math.abs(path[wHi].y - path[idxCurr].y)
+        );
+
+        const baseRailZone = 125.0;
+        const maxRailZoneX =
+          ptInfo.minDistToTargets >= 85.0
+            ? Math.min(240.0, Math.max(baseRailZone, 75.0 + 0.9 * stepDxMax))
+            : baseRailZone;
+        const maxRailZoneY =
+          ptInfo.minDistToTargets >= 85.0
+            ? Math.min(240.0, Math.max(baseRailZone, 75.0 + 0.9 * stepDyMax))
+            : baseRailZone;
+
+        let dLeft = 9999;
+        let dRight = 9999;
+        let dTop = 9999;
+        let dBottom = 9999;
+        for (let i = wLo; i <= wHi; i++) {
+          if (path[i].x < dLeft) dLeft = path[i].x;
+          if (TABLE_W_MM - path[i].x < dRight) dRight = TABLE_W_MM - path[i].x;
+          if (path[i].y < dTop) dTop = path[i].y;
+          if (TABLE_H_MM - path[i].y < dBottom) dBottom = TABLE_H_MM - path[i].y;
+        }
+
+        const inX = Math.abs(vecInX) >= 1.5 ? vecInX : locInX;
+        const outX = Math.abs(vecOutX) >= 1.5 ? vecOutX : locOutX;
+        const inY = Math.abs(vecInY) >= 1.5 ? vecInY : locInY;
+        const outY = Math.abs(vecOutY) >= 1.5 ? vecOutY : locOutY;
+
+        // 레일 법선 방향 속도 부호 반전(입사 -> 반사) 확인
+        const railCandidates = [];
+        if (dLeft <= maxRailZoneX && inX < -1.5 && outX > 1.5) railCandidates.push({ d: dLeft, rail: 'LEFT' });
+        if (dRight <= maxRailZoneX && inX > 1.5 && outX < -1.5) railCandidates.push({ d: dRight, rail: 'RIGHT' });
+        if (dTop <= maxRailZoneY && inY < -1.5 && outY > 1.5) railCandidates.push({ d: dTop, rail: 'TOP' });
+        if (dBottom <= maxRailZoneY && inY > 1.5 && outY < -1.5) railCandidates.push({ d: dBottom, rail: 'BOTTOM' });
+
+        if (railCandidates.length === 0) continue;
+        railCandidates.sort((a, b) => a.d - b.d);
+        const dRailMin = railCandidates[0].d;
+        const hitRail = railCandidates[0].rail;
+
+        const stepNearT1 = Math.hypot(stepDxMax, stepDyMax);
+        const dynT1Radius = Math.min(220.0, Math.max(105.0, 75.0 + 1.15 * stepNearT1));
+        const hitIdx1 = browserVisionState.firstTargetHitPathIdx;
+        let isBeforeFirstHit = hitIdx1 === null || idxCurr < hitIdx1;
+
+        // 출발 원점 근처 초기 떨림 꼭짓점 배제
+        const origPos = browserVisionState.strokeOriginPos;
+        if (isBeforeFirstHit && validVertices.length === 0 && origPos && dRailMin > 48.0) {
+          const dOrigRail =
+            hitRail === 'LEFT'
+              ? origPos.x
+              : hitRail === 'RIGHT'
+              ? TABLE_W_MM - origPos.x
+              : hitRail === 'TOP'
+              ? origPos.y
+              : TABLE_H_MM - origPos.y;
+          if (dRailMin > dOrigRail - 8.0) continue;
+        }
+
+        // 제1적구 최초 충돌 시점 전후(±3프레임)의 1적구 타격 굴절 꼭짓점은 쿠션에서 철저히 배제
+        if (hitIdx1 !== null && Math.abs(idxCurr - hitIdx1) <= 3) {
+          const t1Ref =
+            browserVisionState.firstTargetBall
+              ? browserVisionState.initialPositions[browserVisionState.firstTargetBall]
+              : null;
+          let isVertexPastT1 = false;
+          if (origPos && t1Ref) {
+            const dOrigV = Math.hypot(pCurr.x - origPos.x, pCurr.y - origPos.y);
+            const dOrigT1 = Math.hypot(t1Ref.x - origPos.x, t1Ref.y - origPos.y);
+            if (
+              dOrigV >= dOrigT1 - Math.max(75.0, 50.0 + 0.85 * stepNearT1) ||
+              Math.hypot(pCurr.x - t1Ref.x, pCurr.y - t1Ref.y) <= dynT1Radius
+            ) {
+              isVertexPastT1 = true;
+            }
+          }
+          if (
+            (idxCurr > hitIdx1 || isVertexPastT1) &&
+            dRailMin <= 68.0 &&
+            (ptInfo.minDistToTargets >= 64.0 || isVertexPastT1)
+          ) {
+            isBeforeFirstHit = false;
+          } else {
+            continue;
+          }
+        }
+
+        // 목적구 반경 안에서 꺾인 꼭짓점이면서 실제 레일 밀착(<=42mm)이 아니면 목적구 충돌 꼭짓점이므로 쿠션에서 배제
+        const effObjMaskR = isBeforeFirstHit ? dynT1Radius : 85.0;
+        if (
+          ptInfo.minDistToTargets < effObjMaskR &&
+          dRailMin > (ptInfo.minDistToTargets < 85.0 ? 42.0 : 62.0)
+        ) {
+          continue;
+        }
+
+        // 동일 레일 슬라이딩 중복 카운트 차단: 레일로부터 220mm 이상 깊숙이 이탈했다가 다시 들어온 경우만 인정!
+        if (hitRail === lastRail && lastVertexPathIdx >= 0) {
+          const crossedFirstHit = hitIdx1 !== null && lastVertexPathIdx < hitIdx1 && hitIdx1 < idxCurr;
+          if (!crossedFirstHit) {
+            let maxAway = 0.0;
+            for (let mI = lastVertexPathIdx; mI <= idxCurr; mI++) {
+              const mp = path[mI];
+              const rD =
+                hitRail === 'LEFT'
+                  ? mp.x
+                  : hitRail === 'RIGHT'
+                  ? TABLE_W_MM - mp.x
+                  : hitRail === 'TOP'
+                  ? mp.y
+                  : TABLE_H_MM - mp.y;
+              if (rD > maxAway) maxAway = rD;
+            }
+            if (maxAway < 220.0) continue;
+          }
+        }
+
+        validVertices.push({ frameIdx: ptInfo.frameIdx, t: ptInfo.t, rail: hitRail, x: pCurr.x, y: pCurr.y });
+        lastRail = hitRail;
+        lastVertexPathIdx = idxCurr;
+      }
+
+      // 초고속 서브프레임 쿠션 반사 보강 (approxPolyDP에서 평탄화된 고속 반사 정점 복구)
+      const existingIndices = new Set();
+      for (const v of validVertices) {
+        for (let pI = 0; pI < path.length; pI++) {
+          if (path[pI].frameIdx === v.frameIdx) existingIndices.add(pI);
+        }
+      }
+      const hitIdx1 = browserVisionState.firstTargetHitPathIdx;
+      for (let idxS = 1; idxS < path.length - 1; idxS++) {
+        let nearExisting = false;
+        for (const exI of existingIndices) {
+          if (Math.abs(idxS - exI) <= 2) {
+            nearExisting = true;
+            break;
+          }
+        }
+        if (nearExisting) continue;
+
+        const ptS = path[idxS];
+        const dxStep = Math.max(Math.abs(ptS.x - path[idxS - 1].x), Math.abs(path[idxS + 1].x - ptS.x));
+        const dyStep = Math.max(Math.abs(ptS.y - path[idxS - 1].y), Math.abs(path[idxS + 1].y - ptS.y));
+        const stepSMag = Math.hypot(dxStep, dyStep);
+        const isPreS = hitIdx1 === null || idxS <= hitIdx1;
+        const minObjRS = isPreS ? Math.min(210.0, Math.max(105.0, 75.0 + 1.1 * stepSMag)) : 85.0;
+        if (ptS.minDistToTargets < minObjRS) continue;
+        if (hitIdx1 !== null && Math.abs(idxS - hitIdx1) <= 3) continue;
+
+        const wLoS = Math.max(0, idxS - 2);
+        const wHiS = Math.min(path.length - 1, idxS + 2);
+        const vInSX = ptS.x - path[wLoS].x;
+        const vInSY = ptS.y - path[wLoS].y;
+        const vOutSX = path[wHiS].x - ptS.x;
+        const vOutSY = path[wHiS].y - ptS.y;
+        if (Math.hypot(vInSX, vInSY) < 25.0 || Math.hypot(vOutSX, vOutSY) < 25.0) continue;
+        if (angleBetweenDeg(vInSX, vInSY, vOutSX, vOutSY) < 10.0) continue;
+
+        const zoneX = Math.min(230.0, Math.max(125.0, 75.0 + 0.85 * dxStep));
+        const zoneY = Math.min(230.0, Math.max(125.0, 75.0 + 0.85 * dyStep));
+        const dL = ptS.x;
+        const dR = TABLE_W_MM - ptS.x;
+        const dT = ptS.y;
+        const dB = TABLE_H_MM - ptS.y;
+
+        const subCands = [];
+        if (dL <= zoneX && vInSX < -12.0 && vOutSX > 12.0 && ptS.x <= path[idxS - 1].x && ptS.x <= path[idxS + 1].x) {
+          subCands.push({ d: dL, rail: 'LEFT' });
+        }
+        if (dR <= zoneX && vInSX > 12.0 && vOutSX < -12.0 && ptS.x >= path[idxS - 1].x && ptS.x >= path[idxS + 1].x) {
+          subCands.push({ d: dR, rail: 'RIGHT' });
+        }
+        if (dT <= zoneY && vInSY < -12.0 && vOutSY > 12.0 && ptS.y <= path[idxS - 1].y && ptS.y <= path[idxS + 1].y) {
+          subCands.push({ d: dT, rail: 'TOP' });
+        }
+        if (dB <= zoneY && vInSY > 12.0 && vOutSY < -12.0 && ptS.y >= path[idxS - 1].y && ptS.y >= path[idxS + 1].y) {
+          subCands.push({ d: dB, rail: 'BOTTOM' });
+        }
+        if (subCands.length > 0) {
+          subCands.sort((a, b) => a.d - b.d);
+          validVertices.push({
+            frameIdx: ptS.frameIdx,
+            t: ptS.t,
+            rail: subCands[0].rail,
+            x: ptS.x,
+            y: ptS.y,
+          });
+          existingIndices.add(idxS);
+        }
+      }
+
+      validVertices.sort((a, b) => a.frameIdx - b.frameIdx);
+
+      // 선쿠션(cBefore) vs 후쿠션(cAfter) 분리 및 직진 1적구 타격 시 선쿠션 오탐 차단
+      const isDirectShotToT1 = browserVisionState.minRailDistBeforeFirstHit > 72.0;
+      const cueNowC = browserVisionState.activeCueColor || 'WHITE';
+      const objInitPositions = ['WHITE', 'YELLOW', 'RED']
+        .filter((c) => c !== cueNowC && browserVisionState.initialPositions[c])
+        .map((c) => browserVisionState.initialPositions[c]);
+
+      let cBefore = 0;
+      let cAfter = 0;
+      const origPos = browserVisionState.strokeOriginPos;
+      const hitTime1 = browserVisionState.firstTargetHitTime;
+
+      for (const v of validVertices) {
+        if (
+          origPos &&
+          Math.hypot(v.x - origPos.x, v.y - origPos.y) <= 55.0 &&
+          (hitTime1 === null || v.t <= hitTime1 + 0.04)
+        ) {
+          continue;
+        }
+        if (hitTime1 === null && objInitPositions.length > 0) {
+          const minDObjV = Math.min(...objInitPositions.map((pObj) => Math.hypot(v.x - pObj.x, v.y - pObj.y)));
+          if (minDObjV <= 185.0 && path.length >= 1 && path[path.length - 1].minDistToTargets <= 210.0) {
+            continue;
+          }
+        }
+        let isPreHit = hitTime1 === null || v.t < hitTime1 - 0.005;
+        if (isPreHit && hitTime1 !== null) {
+          const dRailV = Math.min(v.x, TABLE_W_MM - v.x, v.y, TABLE_H_MM - v.y);
+          if (isDirectShotToT1) {
+            if (dRailV <= 72.0) isPreHit = false;
+            else continue;
+          } else if (dRailV > 125.0) {
+            continue;
+          }
+        }
+        if (isPreHit) cBefore += 1;
+        else cAfter += 1;
+      }
+
+      return { cBefore, cAfter, vertices: validVertices };
+    }
+
+    // 수구 폴리라인 꼭짓점 굴절 검사 (로컬 _check_cue_polyline_vertex_at_target 1:1 이식)
+    function checkCuePolylineVertexAtTarget(targetPos, fPre2, fPrev, fCurr, fPost2, cueColor) {
+      const p0 = fPre2.pos[cueColor];
+      const p1 = fPrev.pos[cueColor];
+      const p2 = fCurr.pos[cueColor];
+      const p3 = fPost2.pos[cueColor];
+
+      const bendAtCurr = angleBetweenDeg(p2.x - p1.x, p2.y - p1.y, p3.x - p2.x, p3.y - p2.y);
+      if (bendAtCurr < 1.8) return { isValidKink: false, bestBend: 0.0, lineRmse: 0.0 };
+
+      const pts4 = [p0, p1, p2, p3];
+      const lineRmse = computeLineFitRmse(pts4);
+      const approx = approxPolyDP(pts4, 1.8);
+
+      let maxBend = 0.0;
+      for (let k = 1; k < approx.length - 1; k++) {
+        const vInX = approx[k].x - approx[k - 1].x;
+        const vInY = approx[k].y - approx[k - 1].y;
+        const vOutX = approx[k + 1].x - approx[k].x;
+        const vOutY = approx[k + 1].y - approx[k].y;
+        if (Math.hypot(vInX, vInY) < 5.0 || Math.hypot(vOutX, vOutY) < 5.0) continue;
+        const bend = angleBetweenDeg(vInX, vInY, vOutX, vOutY);
+        const distToT = Math.hypot(approx[k].x - targetPos.x, approx[k].y - targetPos.y);
+        if (distToT <= 74.0 && bend > maxBend) maxBend = bend;
+      }
+
+      const bestBend = Math.max(maxBend, bendAtCurr);
+      const isValidKink = bestBend >= 4.0 && (lineRmse >= 1.6 || bestBend >= 4.2);
+      return { isValidKink, bestBend, lineRmse };
+    }
+
+    // 로컬 CausalKissSafeFSM._verify_pair_collision 1:1 이식 (증거 A: 목적구 위치 이탈 + 증거 B: 얇은 스침 수구 굴절)
+    function verifyPairCollision(ballX, ballY, fPre2, fPrev, fCurr, fPost2, otherBall) {
+      const tEval = fCurr.t;
+      const pairKey = [ballX, ballY].sort().join('_');
+      if (tEval - (browserVisionState.pairLastHitTime[pairKey] || -999.0) < 0.08) return false;
+
+      const ccdPre = subframeCcd(fPrev.pos[ballX], fCurr.pos[ballX], fPrev.pos[ballY], fCurr.pos[ballY]);
+      const ccdPost = subframeCcd(fCurr.pos[ballX], fPost2.pos[ballX], fCurr.pos[ballY], fPost2.pos[ballY]);
+
+      let dMin = ccdPre.dist;
+      let nXY = { x: ccdPre.nx, y: ccdPre.ny };
+      if (!browserVisionState.firstTargetBall && ccdPost.dist < ccdPre.dist) {
+        dMin = ccdPost.dist;
+        nXY = { x: ccdPost.nx, y: ccdPost.ny };
+      }
+
+      if (!browserVisionState.firstTargetBall && dMin > 68.0) {
+        const stepInX = fPrev.pos[ballX].x - fPre2.pos[ballX].x;
+        const stepInY = fPrev.pos[ballX].y - fPre2.pos[ballX].y;
+        const yDisp = Math.hypot(fPost2.pos[ballY].x - fPre2.pos[ballY].x, fPost2.pos[ballY].y - fPre2.pos[ballY].y);
+        if (Math.hypot(stepInX, stepInY) >= 35.0 && yDisp >= 3.5) {
+          const pRayExt = { x: fPrev.pos[ballX].x + stepInX, y: fPrev.pos[ballX].y + stepInY };
+          const ccdRay = subframeCcd(fPrev.pos[ballX], pRayExt, fPrev.pos[ballY], fCurr.pos[ballY]);
+          if (ccdRay.dist < dMin) {
+            dMin = ccdRay.dist;
+            nXY = { x: ccdRay.nx, y: ccdRay.ny };
+          }
+        }
+      }
+
+      if (dMin > 135.0) return false;
+
+      const dXOther = subframeCcd(fPrev.pos[ballX], fCurr.pos[ballX], fPrev.pos[otherBall], fCurr.pos[otherBall]).dist;
+      const dYOther = subframeCcd(fPrev.pos[otherBall], fCurr.pos[otherBall], fPrev.pos[ballY], fCurr.pos[ballY]).dist;
+      const dYOtherPost = Math.hypot(
+        fPost2.pos[ballY].x - fPost2.pos[otherBall].x,
+        fPost2.pos[ballY].y - fPost2.pos[otherBall].y
+      );
+
+      if (browserVisionState.firstTargetBall && ballY !== browserVisionState.firstTargetBall) {
+        if (Math.min(dYOther, dYOtherPost) <= 66.0 && dXOther <= 64.0 && dXOther < dMin) {
+          return false;
+        }
+      }
+
+      const pYBefore = fPre2.pos[ballY];
+      const pYMid = fPrev.pos[ballY];
+      const pYAfter = fPost2.pos[ballY];
+
+      const dtBefore = Math.max(fPrev.t - fPre2.t, 1e-3);
+      const dtAfter = Math.max(fPost2.t - fCurr.t, 1e-3);
+      const vYBeforeX = (pYMid.x - pYBefore.x) / dtBefore;
+      const vYBeforeY = (pYMid.y - pYBefore.y) / dtBefore;
+      const vYAfterX = (pYAfter.x - fCurr.pos[ballY].x) / dtAfter;
+      const vYAfterY = (pYAfter.y - fCurr.pos[ballY].y) / dtAfter;
+      const deltaVYMag = Math.hypot(vYAfterX - vYBeforeX, vYAfterY - vYBeforeY);
+      const speedYBefore = Math.hypot(vYBeforeX, vYBeforeY);
+
+      const dtXBefore = Math.max(fCurr.t - fPre2.t, 1e-3);
+      const vXBeforeX = (fCurr.pos[ballX].x - fPre2.pos[ballX].x) / dtXBefore;
+      const vXBeforeY = (fCurr.pos[ballX].y - fPre2.pos[ballX].y) / dtXBefore;
+      const vXAfterX = (fPost2.pos[ballX].x - fCurr.pos[ballX].x) / dtAfter;
+      const vXAfterY = (fPost2.pos[ballX].y - fCurr.pos[ballX].y) / dtAfter;
+
+      const { isValidKink: hasCueVertex, bestBend: cueBendDeg, lineRmse } = checkCuePolylineVertexAtTarget(
+        fCurr.pos[ballY],
+        fPre2,
+        fPrev,
+        fCurr,
+        fPost2,
+        ballX
+      );
+
+      // [증거 A] 목적구 정지 앵커 이탈 (5.2mm 이상 실제 이동)
+      let phenomenonAHit = false;
+      const netDispY = Math.hypot(pYAfter.x - pYBefore.x, pYAfter.y - pYBefore.y);
+      const stepAfterHit = Math.hypot(pYAfter.x - fCurr.pos[ballY].x, pYAfter.y - fCurr.pos[ballY].y);
+      const effApproachZone = !browserVisionState.firstTargetBall ? 82.0 : 72.0;
+
+      if (speedYBefore < 50.0) {
+        if (dMin <= effApproachZone) {
+          if (netDispY >= 5.2 && stepAfterHit >= 1.5 && deltaVYMag >= 42.0) {
+            if (dMin <= dXOther + 6.0 || dYOther > 68.0) {
+              phenomenonAHit = true;
+            }
+          }
+        } else if (
+          netDispY >= 15.0 &&
+          stepAfterHit >= 6.0 &&
+          deltaVYMag >= 140.0 &&
+          dYOther > 85.0 &&
+          dXOther > dMin &&
+          (!browserVisionState.firstTargetBall || (hasCueVertex && cueBendDeg >= 4.0))
+        ) {
+          phenomenonAHit = true;
+        }
+      }
+
+      // [증거 B] 초미세 얇은 스침(Thin-Hit)에 의한 수구 직선 파괴(Line-Fit RMSE) 및 법선 반발 검증
+      let phenomenonBHit = false;
+      if (!phenomenonAHit) {
+        const px = fCurr.pos[ballX].x;
+        const py = fCurr.pos[ballX].y;
+        const dRailNow = Math.min(px, TABLE_W_MM - px, py, TABLE_H_MM - py);
+        const railNormalFlipped =
+          (px <= 125.0 && vXBeforeX < -15.0 && vXAfterX > 15.0) ||
+          (TABLE_W_MM - px <= 125.0 && vXBeforeX > 15.0 && vXAfterX < -15.0) ||
+          (py <= 125.0 && vXBeforeY < -15.0 && vXAfterY > 15.0) ||
+          (TABLE_H_MM - py <= 125.0 && vXBeforeY > 15.0 && vXAfterY < -15.0);
+        const isBouncingOnRail = dRailNow <= 54.0 || railNormalFlipped;
+
+        if (!browserVisionState.firstTargetBall) {
+          const stepDispT1 = Math.hypot(fCurr.pos[ballY].x - pYBefore.x, fCurr.pos[ballY].y - pYBefore.y);
+          const maxDispT1 = Math.max(netDispY, stepDispT1);
+          const cueDeflectT1 = Math.max(cueBendDeg, angleBetweenDeg(vXBeforeX, vXBeforeY, vXAfterX, vXAfterY));
+          if (dMin <= 70.0 && (cueDeflectT1 >= 1.8 || maxDispT1 >= 1.2 || hasCueVertex)) {
+            phenomenonBHit = true;
+          } else if (
+            dMin <= 82.0 &&
+            (hasCueVertex || cueDeflectT1 >= 2.5 || maxDispT1 >= 1.8) &&
+            (!isBouncingOnRail || maxDispT1 >= 1.4 || dMin <= 74.0)
+          ) {
+            phenomenonBHit = true;
+          }
+        } else {
+          const normalDispY = (pYAfter.x - pYBefore.x) * nXY.x + (pYAfter.y - pYBefore.y) * nXY.y;
+          const targetActuallyPushed =
+            netDispY >= 1.6 && normalDispY >= 0.85 && normalDispY / Math.max(netDispY, 1e-6) >= 0.5;
+          const otherMoved =
+            Math.hypot(fPost2.pos[otherBall].x - fPre2.pos[otherBall].x, fPost2.pos[otherBall].y - fPre2.pos[otherBall].y) >= 5.2;
+
+          if (
+            (!isBouncingOnRail || targetActuallyPushed) &&
+            dXOther > 72.0 &&
+            !otherMoved &&
+            dMin <= 68.0 &&
+            (hasCueVertex || targetActuallyPushed) &&
+            (cueBendDeg >= 3.8 || netDispY >= 2.4) &&
+            (lineRmse >= 1.5 || netDispY >= 2.4)
+          ) {
+            phenomenonBHit = true;
+          }
+        }
+      }
+
+      if (phenomenonAHit || phenomenonBHit) {
+        browserVisionState.pairLastHitTime[pairKey] = tEval;
+        return true;
+      }
+      return false;
+    }
+
+    function stepBrowserVisionFSM(dtSec) {
+      browserVisionState.frameCounter += 1;
+      browserVisionState.simClockSec += dtSec;
+      const tNow = browserVisionState.simClockSec;
+      const st = lastScoreboardData || cloudState;
+
+      // ID 스왑 맵이 적용된 현재 물리 좌표(mm) 및 속도(mm/s) 스냅샷 생성
+      const map = browserVisionState.idSwapMap;
+      const snapPos = {};
+      const snapVel = {};
+      const prevSnap =
+        browserVisionState.history.length > 0
+          ? browserVisionState.history[browserVisionState.history.length - 1]
+          : null;
+
+      ['WHITE', 'YELLOW', 'RED'].forEach((trueC) => {
+        const obsC = map[trueC] || trueC;
+        const b = browserVisionState.balls[obsC];
+        snapPos[trueC] = { x: b.x, y: b.y };
+        if (prevSnap) {
+          const dt = Math.max(tNow - prevSnap.t, 1e-3);
+          const rawVx = (b.x - prevSnap.pos[trueC].x) / dt;
+          const rawVy = (b.y - prevSnap.pos[trueC].y) / dt;
+          const prevV = prevSnap.vel[trueC] || { x: 0, y: 0 };
+          snapVel[trueC] = {
+            x: 0.65 * rawVx + 0.35 * prevV.x,
+            y: 0.65 * rawVy + 0.35 * prevV.y,
+          };
+        } else {
+          snapVel[trueC] = { x: 0, y: 0 };
+        }
+      });
+
+      const currSnap = {
+        frameIdx: browserVisionState.frameCounter,
+        t: tNow,
+        pos: snapPos,
+        vel: snapVel,
+      };
+      browserVisionState.history.push(currSnap);
+      if (browserVisionState.history.length > 20) browserVisionState.history.shift();
+
+      // 1) 대기 상태(WAIT_SHOT) -> 정지 위치(restPos) 스냅샷 저장 및 스트로크 출발 감지
       if (browserVisionState.fsmState === 'WAIT_SHOT') {
         ['WHITE', 'YELLOW', 'RED'].forEach((k) => {
           const b = browserVisionState.balls[k];
           if (!b.detected) return;
+          const spdMmS = Math.hypot(snapVel[k].x, snapVel[k].y);
           if (!browserVisionState.restPos[k]) {
             browserVisionState.restPos[k] = { x: b.x, y: b.y };
-          } else if (b.speed < 0.9) {
+          } else if (spdMmS < 35.0) {
             browserVisionState.restPos[k].x = browserVisionState.restPos[k].x * 0.85 + b.x * 0.15;
             browserVisionState.restPos[k].y = browserVisionState.restPos[k].y * 0.85 + b.y * 0.15;
           }
@@ -4672,8 +5656,9 @@
           const b = browserVisionState.balls[candKey];
           const anchor = browserVisionState.restPos[candKey];
           if (!b.detected || !anchor) continue;
-          const disp = Math.hypot(b.x - anchor.x, b.y - anchor.y);
-          if (b.speed >= 1.35 && disp >= 4.2) {
+          const dispMm = Math.hypot(b.x - anchor.x, b.y - anchor.y);
+          const spdMmS = Math.hypot(snapVel[candKey].x, snapVel[candKey].y);
+          if (spdMmS >= 145.0 && dispMm >= 22.0) {
             movingCandidate = candKey;
             break;
           }
@@ -4686,7 +5671,6 @@
             browserVisionState.shotId = Date.now();
             browserVisionState.activeCueColor = movingCandidate;
 
-            // 출발한 수구 색상에 맞춰 공격 선수 자동 동기화 (WHITE=P1, YELLOW=P2)
             const targetPlayerId = movingCandidate === 'YELLOW' ? 'P2' : 'P1';
             if (st.active_player_id !== targetPlayerId) {
               st.active_player_id = targetPlayerId;
@@ -4695,20 +5679,35 @@
               }
             }
 
-            const cueB = browserVisionState.balls[movingCandidate];
-            const ancB = browserVisionState.restPos[movingCandidate] || { x: cueB.x, y: cueB.y };
-            browserVisionState.trail = [
-              { x: ancB.x, y: ancB.y },
-              { x: cueB.x, y: cueB.y },
+            ['WHITE', 'YELLOW', 'RED'].forEach((k) => {
+              const rp = browserVisionState.restPos[k] || snapPos[k];
+              browserVisionState.initialPositions[k] = { x: rp.x, y: rp.y };
+              browserVisionState.allBallPaths[k] = [{ frameIdx: currSnap.frameIdx, t: tNow, x: snapPos[k].x, y: snapPos[k].y }];
+            });
+
+            const ancCue = browserVisionState.initialPositions[movingCandidate];
+            browserVisionState.strokeOriginPos = { x: ancCue.x, y: ancCue.y };
+            const otherCs = ['WHITE', 'YELLOW', 'RED'].filter((c) => c !== movingCandidate);
+            const initMinDist = Math.min(
+              ...otherCs.map((oc) => Math.hypot(ancCue.x - snapPos[oc].x, ancCue.y - snapPos[oc].y))
+            );
+            const currMinDist = Math.min(
+              ...otherCs.map((oc) => Math.hypot(snapPos[movingCandidate].x - snapPos[oc].x, snapPos[movingCandidate].y - snapPos[oc].y))
+            );
+
+            browserVisionState.cuePath = [
+              { frameIdx: currSnap.frameIdx - 1, t: tNow - dtSec, x: ancCue.x, y: ancCue.y, minDistToTargets: initMinDist },
+              { frameIdx: currSnap.frameIdx, t: tNow, x: snapPos[movingCandidate].x, y: snapPos[movingCandidate].y, minDistToTargets: currMinDist },
             ];
             browserVisionState.cushionCount = 0;
             browserVisionState.cushionsBeforeFirstHit = 0;
+            browserVisionState.cushionsAfterFirstHit = 0;
             browserVisionState.cushionsBeforeSecondHit = 0;
-            browserVisionState.minRailDistBeforeFirstHit = 999;
-            browserVisionState.lastCushionSide = '';
-            browserVisionState.lastCushionFrame = browserVisionState.frameCounter;
+            browserVisionState.minRailDistBeforeFirstHit = 9999;
             browserVisionState.firstTargetBall = null;
             browserVisionState.secondTargetBall = null;
+            browserVisionState.firstTargetHitTime = null;
+            browserVisionState.firstTargetHitPathIdx = null;
             browserVisionState.hitBalls = [];
             browserVisionState.firstContactIsCushion = false;
             browserVisionState.firstContactDecided = false;
@@ -4722,156 +5721,140 @@
         return;
       }
 
+      // 2) 샷 진행 상태(SHOT_IN_PROGRESS) -> 궤적 축적, ID 스왑 복원, 폴리라인 쿠션 계산, 1·2적구 충돌 판정
       if (browserVisionState.fsmState === 'SHOT_IN_PROGRESS') {
         browserVisionState.shotActiveFrames += 1;
         const cueColor = browserVisionState.activeCueColor || 'WHITE';
-        const otherColor = cueColor === 'WHITE' ? 'YELLOW' : 'WHITE';
-        const targetKeys = [otherColor, 'RED'];
+        const otherColors = ['WHITE', 'YELLOW', 'RED'].filter((c) => c !== cueColor);
 
-        const cueBall = browserVisionState.balls[cueColor];
-        const maxBallSpeed = Math.max(
-          browserVisionState.balls.WHITE.speed || 0,
-          browserVisionState.balls.YELLOW.speed || 0,
-          browserVisionState.balls.RED.speed || 0
+        ['WHITE', 'YELLOW', 'RED'].forEach((k) => {
+          browserVisionState.allBallPaths[k].push({
+            frameIdx: currSnap.frameIdx,
+            t: tNow,
+            x: snapPos[k].x,
+            y: snapPos[k].y,
+          });
+        });
+
+        const cuePos = snapPos[cueColor];
+        const minDistToTargets = Math.min(
+          ...otherColors.map((oc) => Math.hypot(cuePos.x - snapPos[oc].x, cuePos.y - snapPos[oc].y))
         );
+        browserVisionState.cuePath.push({
+          frameIdx: currSnap.frameIdx,
+          t: tNow,
+          x: cuePos.x,
+          y: cuePos.y,
+          minDistToTargets,
+        });
 
-        if (cueBall.detected) {
-          browserVisionState.trail.push({ x: cueBall.x, y: cueBall.y });
-          if (browserVisionState.trail.length > 90) browserVisionState.trail.shift();
-
-          if (!browserVisionState.firstTargetBall) {
-            const dRailNow = Math.min(
-              Math.abs(cueBall.x - bounds.left),
-              Math.abs(bounds.right - cueBall.x),
-              Math.abs(cueBall.y - bounds.top),
-              Math.abs(bounds.bottom - cueBall.y)
-            );
-            const ancCue = browserVisionState.restPos[cueColor];
-            const dispFromStart = ancCue ? Math.hypot(cueBall.x - ancCue.x, cueBall.y - ancCue.y) : 99;
-            if (dispFromStart >= 9 && dRailNow < browserVisionState.minRailDistBeforeFirstHit) {
+        if (!browserVisionState.firstTargetBall && browserVisionState.strokeOriginPos) {
+          const dispOrig = Math.hypot(
+            cuePos.x - browserVisionState.strokeOriginPos.x,
+            cuePos.y - browserVisionState.strokeOriginPos.y
+          );
+          if (dispOrig >= 30.0 && minDistToTargets >= 95.0) {
+            const dRailNow = Math.min(cuePos.x, TABLE_W_MM - cuePos.x, cuePos.y, TABLE_H_MM - cuePos.y);
+            if (dRailNow < browserVisionState.minRailDistBeforeFirstHit) {
               browserVisionState.minRailDistBeforeFirstHit = dRailNow;
             }
           }
         }
 
-        // 1) 적구 충돌 판정 (서브프레임 최단 거리 <= 21px OR 관성의 법칙에 따른 정지 적구 이탈 >= 3.8px)
-        let hitAnyTargetThisFrame = false;
-        for (const tKey of targetKeys) {
-          if (browserVisionState.hitBalls.includes(tKey)) continue;
-          const tBall = browserVisionState.balls[tKey];
-          if (!tBall.detected) continue;
+        // 5프레임 슬라이딩 히스토리(f_pre2, f_prev, f_curr, f_post2) 기반 정밀 인과 판정
+        const hist = browserVisionState.history;
+        if (hist.length >= 5) {
+          const fPre2 = hist[hist.length - 5];
+          const fPrev = hist[hist.length - 4];
+          const fCurr = hist[hist.length - 3];
+          const fPost2 = hist[hist.length - 1];
 
-          const dSub = cueBall.detected
-            ? segmentToSegmentMinDist(
-                cueBall.prevX || cueBall.x,
-                cueBall.prevY || cueBall.y,
-                cueBall.x,
-                cueBall.y,
-                tBall.prevX || tBall.x,
-                tBall.prevY || tBall.y,
-                tBall.x,
-                tBall.y
-              )
-            : 999;
+          // 수구 ↔ 1적구 정면 타격 후 ID 스왑 복원
+          for (const oc of otherColors) {
+            detectAndFixCueTargetIdSwap(fCurr.t, cueColor, oc);
+          }
 
-          const tAnchor = browserVisionState.restPos[tKey];
-          const dispFromRest = tAnchor ? Math.hypot(tBall.x - tAnchor.x, tBall.y - tAnchor.y) : 0;
+          // 수구 ↔ 목적구 충돌 판정 (증거 A + 증거 B)
+          for (let i = 0; i < otherColors.length; i++) {
+            const targetC = otherColors[i];
+            const thirdC = otherColors[1 - i];
+            if (browserVisionState.hitBalls.includes(targetC)) continue;
 
-          // 관성의 법칙: 제1적구 피격 전 정지해 있던 적구가 3.8px 이상 움직이면 100% 수구가 1적구를 충돌한 것!
-          const inertiaFirstHit =
-            !browserVisionState.firstTargetBall && dispFromRest >= 3.8 && tBall.speed >= 0.85;
-          const directHit = dSub <= 21.5 && (dispFromRest >= 2.2 || cueBall.speed >= 1.2);
-
-          if (directHit || inertiaFirstHit) {
-            browserVisionState.hitBalls.push(tKey);
-            hitAnyTargetThisFrame = true;
-            if (!browserVisionState.firstTargetBall) {
-              browserVisionState.firstTargetBall = tKey;
-              // 수구가 쿠션에 실제로 닿지 않았는데(minRailDist > 12px) 1적구가 맞았다면 선행 쿠션 오탐을 0으로 강제 초기화!
-              if (browserVisionState.minRailDistBeforeFirstHit > 12.5) {
-                if (browserVisionState.cushionsBeforeFirstHit > 0) {
-                  browserVisionState.cushionCount = Math.max(
-                    0,
-                    browserVisionState.cushionCount - browserVisionState.cushionsBeforeFirstHit
+            if (verifyPairCollision(cueColor, targetC, fPre2, fPrev, fCurr, fPost2, thirdC)) {
+              browserVisionState.hitBalls.push(targetC);
+              if (!browserVisionState.firstTargetBall) {
+                browserVisionState.firstTargetBall = targetC;
+                // 실제 1적구와 가장 가까웠던 cuePath 인덱스 및 시각 역산
+                const t1Init = browserVisionState.initialPositions[targetC] || fCurr.pos[targetC];
+                let bestHitIdx = Math.max(0, browserVisionState.cuePath.length - 3);
+                let bestDT1 = 1e9;
+                const searchLo = Math.max(0, browserVisionState.cuePath.length - 7);
+                for (let idxC = searchLo; idxC < browserVisionState.cuePath.length; idxC++) {
+                  const dC = Math.hypot(
+                    browserVisionState.cuePath[idxC].x - t1Init.x,
+                    browserVisionState.cuePath[idxC].y - t1Init.y
                   );
+                  if (dC < bestDT1) {
+                    bestDT1 = dC;
+                    bestHitIdx = idxC;
+                  }
                 }
-                browserVisionState.cushionsBeforeFirstHit = 0;
-                browserVisionState.firstContactIsCushion = false;
-              } else {
-                browserVisionState.firstContactIsCushion = browserVisionState.cushionsBeforeFirstHit >= 1;
+                browserVisionState.firstTargetHitPathIdx = bestHitIdx;
+                browserVisionState.firstTargetHitTime = browserVisionState.cuePath[bestHitIdx].t;
+                browserVisionState.firstContactDecided = true;
+              } else if (!browserVisionState.secondTargetBall) {
+                browserVisionState.secondTargetBall = targetC;
               }
-              browserVisionState.firstContactDecided = true;
-            } else if (!browserVisionState.secondTargetBall) {
-              browserVisionState.secondTargetBall = tKey;
-              browserVisionState.cushionsBeforeSecondHit = browserVisionState.cushionCount;
             }
           }
         }
 
-        // 2) 쿠션(레일) 반사 감지 (미타격 적구 반경 24px 이내에서는 1적구 충돌 굴절이 쿠션으로 오인되지 않도록 억제)
-        let nearUnhitTarget = false;
-        if (cueBall.detected) {
-          for (const tKey of targetKeys) {
-            if (browserVisionState.hitBalls.includes(tKey)) continue;
-            const tb = browserVisionState.balls[tKey];
-            if (tb.detected && Math.hypot(cueBall.x - tb.x, cueBall.y - tb.y) <= 24) {
-              nearUnhitTarget = true;
-              break;
-            }
+        // approxPolyDP 폴리라인 꼭짓점 기반 쿠션 수 실시간 재계산 (단순 테두리 시간 누적 폭주 원천 제거!)
+        const polyRes = extractPolylineCushions();
+        browserVisionState.cushionsBeforeFirstHit = polyRes.cBefore;
+        browserVisionState.cushionsAfterFirstHit = polyRes.cAfter;
+        browserVisionState.cushionCount = polyRes.cBefore + polyRes.cAfter;
+        browserVisionState.firstContactIsCushion = polyRes.cBefore >= 1;
+        if (browserVisionState.firstTargetBall || polyRes.cBefore >= 1) {
+          browserVisionState.firstContactDecided = true;
+        }
+
+        // 3) 제2적구 충돌 확정 시 이벤트 시퀀스 검증 후 즉시 득점 판정
+        if (browserVisionState.secondTargetBall) {
+          browserVisionState.cushionsBeforeSecondHit = browserVisionState.cushionCount;
+          if (browserVisionState.cushionCount >= 3) {
+            const isBank = browserVisionState.cushionsBeforeFirstHit >= 1;
+            const delta = isBank && st.rule_mode === 'PBA' ? 2 : 1;
+            const activeId = st.active_player_id || 'P1';
+            applyLocalCloudAction('ADJUST_SCORE', {
+              player_id: activeId,
+              delta,
+              is_bank: isBank,
+              shot_id: browserVisionState.shotId,
+              cushions_before_first_hit: browserVisionState.cushionsBeforeFirstHit,
+              cushions_before_second_hit: browserVisionState.cushionCount,
+              total_cushions: browserVisionState.cushionCount,
+            });
+            resetBrowserVisionShotState();
+            browserVisionState.cooldownFrames = 20;
+            return;
           }
         }
 
-        let hitSide = '';
-        if (cueBall.detected && !hitAnyTargetThisFrame && !nearUnhitTarget) {
-          const margin = 11.5;
-          if (cueBall.x <= bounds.left + margin) hitSide = 'LEFT';
-          else if (cueBall.x >= bounds.right - margin) hitSide = 'RIGHT';
-          else if (cueBall.y <= bounds.top + margin) hitSide = 'TOP';
-          else if (cueBall.y >= bounds.bottom - margin) hitSide = 'BOTTOM';
-        }
-
-        if (
-          hitSide &&
-          !browserVisionState.secondTargetBall &&
-          (hitSide !== browserVisionState.lastCushionSide ||
-            browserVisionState.frameCounter - browserVisionState.lastCushionFrame > 8)
-        ) {
-          browserVisionState.cushionCount += 1;
-          browserVisionState.lastCushionSide = hitSide;
-          browserVisionState.lastCushionFrame = browserVisionState.frameCounter;
-          if (!browserVisionState.firstTargetBall) {
-            browserVisionState.cushionsBeforeFirstHit = browserVisionState.cushionCount;
-            browserVisionState.firstContactDecided = true;
-            browserVisionState.firstContactIsCushion = true;
-          } else {
-            browserVisionState.cushionsBeforeSecondHit = browserVisionState.cushionCount;
-          }
-        }
-
-        // 3) 제2적구 충돌 즉시 득점/실패 판정
-        if (browserVisionState.secondTargetBall && browserVisionState.cushionCount >= 3) {
-          const isBank = browserVisionState.cushionsBeforeFirstHit >= 1;
-          const delta = isBank && st.rule_mode === 'PBA' ? 2 : 1;
-          const activeId = st.active_player_id || 'P1';
-          applyLocalCloudAction('ADJUST_SCORE', {
-            player_id: activeId,
-            delta,
-            is_bank: isBank,
-            shot_id: browserVisionState.shotId,
-            cushions_before_first_hit: browserVisionState.cushionsBeforeFirstHit,
-            cushions_before_second_hit: browserVisionState.cushionCount,
-            total_cushions: browserVisionState.cushionCount,
-          });
-          resetBrowserVisionShotState();
-          browserVisionState.cooldownFrames = 28;
-          return;
-        }
-
-        // 4) 모든 공 정지 확인 -> 미스(공격권 교대) 판정
-        if (maxBallSpeed < 0.75) {
+        // 4) 모든 공 정지 확인 (속도 < 25mm/s) -> 미스(공격권 교대) 판정
+        const maxSpeedMmS = Math.max(
+          Math.hypot(snapVel.WHITE.x, snapVel.WHITE.y),
+          Math.hypot(snapVel.YELLOW.x, snapVel.YELLOW.y),
+          Math.hypot(snapVel.RED.x, snapVel.RED.y)
+        );
+        if (maxSpeedMmS < 28.0) {
           browserVisionState.stillFrames += 1;
-          if (browserVisionState.stillFrames >= 14) {
-            if (browserVisionState.hitBalls.length > 0 || browserVisionState.cushionCount >= 1 || browserVisionState.shotActiveFrames >= 8) {
+          if (browserVisionState.stillFrames >= 10) {
+            if (
+              browserVisionState.hitBalls.length > 0 ||
+              browserVisionState.cushionCount >= 1 ||
+              browserVisionState.shotActiveFrames >= 6
+            ) {
               applyLocalCloudAction('SWITCH_TURN', {
                 shot_id: browserVisionState.shotId,
                 cushions_before_first_hit: browserVisionState.cushionsBeforeFirstHit,
@@ -4882,7 +5865,7 @@
               });
             }
             resetBrowserVisionShotState();
-            browserVisionState.cooldownFrames = 12;
+            browserVisionState.cooldownFrames = 10;
             return;
           }
         } else {
@@ -4950,13 +5933,32 @@
       visionCanvas.width = W;
       visionCanvas.height = H;
       browserVisionState.boundsCalibrated = false;
+      browserVisionState.lastVideoTime = -1;
 
       function loop() {
         if (clientSourceMode !== 'UPLOAD' && clientSourceMode !== 'CAMERA') return;
         if (localVideo.readyState >= 2) {
           if (!localVideo.paused && !localVideo.ended) {
-            detectTableAndBallsOnOffscreen(localVideo, W, H);
-            stepBrowserVisionFSM();
+            const curVideoTime = Number(localVideo.currentTime || 0);
+            // 60Hz/144Hz 모니터에서 30fps 영상 재생 시 동일 비디오 프레임 중복 처리로 속도가 0으로 떨어지는 현상 원천 차단!
+            const isNewFrame =
+              clientSourceMode === 'CAMERA' ||
+              browserVisionState.lastVideoTime < 0 ||
+              Math.abs(curVideoTime - browserVisionState.lastVideoTime) >= 0.008;
+
+            if (isNewFrame) {
+              let dtSec = 1.0 / 30.0;
+              if (
+                clientSourceMode === 'UPLOAD' &&
+                browserVisionState.lastVideoTime >= 0 &&
+                curVideoTime > browserVisionState.lastVideoTime
+              ) {
+                dtSec = Math.min(0.1, Math.max(0.012, curVideoTime - browserVisionState.lastVideoTime));
+              }
+              browserVisionState.lastVideoTime = curVideoTime;
+              detectTableAndBallsOnOffscreen(localVideo, W, H);
+              stepBrowserVisionFSM(dtSec);
+            }
           }
           renderBrowserVisionOverlay(visionCanvas, localVideo, W, H);
         }
