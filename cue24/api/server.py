@@ -276,7 +276,7 @@ class LiveStreamReader:
             self.video_height = int(cached["video_height"])
             self.video_fps = float(cached["video_fps"])
             if self.is_real_video_loaded:
-                self.calibrator = TableCalibrator(src_corners=list(cached["src_corners"]))
+                self.calibrator = TableCalibrator(src_corners=cached["src_points"].copy())
                 self._update_cached_half_homography()
                 self._table_calibrated = True
                 self._latest_raw_frame = cached["raw_frame"]
@@ -306,7 +306,8 @@ class LiveStreamReader:
             self.video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
             self.video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
-            if self.camera_index is None:
+            is_virtual_drive = str(path_str).upper().startswith("J:")
+            if self.camera_index is None and not is_virtual_drive:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, self.ACTIVE_SHOT_START_FRAME)
 
             ret, raw_frame = cap.read()
@@ -333,7 +334,7 @@ class LiveStreamReader:
                             "video_width": self.video_width,
                             "video_height": self.video_height,
                             "video_fps": self.video_fps,
-                            "src_corners": list(self.calibrator.src_corners),
+                            "src_points": self.calibrator.src_points.copy(),
                             "raw_frame": raw_frame,
                             "jpg_bytes": jpg_bytes,
                         }
@@ -671,17 +672,23 @@ class LiveStreamReader:
         self._reset_wall_clock_sync()
 
         if self.is_real_video_loaded and self._video_cap is not None:
-            if self.camera_index is None and seek_to_active_shot:
-                self._video_cap.set(
-                    cv2.CAP_PROP_POS_FRAMES, self.ACTIVE_SHOT_START_FRAME
-                )
+            is_virtual_drive = str(self.video_path).upper().startswith("J:")
+            if is_virtual_drive and self._latest_raw_frame is not None:
+                ret = True
+                raw_frame = self._latest_raw_frame
+            else:
+                if self.camera_index is None and seek_to_active_shot and not is_virtual_drive:
+                    self._video_cap.set(
+                        cv2.CAP_PROP_POS_FRAMES, self.ACTIVE_SHOT_START_FRAME
+                    )
 
-            ret, raw_frame = self._video_cap.read()
-            if not ret or raw_frame is None:
-                self._video_cap.set(
-                    cv2.CAP_PROP_POS_FRAMES, self.ACTIVE_SHOT_START_FRAME
-                )
                 ret, raw_frame = self._video_cap.read()
+                if not ret or raw_frame is None:
+                    self._video_cap.set(
+                        cv2.CAP_PROP_POS_FRAMES,
+                        0 if is_virtual_drive else self.ACTIVE_SHOT_START_FRAME,
+                    )
+                    ret, raw_frame = self._video_cap.read()
 
             if ret and raw_frame is not None:
                 self._latest_raw_frame = raw_frame
@@ -1545,6 +1552,10 @@ class LiveStreamReader:
                         }
                         cue_origin = rest_vpos[shooter_vcol].copy()
                         self.causal_kiss_fsm.stroke_origin_pos = cue_origin
+                        self.causal_kiss_fsm.update(
+                            t=max(0.0, t_init - (1.0 / fps_scale)),
+                            coords_mm=rest_vpos,
+                        )
                     self.causal_kiss_fsm.update(
                         t=t_init,
                         coords_mm=init_vpos,

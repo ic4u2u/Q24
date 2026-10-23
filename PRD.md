@@ -1,4 +1,4 @@
-# 프로젝트 설계도 및 파일 지도 (PRD.md)
+# 프로젝트 설계도 및 파일 지도 (PRD.md) — Q24 (CUE24)
 
 > **규칙**: 새로운 파일이나 기능이 추가될 때마다 AI는 이 문서를 최신 상태로 업데이트합니다.
 
@@ -17,19 +17,25 @@
   - 3쿠션 경기 FSM(WAIT_SHOT / SHOT_IN_PROGRESS / BALL_STOPPED), 수구 출발 시 샷 클락 자동 정지 및 3공 정지 시 득점 카운트/실패 시 자동 턴 전환·샷 클락 재작동 (`cue24/services/match_manager.py`)
   - 실시간 라이브캠 & 3공 정지 시 직전 샷 자동 리플레이(Auto-Replay) 링버퍼 엔진 (`cue24/core/replay_buffer.py`)
   - FastAPI 실시간 WebSocket(`/ws/scoreboard`) 브로드캐스트, 절대 시계(Wall-Clock) 동기화 기반 실시간 1.0배속 MJPEG 라이브/리플레이 스트리밍 및 비전 판독 파이프라인 서버 (`cue24/api/server.py`)
-  - 20인치 태블릿 CUESCO 스타일 점수판에 꽉 찬 초대형 득점 숫자(`clamp(11rem, min(48vh, 25vw), 32rem)`), 당구장 표준 자연스러운 전면 한글화 UI 및 AI 초정밀 비디오 판독(VAR) 팝업 (`cue24/static/index.html`)
+  - 20인치 태블릿 CUESCO 스타일 점수판에 꽉 찬 초대형 득점 숫자(`clamp(11rem, min(48vh, 25vw), 32rem)`), 영상 업로드/실시간 카메라 AI 비전 판독 및 AI 초정밀 비디오 판독(VAR) 팝업 (`index.html`, `public/index.html`, `cue24/static/index.html`)
 
 ---
 
 ## 2. 현재 폴더 및 파일 구조도 (초보자용 한 줄 설명)
+> **모듈화 원칙**: 통짜 파일 문제를 원천 차단하기 위해 새로운 코드 파일은 **최대 250~300줄 이하**로 쪼개어 관리합니다.
+
 ```text
 h:\WorkSpace\Q24\
+├── AGENTS.md               # 최신 공식 문서(Context7 MCP) 자동 참조 & 카파시 4대 코딩 행동 강령
 ├── RULES.md                # AI가 코드를 멋대로 고치지 못하게 강제하는 현장 안전 수칙
 ├── .antigravityrules       # 안티그래비티 시스템이 자동으로 읽는 규칙 파일 (RULES.md와 동일)
 ├── PRD.md                  # 우리 서비스의 전체 설계도 및 각 파일 역할 지도 (현재 문서)
 ├── CHECKLIST.md            # 코드 수정 직후 1분 점검표 & 배포 전 5분 점검표
 ├── CHEATSHEET.md           # 평소에 복사해서 바로 쓰는 상황별 AI 명령어 모음집
 ├── .gitignore              # 비밀키(.env)와 무거운 설치 폴더(node_modules) 유출을 막는 보안 검문소
+├── index.html              # 클라우드(Vercel) 및 로컬 브라우저 겸용 20인치 태블릿 스코어보드 엔트리 HTML
+├── public/
+│   └── index.html          # Vercel 정적 배포용 스코어보드 HTML
 └── cue24/                  # CUE24 메인 애플리케이션 패키지
     ├── requirements.txt    # 필수 파이썬 라이브러리(OpenCV, FastAPI, PyTorch 등) 목록
     ├── main.py             # Uvicorn 웹서버 가동 및 비디오 스트림 백그라운드 파이프라인 통합 엔트리포인트
@@ -63,6 +69,6 @@ h:\WorkSpace\Q24\
 ---
 
 ## 3. 데이터베이스(DB) 테이블 구조 요약
-- **사용 예정 DB**: Supabase (RLS 행 단위 보안 필수 적용)
+- **사용 예정 DB**: Supabase (RLS 행 단위 보안 & Soft Delete 필수 적용)
 - **테이블 목록**:
   - (추후 DB 설계 시 테이블명, 주요 컬럼, RLS 보안 적용 여부를 이곳에 기록합니다)
