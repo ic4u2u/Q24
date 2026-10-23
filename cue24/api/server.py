@@ -500,24 +500,82 @@ class LiveStreamReader:
         yel_m = (
             (B_ch >= 150) & (A_ch < 146) & (L_ch >= 118) & (S_ch >= 82)
         ).astype(np.uint8) * 255
+        if self._channel_core_state["YELLOW"]["pos"] is not None:
+            yp = self._channel_core_state["YELLOW"]["pos"]
+            yx_q = int(round(float(yp[0]) * 0.25))
+            yy_q = int(round(float(yp[1]) * 0.25))
+            x0_y, x1_y = max(0, yx_q - 30), min(710, yx_q + 31)
+            y0_y, y1_y = max(0, yy_q - 30), min(355, yy_q + 31)
+            if x1_y > x0_y and y1_y > y0_y:
+                local_yel = (
+                    (B_ch[y0_y:y1_y, x0_y:x1_y] >= 138)
+                    & (A_ch[y0_y:y1_y, x0_y:x1_y] < 146)
+                    & (L_ch[y0_y:y1_y, x0_y:x1_y] >= 112)
+                    & (S_ch[y0_y:y1_y, x0_y:x1_y] >= 54)
+                ).astype(np.uint8) * 255
+                yel_m[y0_y:y1_y, x0_y:x1_y] = np.maximum(
+                    yel_m[y0_y:y1_y, x0_y:x1_y], local_yel
+                )
         yel_m = cv2.morphologyEx(yel_m, cv2.MORPH_CLOSE, self._morph_kernel)
 
+        # RED/YELLOW 공 표면의 천장 조명 반사광(Glare)이나 청색 라사지 모션블러 경계가 WHITE 마스크에 침범하지 못하도록 원천 차폐
+        colored_excl = cv2.dilate(
+            cv2.bitwise_or(red_m, yel_m), self._morph_kernel, iterations=1
+        )
         whi_m = (
             (L_ch >= 178)
             & (S_ch <= 86)
             & (B_ch >= 112)
-            & (B_ch < 148)
+            & (B_ch < 146)
             & (A_ch < 140)
+            & (colored_excl == 0)
         ).astype(np.uint8) * 255
         whi_m = cv2.morphologyEx(whi_m, cv2.MORPH_OPEN, self._morph_open_k5)
+        if self._channel_core_state["WHITE"]["pos"] is not None:
+            wp = self._channel_core_state["WHITE"]["pos"]
+            wx_q = int(round(float(wp[0]) * 0.25))
+            wy_q = int(round(float(wp[1]) * 0.25))
+            x0_w, x1_w = max(0, wx_q - 28), min(710, wx_q + 29)
+            y0_w, y1_w = max(0, wy_q - 28), min(355, wy_q + 29)
+            if x1_w > x0_w and y1_w > y0_w and self.match_manager.fsm_state == MatchState.SHOT_IN_PROGRESS:
+                local_whi = (
+                    (L_ch[y0_w:y1_w, x0_w:x1_w] >= 158)
+                    & (S_ch[y0_w:y1_w, x0_w:x1_w] <= 92)
+                    & (B_ch[y0_w:y1_w, x0_w:x1_w] >= 104)
+                    & (B_ch[y0_w:y1_w, x0_w:x1_w] < 138)
+                    & (A_ch[y0_w:y1_w, x0_w:x1_w] < 138)
+                    & (colored_excl[y0_w:y1_w, x0_w:x1_w] == 0)
+                ).astype(np.uint8) * 255
+                local_whi = cv2.morphologyEx(local_whi, cv2.MORPH_OPEN, self._morph_kernel)
+                whi_m[y0_w:y1_w, x0_w:x1_w] = np.maximum(
+                    whi_m[y0_w:y1_w, x0_w:x1_w], local_whi
+                )
+
+        prev_all_pos: Dict[str, np.ndarray] = {
+            k: self._channel_core_state[k]["pos"].copy()
+            for k in ("WHITE", "YELLOW", "RED")
+            if self._channel_core_state[k]["pos"] is not None
+        }
 
         out: Dict[str, Dict[str, float]] = {}
-        for col, mask in (("WHITE", whi_m), ("YELLOW", yel_m), ("RED", red_m)):
+        # 유색구(RED -> YELLOW) 코어를 먼저 확정한 뒤 WHITE를 매칭하여 1적구 하이라이트/블러를 수구로 오인하는 현상 차단
+        for col, mask in (("RED", red_m), ("YELLOW", yel_m), ("WHITE", whi_m)):
             cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             st = self._channel_core_state[col]
             prev_p: Optional[np.ndarray] = st["pos"]
             prev_v: np.ndarray = st["vel"]
             pred_p: Optional[np.ndarray] = (prev_p + prev_v * 0.95) if prev_p is not None else None
+
+            near_other_ball = False
+            if prev_p is not None:
+                for ok, op in prev_all_pos.items():
+                    if ok == col:
+                        continue
+                    if float(np.linalg.norm(prev_p - op)) <= 135.0 or (
+                        pred_p is not None and float(np.linalg.norm(pred_p - op)) <= 95.0
+                    ):
+                        near_other_ball = True
+                        break
 
             best_pt: Optional[np.ndarray] = None
             best_rad: float = 31.0
@@ -547,11 +605,18 @@ class LiveStreamReader:
                     [float(cx) * 4.0, (float(cy) + float(rad_q) * tilt) * 4.0],
                     dtype=np.float64,
                 )
+                # 이미 확정된 다른 색상 공의 중심 반경(44mm) 이내 후보점은 동일 공 중복 선택이므로 배제
+                if any(
+                    math.hypot(float(pt_mm[0]) - d["x"], float(pt_mm[1]) - d["y"]) < 44.0
+                    for d in out.values()
+                ):
+                    continue
                 border_penalty = 85.0 if touches_border else 0.0
                 if pred_p is not None and prev_p is not None:
                     dist_pred = float(np.linalg.norm(pt_mm - pred_p))
                     dist_prev = float(np.linalg.norm(pt_mm - prev_p))
-                    dist = min(dist_pred, dist_prev)
+                    # 공-공 충돌 근접 구간에서는 직진 관성 예측점(pred_p)이 튕겨 나가는 1적구 위로 포개지므로 직전 위치(dist_prev) 기준 매칭
+                    dist = dist_prev if near_other_ball else min(dist_pred, dist_prev)
                     max_gate = 320.0 + min(900.0, int(st["missing"]) * 220.0)
                     if dist > max_gate:
                         continue
@@ -585,12 +650,29 @@ class LiveStreamReader:
                 st["missing"] = 0
             elif prev_p is not None:
                 # 정지해 있던 공(속도 < 8.0mm/frame)이 선수 몸/팔에 가려진 경우 절대 스스로 움직이거나 순간이동하지 않고 제자리 고정!
-                if float(np.linalg.norm(prev_v)) < 8.0:
+                # 또한 다른 공과 근접 충돌(near_other_ball) 순간 블러로 소실된 경우 상대 공을 뚫고 직진 관성 투사하지 않도록 감속 고정!
+                if float(np.linalg.norm(prev_v)) < 8.0 or near_other_ball:
                     st["pos"] = prev_p
-                    st["vel"] = np.zeros(2, dtype=np.float64)
+                    st["vel"] = prev_v * 0.25 if near_other_ball else np.zeros(2, dtype=np.float64)
                     st["missing"] = int(st["missing"]) + 1
                 else:
                     nxt = prev_p + prev_v * 0.94
+                    if any(
+                        math.hypot(float(nxt[0]) - d["x"], float(nxt[1]) - d["y"]) < 68.0
+                        for d in out.values()
+                    ):
+                        st["pos"] = prev_p
+                        st["vel"] = prev_v * 0.25
+                        st["missing"] = int(st["missing"]) + 1
+                        p_final = st["pos"]
+                        out[col] = {
+                            "x": float(p_final[0]),
+                            "y": float(p_final[1]),
+                            "radius": best_rad,
+                            "circularity": best_circ,
+                            "area": best_area,
+                        }
+                        continue
                     if nxt[0] < 31.0:
                         nxt[0] = 31.0 + (31.0 - nxt[0])
                         prev_v[0] *= -0.82
@@ -1321,7 +1403,7 @@ class LiveStreamReader:
         """
         self.frame_counter += 1
 
-        # 1. [2단계 & 3단계] 3채널 고정 코어 좌표인 경우 ID 1:1 직결 업데이트(충돌 시 ID 스왑 0% 원천 차단),
+        # 1. [2단계 & 3단계] 3채널 고정 코어 좌표인 경우 ID 1:1 직결 업데이트 + 물리 충돌 가드 검증,
         # 일반 좌표인 경우 최단 거리 위치 추적 및 물리 충돌 가드 업데이트
         if (
             require_rest_displacement
@@ -1330,9 +1412,33 @@ class LiveStreamReader:
             and len(detected_points) == 3
             and len(self.tracker.balls) == 3
         ):
+            was_stat_pre = {
+                bid: (b.speed <= self.tracker.stop_velocity_th)
+                for bid, b in self.tracker.balls.items()
+            }
+            pre_pos_map = {
+                bid: b.position.copy() for bid, b in self.tracker.balls.items()
+            }
             for bid in (1, 2, 3):
                 self.tracker.balls[bid].color = detected_colors[bid]
                 self.tracker.balls[bid].update_kinematics(detected_points[bid - 1])
+            if (
+                self.match_manager.fsm_state == MatchState.SHOT_IN_PROGRESS
+                and self.tracker.cue_ball_id is not None
+            ):
+                if self.tracker.enforce_cue_target_collision_guard(
+                    was_stat_pre, pre_pos_map
+                ):
+                    # 만약 3채널 코어에서 수구와 1적구가 충돌 직후 뒤바뀌었다면 채널 상태도 함께 역스왑 동기화
+                    for bid in (1, 2, 3):
+                        col_k = detected_colors[bid]
+                        if col_k in self._channel_core_state:
+                            self._channel_core_state[col_k]["pos"] = (
+                                self.tracker.balls[bid].position.copy()
+                            )
+                            self._channel_core_state[col_k]["vel"] = (
+                                self.tracker.balls[bid].velocity.copy()
+                            )
             ball_states = self.tracker.balls
         else:
             ball_states = self.tracker.update(detected_points)
@@ -1408,6 +1514,7 @@ class LiveStreamReader:
             )
 
             # 1순위: 현재 턴 선수의 지정 수구(active_expected_color)가 출발했는지 확인
+            exp_disp_from_rest = 0.0
             if expected_cue_id is not None and expected_cue_id in ball_states:
                 exp_st = ball_states[expected_cue_id]
                 exp_disp = 999.0
@@ -1416,17 +1523,46 @@ class LiveStreamReader:
                     exp_disp = math.hypot(
                         float(exp_st.position[0]) - rx, float(exp_st.position[1]) - ry
                     )
+                    exp_disp_from_rest = exp_disp
                 if exp_st.speed >= vel_th and exp_disp >= self.VISION_START_DISP_MM:
                     first_moving_id = expected_cue_id
 
             # 1-B순위: 아직 공끼리 충돌하기 전(>= 66mm) 상태에서 WHITE/YELLOW 중 실제로 정지 위치에서
-            # 먼저 출발한 공(First-Mover)을 수구로 결정! (가만히 있는 공을 수구로 오인하는 현상 차단)
+            # 먼저 출발한 공(First-Mover)을 수구로 결정!
+            # 단, 지정 수구(expected_cue_id)가 이미 조금이라도 움직였거나(>= 4.5mm) 상대 공과 근접(< 155mm)한 상태라면
+            # 수구가 1적구를 타격해 1적구가 튕겨 나간 것이므로 절대 1적구를 수구로 바꿔치기하지 않음!
             if first_moving_id is None and min_pair_dist_now >= 66.0:
                 best_onset_id: Optional[int] = None
                 best_onset_speed: float = 0.0
                 for bid, st in ball_states.items():
                     if str(st.color).upper() not in ("WHITE", "YELLOW"):
                         continue
+                    if (
+                        not is_opening_unlocked
+                        and expected_cue_id is not None
+                        and bid != expected_cue_id
+                    ):
+                        exp_cur = ball_states[expected_cue_id]
+                        cur_pair_d = math.hypot(
+                            float(st.position[0]) - float(exp_cur.position[0]),
+                            float(st.position[1]) - float(exp_cur.position[1]),
+                        )
+                        rest_pair_d = 999.0
+                        if (
+                            expected_cue_id in self._rest_positions
+                            and bid in self._rest_positions
+                        ):
+                            rest_pair_d = math.hypot(
+                                self._rest_positions[bid][0] - self._rest_positions[expected_cue_id][0],
+                                self._rest_positions[bid][1] - self._rest_positions[expected_cue_id][1],
+                            )
+                        if (
+                            exp_disp_from_rest >= 4.5
+                            or exp_cur.speed >= vel_th * 0.60
+                            or cur_pair_d < 155.0
+                            or rest_pair_d < 155.0
+                        ):
+                            continue
                     cand_disp = 999.0
                     if require_rest_displacement and bid in self._rest_positions:
                         rx, ry = self._rest_positions[bid]
@@ -2170,21 +2306,22 @@ class LiveStreamReader:
         """
         self.is_running = True
         result_display_ticks = 0
-        last_tracked_shot_type = ""
+        last_tracked_shot_key = ""
         while self.is_running:
             await asyncio.sleep(1.0)
             cur_last = self.match_manager.last_shot_result or {}
             cur_shot_type = str(cur_last.get("shot_type", "READY")).upper()
+            cur_shot_key = f"{cur_last.get('shot_id', '')}_{cur_shot_type}"
             if (
                 self.match_manager.fsm_state == MatchState.WAIT_SHOT
                 and cur_shot_type in ("REGULAR_3C", "BANK_SHOT", "MISS", "FOUL", "TIME_OUT_FOUL")
             ):
-                if cur_shot_type != last_tracked_shot_type:
+                if cur_shot_key != last_tracked_shot_key:
                     result_display_ticks = 1
-                    last_tracked_shot_type = cur_shot_type
+                    last_tracked_shot_key = cur_shot_key
                 else:
                     result_display_ticks += 1
-                if result_display_ticks >= 3:
+                if result_display_ticks >= 7:
                     self.match_manager.last_shot_result = {
                         "shot_id": self.match_manager.shot_seq_id,
                         "is_scored": False,
@@ -2199,14 +2336,14 @@ class LiveStreamReader:
                         "second_ball_hit": False,
                     }
                     result_display_ticks = 0
-                    last_tracked_shot_type = "READY"
+                    last_tracked_shot_key = f"{self.match_manager.shot_seq_id}_READY"
                     if self.match_manager.is_timer_paused or self.match_manager.is_match_paused:
                         await self.ws_manager.broadcast_event(
                             "SCORE_UPDATED", self.match_manager.get_match_payload()
                         )
             else:
                 result_display_ticks = 0
-                last_tracked_shot_type = cur_shot_type
+                last_tracked_shot_key = cur_shot_key
 
             if (
                 self.match_manager.fsm_state == MatchState.WAIT_SHOT

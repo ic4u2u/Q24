@@ -3191,7 +3191,7 @@
         }
       }
 
-      // 득점성공/실패 판정 완료(WAIT_SHOT 복귀) 시 3초 동안 결과를 보여준 뒤 다음 이닝을 위해 초기 대기 상태로 자동 리셋
+      // 득점성공/실패 판정 완료(WAIT_SHOT 복귀) 시 5초 동안 결과를 보여준 뒤 다음 이닝을 위해 초기 대기 상태로 자동 리셋
       if ((isScored || isFailed) && fsmState !== 'SHOT_IN_PROGRESS') {
         const resultKey = `${last.shot_id ?? ''}_${rawShotType}_${data ? data.current_inning : ''}_${data ? data.active_player_id : ''}`;
         if (bannerResetDoneKey === resultKey) {
@@ -3207,7 +3207,7 @@
             bannerResetDoneKey = resultKey;
             bannerResetTimerId = null;
             resetLiveBannerToWaiting();
-          }, 3000);
+          }, 7000);
         }
       }
 

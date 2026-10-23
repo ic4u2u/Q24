@@ -402,11 +402,16 @@ class ScoringEngine:
             ):
                 ox_c, oy_c = self._stroke_origin_pos
                 d_o_t1 = math.hypot(t1_origin[0] - ox_c, t1_origin[1] - oy_c)
+                corridor_tol = min(105.0, max(65.0, 52.0 + 0.022 * d_o_t1))
                 is_direct_corridor = d_o_t1 <= 115.0
                 if not is_direct_corridor and d_o_t1 > 20.0:
                     ux_d = (t1_origin[0] - ox_c) / d_o_t1
                     uy_d = (t1_origin[1] - oy_c) / d_o_t1
+                    d_o_hit = math.hypot(cue_pos[0] - ox_c, cue_pos[1] - oy_c)
+                    ux_h = ((cue_pos[0] - ox_c) / d_o_hit) if d_o_hit > 20.0 else ux_d
+                    uy_h = ((cue_pos[1] - ox_c) / d_o_hit) if d_o_hit > 20.0 else uy_d
                     max_corr_dev = 0.0
+                    max_chord_dev = 0.0
                     pre_cnt = 0
                     for f_l, pt_l, _, _ in self._cue_trajectory_log:
                         if f_l <= frame_idx:
@@ -418,7 +423,14 @@ class ScoringEngine:
                                 dev_l = math.hypot(vx_l - proj_l * ux_d, vy_l - proj_l * uy_d)
                                 if dev_l > max_corr_dev:
                                     max_corr_dev = dev_l
-                    if pre_cnt >= 1 and max_corr_dev <= 62.0:
+                                proj_h = vx_l * ux_h + vy_l * uy_h
+                                dev_h = math.hypot(vx_l - proj_h * ux_h, vy_l - proj_h * uy_h)
+                                if dev_h > max_chord_dev:
+                                    max_chord_dev = dev_h
+                    if pre_cnt >= 1 and (
+                        max_corr_dev <= corridor_tol
+                        or (max_chord_dev <= min(85.0, corridor_tol) and self._min_rail_dist_before_first_hit > 58.0)
+                    ):
                         is_direct_corridor = True
 
                 cx_last, cy_last = (
@@ -434,7 +446,11 @@ class ScoringEngine:
                     cy_last,
                     self.table_height_mm - cy_last,
                 )
-                if is_direct_corridor or (d_o_c >= d_o_t1 - 25.0 and d_c_t1 <= 155.0):
+                if (
+                    is_direct_corridor
+                    or self._min_rail_dist_before_first_hit > 72.0
+                    or (d_o_c >= d_o_t1 - 85.0 and d_c_t1 <= 195.0)
+                ):
                     restored_c = self.cushion_count_before_first_hit
                     self.cushion_count_before_first_hit = 0
                     if d_rail_last <= 58.0 and d_o_c >= d_o_t1 - 25.0:

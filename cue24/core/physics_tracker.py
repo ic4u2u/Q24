@@ -337,8 +337,18 @@ class PhysicsTracker:
                 dist = math.hypot(dx, dy)
                 cost = dist
 
-                # OC-SORT OCM(Observation-Centric Momentum): 주행 중인 공의 관측 방향 연속성 보너스 반영
-                if use_ocm and state.speed > (self.stop_velocity_th * 2.0) and dist > 4.0:
+                # 공-공 근접 충돌 구간(<= 145mm)에서는 수구 직진 관성(OCM) 보너스가 튕겨 나가는 1적구를 수구로 끌어당기므로 비활성화
+                near_other = any(
+                    float(np.linalg.norm(cur_pos - other.position)) <= 145.0
+                    for obid, other in self.balls.items()
+                    if obid != bid
+                )
+                if (
+                    use_ocm
+                    and not near_other
+                    and state.speed > (self.stop_velocity_th * 2.0)
+                    and dist > 4.0
+                ):
                     disp_vec = np.array([dx, dy], dtype=np.float64)
                     cos_dir = self._cosine_similarity(state.velocity, disp_vec)
                     cost -= 3.5 * cos_dir
@@ -379,8 +389,145 @@ class PhysicsTracker:
             state_b.velocity.copy(),
             state_a.velocity.copy(),
         )
+        state_a.velocity_ema, state_b.velocity_ema = (
+            state_b.velocity_ema.copy(),
+            state_a.velocity_ema.copy(),
+        )
         state_a.speed, state_b.speed = state_b.speed, state_a.speed
+        state_a.speed_ema, state_b.speed_ema = state_b.speed_ema, state_a.speed_ema
         self.swap_correction_count += 1
+
+    def enforce_cue_target_collision_guard(
+        self,
+        was_stationary_before_step: Dict[int, bool],
+        pre_positions: Optional[Dict[int, np.ndarray]] = None,
+    ) -> bool:
+        """
+        [물리 충돌 가드 (직접 접촉 & 30fps 프레임 사이 고속 충돌 통합 방어)]
+        수구가 정지해 있던 1적구를 타격한 직후, 1적구가 법선 방향으로 튀어나가고 수구는 충돌 지점 부근에 감속/굴절되었을 때
+        트래커가 튀어나간 1적구를 수구로 오인(ID 스왑)하면 즉시 두 공의 위치와 속도를 원복합니다.
+        """
+        if self.cue_ball_id is None or self.cue_ball_id not in self.balls:
+            return False
+
+        cue_state = self.balls[self.cue_ball_id]
+        swapped_any = False
+
+        # 단계 A: 직전 프레임에서 근접(<= 65.5mm)으로 등록된 충돌 후보에 대해 ID 스왑 판정 및 원복
+        resolved_targets: List[int] = []
+        for target_id, guard_info in list(self._pending_collision_guards.items()):
+            normal_vec: np.ndarray = guard_info["normal_vec"]  # type: ignore[assignment]
+            target_state = self.balls[target_id]
+
+            cue_cos = self._cosine_similarity(cue_state.velocity, normal_vec)
+            target_cos = self._cosine_similarity(target_state.velocity, normal_vec)
+
+            if (
+                cue_state.speed > self.stop_velocity_th
+                and cue_cos >= self.COSINE_SIM_SWAP_TH
+                and (
+                    target_state.speed <= self.stop_velocity_th
+                    or cue_cos > target_cos
+                    or (cue_state.speed > target_state.speed and target_cos >= self.COSINE_SIM_SWAP_TH)
+                )
+            ):
+                pre_cue_pos: np.ndarray = guard_info["pre_cue_pos"]  # type: ignore[assignment]
+                pre_target_pos: np.ndarray = guard_info["pre_target_pos"]  # type: ignore[assignment]
+
+                true_cue_new_pos = target_state.position.copy()
+                true_target_new_pos = cue_state.position.copy()
+
+                cue_state.prev_position = pre_cue_pos.copy()
+                cue_state.position = true_cue_new_pos
+                cue_state.velocity = cue_state.position - cue_state.prev_position
+                cue_state.velocity_ema = cue_state.velocity.copy()
+                cue_state.speed = float(np.linalg.norm(cue_state.velocity))
+                cue_state.speed_ema = cue_state.speed
+
+                target_state.prev_position = pre_target_pos.copy()
+                target_state.position = true_target_new_pos
+                target_state.velocity = target_state.position - target_state.prev_position
+                target_state.velocity_ema = target_state.velocity.copy()
+                target_state.speed = float(np.linalg.norm(target_state.velocity))
+                target_state.speed_ema = target_state.speed
+
+                self.swap_correction_count += 1
+                swapped_any = True
+
+            resolved_targets.append(target_id)
+
+        for tid in resolved_targets:
+            self._pending_collision_guards.pop(tid, None)
+
+        # 단계 A-2: 30fps 프레임 사이(Mid-Frame, 직전 거리 65.5~175mm) 고속 정면/두꺼운 타격으로
+        # 1적구 라벨은 원래 1적구 자리에 그대로 멈춰 있고 수구 라벨이 1적구 자리를 관통해 날아간 경우 즉시 원복!
+        if not swapped_any and pre_positions is not None and self.cue_ball_id in pre_positions:
+            pre_cue = pre_positions[self.cue_ball_id]
+            for tid, target_state in self.balls.items():
+                if tid == self.cue_ball_id or not was_stationary_before_step.get(tid, False):
+                    continue
+                if tid not in pre_positions:
+                    continue
+                pre_target = pre_positions[tid]
+                diff_pre = pre_target - pre_cue
+                dist_pre = float(np.linalg.norm(diff_pre))
+                if dist_pre <= 1e-6 or dist_pre > 175.0:
+                    continue
+                normal_pre = diff_pre / dist_pre
+                # 현재 target_state로 할당된 점이 충돌 지점(pre_target 또는 수구 접근측) 부근에 머물러 있고,
+                # 현재 cue_state로 할당된 점이 pre_target에서 normal_pre 방향으로 튕겨 나간 경우
+                target_stay_dist = float(np.linalg.norm(target_state.position - pre_target))
+                cue_depart_vec = cue_state.position - pre_target
+                cue_depart_dist = float(np.linalg.norm(cue_depart_vec))
+                cue_depart_cos = self._cosine_similarity(cue_depart_vec, normal_pre)
+                cue_vel_cos = self._cosine_similarity(cue_state.velocity, normal_pre)
+                if (
+                    target_stay_dist <= 32.0
+                    and cue_depart_dist >= 14.0
+                    and cue_depart_cos >= 0.72
+                    and cue_vel_cos >= 0.80
+                    and cue_state.speed > max(self.stop_velocity_th * 2.0, target_state.speed * 1.4)
+                ):
+                    true_cue_new_pos = target_state.position.copy()
+                    true_target_new_pos = cue_state.position.copy()
+
+                    cue_state.prev_position = pre_cue.copy()
+                    cue_state.position = true_cue_new_pos
+                    cue_state.velocity = cue_state.position - cue_state.prev_position
+                    cue_state.velocity_ema = cue_state.velocity.copy()
+                    cue_state.speed = float(np.linalg.norm(cue_state.velocity))
+                    cue_state.speed_ema = cue_state.speed
+
+                    target_state.prev_position = pre_target.copy()
+                    target_state.position = true_target_new_pos
+                    target_state.velocity = target_state.position - target_state.prev_position
+                    target_state.velocity_ema = target_state.velocity.copy()
+                    target_state.speed = float(np.linalg.norm(target_state.velocity))
+                    target_state.speed_ema = target_state.speed
+
+                    self.swap_correction_count += 1
+                    swapped_any = True
+                    break
+
+        # 단계 B: 현재 프레임에서 수구와 목적구 간 거리가 65.5mm 이하로 근접한 순간 다음 프레임 검증용 가드 등록
+        for bid, other_state in self.balls.items():
+            if bid == self.cue_ball_id:
+                continue
+
+            diff_vec = other_state.position - cue_state.position
+            dist = float(np.linalg.norm(diff_vec))
+
+            if dist <= self.collision_distance_th and dist > 1e-6:
+                normal_vec = diff_vec / dist
+                if was_stationary_before_step.get(bid, True):
+                    self._pending_collision_guards[bid] = {
+                        "normal_vec": normal_vec,
+                        "target_was_stationary": True,
+                        "pre_cue_pos": cue_state.position.copy(),
+                        "pre_target_pos": other_state.position.copy(),
+                    }
+
+        return swapped_any
 
     def update(self, detected_points: List[Point2D]) -> Dict[int, BallState]:
         """
@@ -396,9 +543,12 @@ class PhysicsTracker:
         if self.cue_ball_id is None or self.cue_ball_id not in self.balls:
             raise RuntimeError("PhysicsTracker가 초기화되지 않았거나 cue_ball_id가 설정되지 않았습니다.")
 
-        # 0. 매칭 전 각 공의 직전 정지 여부 백업 (충돌 직전 목적구가 정지해 있었는지 확인용)
+        # 0. 매칭 전 각 공의 직전 정지 여부 및 직전 위치 백업 (충돌 직전 목적구가 정지해 있었는지 확인용)
         was_stationary_before_step: Dict[int, bool] = {
             bid: (b.speed <= self.stop_velocity_th) for bid, b in self.balls.items()
+        }
+        pre_positions: Dict[int, np.ndarray] = {
+            bid: b.position.copy() for bid, b in self.balls.items()
         }
 
         # 1. 색상 무시 최단 거리 위치 매칭 및 속도 업데이트
@@ -406,75 +556,8 @@ class PhysicsTracker:
         for bid, pt in matched_coords.items():
             self.balls[bid].update_kinematics(pt)
 
-        cue_state = self.balls[self.cue_ball_id]
-
-        # 2. [물리 충돌 가드 - 단계 A]: 직전 프레임에서 등록된 충돌 후보에 대해 ID 스왑 여부 판정 및 원복
-        # 정지해 있던 목적구(target)는 충돌 후 반드시 충돌 법선 벡터 N 방향으로 튕겨 나가야 함.
-        # 만약 최단 거리 매칭 결과, 수구(cue)가 법선 벡터 N 방향(코사인 유사도 >= 0.85)으로 날아가고 있고
-        # 정작 목적구(target)가 N 방향이 아니거나 멈춰 있다면 트래커가 두 공의 ID를 스왑한 것임!
-        resolved_targets: List[int] = []
-        for target_id, guard_info in list(self._pending_collision_guards.items()):
-            normal_vec: np.ndarray = guard_info["normal_vec"]  # type: ignore[assignment]
-            target_state = self.balls[target_id]
-
-            cue_cos = self._cosine_similarity(cue_state.velocity, normal_vec)
-            target_cos = self._cosine_similarity(target_state.velocity, normal_vec)
-
-            # 수구의 속도 벡터가 법선 N과 코사인 유사도 0.85 이상이고,
-            # 정지해 있던 목적구가 여전히 멈춰 있거나 법선 방향 속도가 수구보다 현저히 낮을 때 ID 스왑으로 판정
-            if (
-                cue_state.speed > self.stop_velocity_th
-                and cue_cos >= self.COSINE_SIM_SWAP_TH
-                and (
-                    target_state.speed <= self.stop_velocity_th
-                    or cue_cos > target_cos
-                    or (cue_state.speed > target_state.speed and target_cos >= self.COSINE_SIM_SWAP_TH)
-                )
-            ):
-                # 충돌 직전 각자의 고유 위치(pre_pos)를 기준으로 속도와 위치를 복원
-                pre_cue_pos: np.ndarray = guard_info["pre_cue_pos"]  # type: ignore[assignment]
-                pre_target_pos: np.ndarray = guard_info["pre_target_pos"]  # type: ignore[assignment]
-
-                true_cue_new_pos = target_state.position.copy()
-                true_target_new_pos = cue_state.position.copy()
-
-                cue_state.prev_position = pre_cue_pos.copy()
-                cue_state.position = true_cue_new_pos
-                cue_state.velocity = cue_state.position - cue_state.prev_position
-                cue_state.speed = float(np.linalg.norm(cue_state.velocity))
-
-                target_state.prev_position = pre_target_pos.copy()
-                target_state.position = true_target_new_pos
-                target_state.velocity = target_state.position - target_state.prev_position
-                target_state.speed = float(np.linalg.norm(target_state.velocity))
-
-                self.swap_correction_count += 1
-
-            resolved_targets.append(target_id)
-
-        for tid in resolved_targets:
-            self._pending_collision_guards.pop(tid, None)
-
-        # 3. [물리 충돌 가드 - 단계 B]: 현재 프레임에서 수구와 목적구 간 거리가 61.5mm 이하(또는 근접 임계값)인지 검사
-        for bid, other_state in self.balls.items():
-            if bid == self.cue_ball_id:
-                continue
-
-            diff_vec = other_state.position - cue_state.position
-            dist = float(np.linalg.norm(diff_vec))
-
-            # 두 공의 거리가 61.5mm 이하(또는 샘플링 접촉 허용 범위 내)로 근접한 순간 충돌 법선 벡터 N 계산
-            if dist <= self.collision_distance_th and dist > 1e-6:
-                normal_vec = diff_vec / dist  # 수구 중심 -> 목적구 중심을 향하는 단위 법선 벡터 N
-
-                if was_stationary_before_step.get(bid, True):
-                    # 다음 프레임(충돌 직후 튕겨 나가는 프레임)에서 궤적을 검증할 수 있도록 충돌 법선 벡터 N을 가드에 등록
-                    self._pending_collision_guards[bid] = {
-                        "normal_vec": normal_vec,
-                        "target_was_stationary": True,
-                        "pre_cue_pos": cue_state.position.copy(),
-                        "pre_target_pos": other_state.position.copy(),
-                    }
+        # 2 & 3. 물리 충돌 가드 실행 (접촉 직후 및 30fps 프레임 간 정면 타격 ID 스왑 강제 원복)
+        self.enforce_cue_target_collision_guard(was_stationary_before_step, pre_positions)
 
         return self.balls
 

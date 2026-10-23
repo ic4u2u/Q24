@@ -168,12 +168,14 @@ class LocalPhysics3CushionAI:
         if not is_first_object_hit_Done:
             if min_cue_to_target_dist_mm <= contact_threshold_mm:
                 return True
-            if curr_init_disp_mm >= 15.0 and min_cue_to_target_dist_mm <= 480.0:
+            if curr_init_disp_mm >= 10.0 and target_step_move_mm >= 3.2:
+                return True
+            if curr_init_disp_mm >= 15.0:
                 return True
             if (
                 target_init_disp_mm <= 24.0
                 and target_step_move_mm >= 3.8
-                and min_cue_to_target_dist_mm <= 320.0
+                and min_cue_to_target_dist_mm <= 480.0
             ):
                 return True
             if (
