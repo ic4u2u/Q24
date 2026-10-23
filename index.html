@@ -735,10 +735,9 @@
        당구대 전체(16:9 원본 비율)가 잘리지 않고 한눈에 다 보이면서 위아래 검은 여백이 생기지 않도록 aspect-ratio 고정 */
     .cam-monitor-box {
       width: 100%;
-      aspect-ratio: 16 / 9;
-      flex: 0 1 auto;
-      max-height: 44vh;
-      min-height: 0;
+      flex: 1 1 auto;
+      max-height: 46vh;
+      min-height: 210px;
       background: #020617;
       border: 2px solid #334155;
       border-radius: 14px;
@@ -770,8 +769,9 @@
     .cam-viewport {
       position: relative;
       width: 100%;
-      flex: 1 1 0;
-      min-height: 110px;
+      aspect-ratio: 16 / 9;
+      flex: 1 1 auto;
+      min-height: 150px;
       background: #000000;
       overflow: hidden;
       display: flex;
@@ -784,6 +784,7 @@
     .cam-monitor-box.fullscreen-mode .cam-viewport {
       flex: 1;
       height: 100%;
+      aspect-ratio: auto;
     }
 
     .cam-viewport.is-zoomed {
@@ -808,8 +809,7 @@
     }
 
     .cam-local-video {
-      position: absolute;
-      inset: 0;
+      position: relative;
       width: 100%;
       height: 100%;
       object-fit: contain;
@@ -837,13 +837,50 @@
       display: block !important;
     }
 
+    .cam-empty-guide {
+      position: absolute;
+      inset: 0;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 16px;
+      background: radial-gradient(circle at 50% 50%, #0f172a 0%, #020617 100%);
+      color: #94a3b8;
+      text-align: center;
+      z-index: 3;
+    }
+
+    .cam-empty-guide.show {
+      display: flex;
+    }
+
+    .cam-empty-guide-btn {
+      padding: 8px 16px;
+      border-radius: 10px;
+      border: 1.5px solid #38bdf8;
+      background: rgba(56, 189, 248, 0.18);
+      color: #f8fafc;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.85rem;
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .cam-empty-guide-btn:hover {
+      background: rgba(56, 189, 248, 0.35);
+      transform: translateY(-1px);
+    }
+
     .cam-stream-img.no-transition,
     .cam-local-video.no-transition,
     .cam-vision-canvas.no-transition {
       transition: none;
     }
 
-    /* 모니터 상단 소스 전환 툴바 ([📁 영상 업로드] / [📷 카메라 연결] / [🎬 시뮬레이션]) */
+    /* 모니터 상단 소스 전환 툴바 ([📁 영상 업로드] / [📷 카메라 연결]) */
     .cam-source-toolbar {
       flex: 0 0 auto;
       display: flex;
@@ -2042,14 +2079,14 @@
 
     <!-- 중앙: 상단 실시간 라이브캠/자동 리플레이 모니터 & 4대 핵심 경기/화면 제어 바 -->
     <section class="center-hub">
-      <!-- 요구사항 5: 기본 비디오 화면에서 누구나 영상 업로드 / 카메라 연결 / 시뮬레이션 전환 가능 -->
+      <!-- 요구사항 5: 기본 비디오 화면에서 누구나 영상 업로드 / 카메라 연결 가능 -->
       <div id="camMonitorBox" class="cam-monitor-box">
-        <!-- 상단 영상 소스 전환 툴바 (Vercel 클라우드 및 로컬 모두에서 즉시 영상 교체/카메라 연결 가능) -->
+        <!-- 상단 영상 소스 전환 툴바 (Vercel 클라우드 및 로컬 모두에서 즉시 영상 업로드/카메라 연결 가능) -->
         <div class="cam-source-toolbar" aria-label="영상 소스 선택 및 업로드 제어">
           <div class="cam-source-btn-group">
             <button
               id="btnSourceUpload"
-              class="cam-source-btn"
+              class="cam-source-btn active"
               onclick="triggerVideoUpload()"
               title="내 PC·스마트폰·태블릿의 당구 영상 파일(MP4/MOV/WebM)을 업로드하여 즉시 AI 판독을 테스트합니다"
             >
@@ -2062,14 +2099,6 @@
               title="웹캠, USB 캡처보드 또는 스마트폰 카메라를 실시간으로 연결합니다"
             >
               📷 카메라 연결
-            </button>
-            <button
-              id="btnSourceDemo"
-              class="cam-source-btn active"
-              onclick="switchToDemoSimMode()"
-              title="샘플 3쿠션 물리 시뮬레이션 화면으로 전환합니다"
-            >
-              🎬 시뮬레이션
             </button>
             <input
               id="videoUploadInput"
@@ -2087,19 +2116,6 @@
               onchange="switchCameraDevice(this.value)"
               title="연결할 카메라 선택"
             ></select>
-            <select
-              id="demoScenarioSelect"
-              class="cam-device-select"
-              onchange="runDemoShotScenario(this.value)"
-              title="시뮬레이션 샷 시나리오 즉시 테스트"
-            >
-              <option value="AUTO">🔄 연속 시연 모드</option>
-              <option value="REGULAR_3C">🎯 일반 3쿠션 득점</option>
-              <option value="BANK_1C">💎 1쿠션 뱅크샷 득점</option>
-              <option value="BANK_3C">💎 3쿠션 뱅크샷 득점</option>
-              <option value="MICRO_HIT">🔬 미세접촉 득점(VAR)</option>
-              <option value="MISS_NEAR">❌ 아슬아슬 공타(턴교대)</option>
-            </select>
           </div>
         </div>
 
@@ -2109,20 +2125,39 @@
             class="cam-stream-img"
             src="/api/video/live"
             alt="CUE24 실시간 당구대 카메라 및 자동 리플레이"
-            onerror="setTimeout(() => { if (currentCamMode === 'LIVE' && clientSourceMode === 'SERVER') switchToLiveCam(); }, 800)"
+            onload="if (clientSourceMode === 'SERVER') { const g = document.getElementById('camEmptyGuide'); if (g) g.classList.remove('show'); }"
+            onerror="if (clientSourceMode === 'SERVER') { this.style.display = 'none'; const g = document.getElementById('camEmptyGuide'); if (g) g.classList.add('show'); }"
           />
           <video
             id="camLocalVideo"
             class="cam-local-video"
             playsinline
+            webkit-playsinline
             muted
           ></video>
           <canvas
             id="camVisionCanvas"
             class="cam-vision-canvas"
           ></canvas>
+          <div id="camEmptyGuide" class="cam-empty-guide">
+            <div style="font-size: 0.9rem; font-weight: 800; color: #e2e8f0;">
+              🎬 당구 영상을 업로드하거나 카메라를 연결해 주세요
+            </div>
+            <div style="font-size: 0.76rem; color: #94a3b8;">
+              MP4 · MOV · WebM 파일을 이 화면에 끌어다 놓아도 즉시 재생됩니다
+            </div>
+            <button
+              type="button"
+              class="cam-empty-guide-btn"
+              onpointerdown="event.stopPropagation()"
+              onpointerup="event.stopPropagation()"
+              onclick="event.stopPropagation(); triggerVideoUpload()"
+            >
+              📁 내 기기에서 당구 영상 선택하기
+            </button>
+          </div>
           <div id="camDropOverlay" class="cam-drop-overlay">
-            📂 여기에 당구 영상 파일(MP4 / MOV / WebM)을 놓으면<br />즉시 영상 교체 및 AI 3쿠션 판독이 시작됩니다!
+            📂 여기에 당구 영상 파일(MP4 / MOV / WebM)을 놓으면<br />즉시 영상 재생 및 AI 3쿠션 판독이 시작됩니다!
           </div>
           <div class="cam-overlay-top">
             <span id="camModeBadge" class="cam-mode-badge">🔴 실시간 화면</span>
@@ -2742,9 +2777,14 @@
         if (clientSourceMode === 'SERVER') {
           const pill = document.getElementById('wsStatusPill');
           const text = document.getElementById('wsStatusText');
-          pill.classList.add('disconnected');
-          text.textContent = '클라우드 모드 전환 중...';
-          startCloudCanvasFallback();
+          if (pill) pill.classList.remove('disconnected');
+          if (text) text.textContent = '영상 업로드 대기 중';
+          const emptyGuide = document.getElementById('camEmptyGuide');
+          if (emptyGuide) emptyGuide.classList.add('show');
+          if (!lastScoreboardData) {
+            lastScoreboardData = cloudState;
+            renderScoreboard(cloudState);
+          }
         }
         setTimeout(connectWebSocket, 4000);
       };
@@ -2901,7 +2941,15 @@
       lastScoreboardData = data;
 
       const streamImgEl = document.getElementById('camStreamImg');
-      if (streamImgEl && currentCamMode === 'LIVE' && streamImgEl.complete && streamImgEl.naturalWidth === 0) {
+      if (
+        clientSourceMode === 'SERVER' &&
+        ws &&
+        ws.readyState === WebSocket.OPEN &&
+        streamImgEl &&
+        currentCamMode === 'LIVE' &&
+        streamImgEl.complete &&
+        streamImgEl.naturalWidth === 0
+      ) {
         switchToLiveCam();
       }
 
