@@ -15,9 +15,10 @@ CUE24 FastAPI 실시간 WebSocket, 라이브캠/자동 리플레이 스트리밍
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
+import tempfile
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -2689,6 +2690,81 @@ async def get_replay_info() -> Dict[str, Any]:
     meta["video_width"] = stream_reader.video_width
     meta["video_height"] = stream_reader.video_height
     return meta
+
+
+class SelectVideoRequest(BaseModel):
+    """클라이언트 영상 업로드 선택 시 로컬 파이썬 서버 영상 소스 동기화 요청 스키마"""
+
+    filename: str = Field(default="L-billiard.mp4", description="선택된 비디오 파일명")
+
+
+@app.post("/api/video/select")
+async def select_local_video_endpoint(req: SelectVideoRequest) -> Dict[str, Any]:
+    """
+    웹(cue24.vercel.app 또는 로컬)에서 [영상 업로드] 버튼으로 파일을 선택했을 때,
+    동일 파일이 로컬 디스크에 존재하면 네트워크 재전송 없이 즉시 파이썬 OpenCV+PyTorch 엔진에 로드하고
+    경기를 초기화하여 로컬과 100% 동일한 실시간 판독 스트림을 시작합니다.
+    """
+    fname = Path(req.filename).name
+    search_dirs = [
+        Path(stream_reader.video_path).parent,
+        Path(settings.DEFAULT_VIDEO_PATH).parent,
+        Path.cwd(),
+        Path.home() / "Downloads",
+        Path.home() / "Videos",
+        Path.home() / "Desktop",
+    ]
+    matched_path: Optional[Path] = None
+    for d in search_dirs:
+        try:
+            cand = d / fname
+            if cand.exists() and cand.is_file():
+                matched_path = cand
+                break
+        except OSError:
+            continue
+
+    if matched_path is None:
+        return {"ok": False, "matched_local": False}
+
+    stream_reader.video_path = str(matched_path)
+    stream_reader._init_video_capture(stream_reader.video_path)
+    payload = stream_reader.reset_match_and_vision()
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return {
+        "ok": True,
+        "matched_local": True,
+        "video_path": stream_reader.video_path,
+        "match": payload,
+    }
+
+
+@app.post("/api/video/upload")
+async def upload_video_binary_endpoint(
+    request: Request, filename: str = "uploaded.mp4"
+) -> Dict[str, Any]:
+    """
+    로컬 디스크에 없는 외부 당구 영상 파일을 업로드받아 파이썬 OpenCV+PyTorch+CausalKissSafeFSM 엔진에 직접 마운트합니다.
+    """
+    body = await request.body()
+    if not body:
+        return {"ok": False, "reason": "empty_body"}
+
+    safe_name = Path(filename).name or "uploaded.mp4"
+    tmp_path = Path(tempfile.gettempdir()) / f"cue24_{safe_name}"
+    tmp_path.write_bytes(body)
+
+    stream_reader.video_path = str(tmp_path)
+    LiveStreamReader._INIT_VIDEO_CACHE.pop(stream_reader.video_path, None)
+    stream_reader._init_video_capture(stream_reader.video_path)
+    payload = stream_reader.reset_match_and_vision()
+    await ws_manager.broadcast_event("SCORE_UPDATED", payload)
+    return {
+        "ok": True,
+        "matched_local": False,
+        "video_path": stream_reader.video_path,
+        "match": payload,
+    }
 
 
 @app.post("/api/match/simulate-shot")

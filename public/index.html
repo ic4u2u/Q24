@@ -2095,9 +2095,8 @@
           <img
             id="camStreamImg"
             class="cam-stream-img"
-            src="/api/video/live"
             alt="CUE24 실시간 당구대 카메라 및 자동 리플레이"
-            onload="if (clientSourceMode === 'SERVER') { const g = document.getElementById('camEmptyGuide'); if (g) g.classList.remove('show'); }"
+            onload="if (clientSourceMode === 'SERVER') { this.style.display = 'block'; this.style.opacity = '1'; const g = document.getElementById('camEmptyGuide'); if (g) g.classList.remove('show'); }"
             onerror="if (clientSourceMode === 'SERVER') { this.style.display = 'none'; const g = document.getElementById('camEmptyGuide'); if (g) g.classList.add('show'); }"
           />
           <video
@@ -2348,6 +2347,32 @@
 
   <script>
     const CIRCUMFERENCE = 2 * Math.PI * 94;
+    // [방법 2: Vercel(https://cue24.vercel.app) <-> 로컬 파이썬 본체 엔진(CausalKissSafeFSM) 실시간 HTTPS/WSS 직결 브릿지]
+    const DEFAULT_PYTHON_TUNNEL_URL = 'https://baseball-playlist-mumbai-suggest.trycloudflare.com';
+
+    function getBackendHttpBase() {
+      const params = new URLSearchParams(window.location.search);
+      const override = params.get('backend') || localStorage.getItem('cue24_backend_url');
+      if (override) {
+        return override.replace(/\/+$/, '');
+      }
+      const hostname = window.location.hostname || '';
+      if (hostname === 'localhost' || hostname === '127.0.0.1') {
+        return '';
+      }
+      return DEFAULT_PYTHON_TUNNEL_URL;
+    }
+
+    function getBackendWsBase() {
+      const httpBase = getBackendHttpBase();
+      if (!httpBase) {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const host = window.location.host || 'localhost:8000';
+        return `${protocol}//${host}`;
+      }
+      return httpBase.replace(/^http/, 'ws');
+    }
+
     let ws = null;
     let varTimeoutId = null;
     let replayOneShotTimerId = null;
@@ -2620,7 +2645,11 @@
       }
 
       if (clientSourceMode === 'SERVER') {
-        streamImg.src = `/api/video/live?t=${Date.now()}`;
+        streamImg.style.display = 'block';
+        streamImg.style.opacity = '1';
+        const emptyGuide = document.getElementById('camEmptyGuide');
+        if (emptyGuide) emptyGuide.classList.remove('show');
+        streamImg.src = `${getBackendHttpBase()}/api/video/live?t=${Date.now()}`;
       }
       modeBadge.textContent = '🔴 실시간 화면';
       shotBadge.textContent = 'LIVE';
@@ -2673,7 +2702,9 @@
       }
 
       if (clientSourceMode === 'SERVER') {
-        streamImg.src = `/api/video/replay?speed=${currentReplaySpeed}&t=${Date.now()}`;
+        streamImg.style.display = 'block';
+        streamImg.style.opacity = '1';
+        streamImg.src = `${getBackendHttpBase()}/api/video/replay?speed=${currentReplaySpeed}&t=${Date.now()}`;
       }
 
       const frameCount = Math.max(30, Number(meta.frame_count || 90));
@@ -2705,9 +2736,7 @@
     }
 
     function connectWebSocket() {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const host = window.location.host || 'localhost:8000';
-      const wsUrl = `${protocol}//${host}/ws/scoreboard`;
+      const wsUrl = `${getBackendWsBase()}/ws/scoreboard`;
 
       ws = new WebSocket(wsUrl);
 
@@ -3407,7 +3436,7 @@
       } else {
         try {
           if (clientSourceMode === 'SERVER') {
-            const res = await fetch('/api/match/player-name', {
+            const res = await fetch(`${getBackendHttpBase()}/api/match/player-name`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ player_id: editingPlayerId, name: newName, handicap: newHandicap }),
@@ -3434,7 +3463,7 @@
       } else {
         try {
           if (clientSourceMode === 'SERVER') {
-            const res = await fetch('/api/match/swap-player-names', { method: 'POST' });
+            const res = await fetch(`${getBackendHttpBase()}/api/match/swap-player-names`, { method: 'POST' });
             if (res.ok) {
               const data = await res.json();
               renderScoreboard(data);
@@ -3453,7 +3482,7 @@
       } else {
         try {
           if (clientSourceMode === 'SERVER') {
-            const res = await fetch('/api/match/swap-seats-full', { method: 'POST' });
+            const res = await fetch(`${getBackendHttpBase()}/api/match/swap-seats-full`, { method: 'POST' });
             if (res.ok) {
               const data = await res.json();
               renderScoreboard(data);
@@ -3490,7 +3519,7 @@
 
       if (clientSourceMode === 'SERVER') {
         try {
-          const res = await fetch('/api/match/reset', { method: 'POST' });
+          const res = await fetch(`${getBackendHttpBase()}/api/match/reset`, { method: 'POST' });
           if (res.ok) {
             const data = await res.json();
             renderScoreboard(data);
@@ -3517,7 +3546,7 @@
       } else {
         try {
           if (clientSourceMode === 'SERVER') {
-            const res = await fetch('/api/match/end', { method: 'POST' });
+            const res = await fetch(`${getBackendHttpBase()}/api/match/end`, { method: 'POST' });
             if (res.ok) {
               const data = await res.json();
               renderScoreboard(data);
@@ -3543,7 +3572,7 @@
       } else {
         try {
           if (clientSourceMode === 'SERVER') {
-            const res = await fetch('/api/match/pause', { method: 'POST' });
+            const res = await fetch(`${getBackendHttpBase()}/api/match/pause`, { method: 'POST' });
             if (res.ok) {
               const data = await res.json();
               renderScoreboard(data);
@@ -3591,7 +3620,7 @@
       } else {
         try {
           if (clientSourceMode === 'SERVER') {
-            const res = await fetch('/api/match/rule-mode', {
+            const res = await fetch(`${getBackendHttpBase()}/api/match/rule-mode`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ rule_mode: nextMode }),
@@ -3612,7 +3641,7 @@
       } else {
         try {
           if (clientSourceMode === 'SERVER') {
-            const res = await fetch('/api/match/adjust-score', {
+            const res = await fetch(`${getBackendHttpBase()}/api/match/adjust-score`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ player_id: playerId, delta }),
@@ -3633,7 +3662,7 @@
       } else {
         try {
           if (clientSourceMode === 'SERVER') {
-            const res = await fetch('/api/match/timeout', { method: 'POST' });
+            const res = await fetch(`${getBackendHttpBase()}/api/match/timeout`, { method: 'POST' });
             if (res.ok) {
               renderScoreboard(await res.json());
               return;
@@ -3650,7 +3679,7 @@
       } else {
         try {
           if (clientSourceMode === 'SERVER') {
-            const res = await fetch('/api/match/switch-turn', { method: 'POST' });
+            const res = await fetch(`${getBackendHttpBase()}/api/match/switch-turn`, { method: 'POST' });
             if (res.ok) {
               renderScoreboard(await res.json());
               return;
@@ -3980,9 +4009,59 @@
       }
     }
 
-    function loadUploadedVideoFile(file) {
+    async function loadUploadedVideoFile(file) {
       stopActiveMediaStream();
       cloudSimActive = false;
+
+      const shortName = file.name.length > 20 ? file.name.slice(0, 17) + '...' : file.name;
+      const backendBase = getBackendHttpBase();
+
+      // [방법 2 핵심]: 로컬 파이썬 서버(OpenCV + CausalKissSafeFSM 본체 엔진)가 켜져 있으면
+      // 브라우저 간이 JS 엔진 대신 실제 파이썬 서버에 영상을 즉시 마운트하여 100% 동일한 정밀 판독 수행!
+      try {
+        // 1단계: 파일명(예: 1.mp4, 2.mp4, 3.mp4 등)으로 로컬 디스크 초고속 직결 마운트 시도 (0.01초)
+        const selectRes = await fetch(`${backendBase}/api/video/select`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: file.name }),
+        });
+        if (selectRes.ok) {
+          const selectJson = await selectRes.json();
+          if (selectJson && selectJson.found && selectJson.data) {
+            updateSourceToolbarUI('SERVER', `파이썬 AI 서버 분석 중 (${shortName})`);
+            renderScoreboard(selectJson.data);
+            switchToLiveCam();
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+              connectWebSocket();
+            }
+            return;
+          }
+        }
+
+        // 2단계: 다른 폴더나 외부 기기(스마트폰 등)에서 선택한 영상이면 파이썬 서버로 직접 전송 후 마운트
+        updateSourceToolbarUI('SERVER', `서버로 영상 전송 중 (${shortName})...`);
+        const uploadRes = await fetch(
+          `${backendBase}/api/video/upload?filename=${encodeURIComponent(file.name)}`,
+          {
+            method: 'POST',
+            body: file,
+          }
+        );
+        if (uploadRes.ok) {
+          const uploadJson = await uploadRes.json();
+          if (uploadJson && uploadJson.status === 'ok' && uploadJson.data) {
+            updateSourceToolbarUI('SERVER', `파이썬 AI 서버 분석 중 (${shortName})`);
+            renderScoreboard(uploadJson.data);
+            switchToLiveCam();
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+              connectWebSocket();
+            }
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn('Python backend video mount unavailable, falling back to browser video:', err);
+      }
 
       if (uploadedVideoObjectUrl) {
         URL.revokeObjectURL(uploadedVideoObjectUrl);
@@ -3992,7 +4071,6 @@
       const localVideo = document.getElementById('camLocalVideo');
       if (!localVideo) return;
 
-      const shortName = file.name.length > 20 ? file.name.slice(0, 17) + '...' : file.name;
       updateSourceToolbarUI('UPLOAD', `업로드 영상 재생 중 (${shortName})`);
 
       // 기존 이벤트 리스너 초기화 및 자동재생 정책 준수를 위한 muted 선지정
@@ -5972,8 +6050,10 @@
       const emptyGuide = document.getElementById('camEmptyGuide');
       if (streamImg) {
         streamImg.addEventListener('load', () => {
-          if (clientSourceMode === 'SERVER' && emptyGuide) {
-            emptyGuide.classList.remove('show');
+          if (clientSourceMode === 'SERVER') {
+            streamImg.style.display = 'block';
+            streamImg.style.opacity = '1';
+            if (emptyGuide) emptyGuide.classList.remove('show');
           }
         });
         streamImg.addEventListener('error', () => {
@@ -5984,6 +6064,7 @@
             }
           }
         });
+        streamImg.src = `${getBackendHttpBase()}/api/video/live?t=${Date.now()}`;
       }
       renderInningSheet([], '1번 선수', '2번 선수', 1);
       startLocalMatchTimerLoop();
