@@ -1,0 +1,15 @@
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.pt
+*.onnx
+*.weights
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+tests/
+benchmark/
+docs/
