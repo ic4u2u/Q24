@@ -2010,11 +2010,14 @@ class LiveStreamReader:
                     else:
                         shot_eval["shot_type"] = "MISS"
                         shot_eval["reason_code"] = str(causal_res.fail_reason or "SECOND_BALL_MISSED")
-                        shot_eval["message"] = (
-                            f"공타: 제2목적구 불발 (누적 {final_tot_cush}쿠션)"
-                            if "SECOND_BALL" in str(causal_res.fail_reason)
-                            else f"공타: {causal_res.fail_reason or '목적구 불발'} (누적 {final_tot_cush}쿠션)"
-                        )
+                        if c_before_first_val >= 1:
+                            shot_eval["message"] = (
+                                f"{c_before_first_val}쿠션 ⇒ {'1적구 ⇒ ' if b1_was_hit else ''}2적구(대기) ⇒ 득점실패"
+                            )
+                        elif b1_was_hit:
+                            shot_eval["message"] = f"1적구 ⇒ {final_tot_cush}쿠션 ⇒ 2적구(대기) ⇒ 득점실패"
+                        else:
+                            shot_eval["message"] = f"1적구(대기) ⇒ {final_tot_cush}쿠션 ⇒ 2적구(대기) ⇒ 득점실패"
                 elif bool(shot_eval.get("already_dispatched", False)):
                     shot_eval["is_scored"] = True
                     is_bank_final = bool(
@@ -2166,8 +2169,45 @@ class LiveStreamReader:
         - 만약 샷 클락(40초)이 모두 소진(0초)되면 시간 초과(TIME FOUL)로 자동 턴 교체를 수행합니다.
         """
         self.is_running = True
+        result_display_ticks = 0
+        last_tracked_shot_type = ""
         while self.is_running:
             await asyncio.sleep(1.0)
+            cur_last = self.match_manager.last_shot_result or {}
+            cur_shot_type = str(cur_last.get("shot_type", "READY")).upper()
+            if (
+                self.match_manager.fsm_state == MatchState.WAIT_SHOT
+                and cur_shot_type in ("REGULAR_3C", "BANK_SHOT", "MISS", "FOUL", "TIME_OUT_FOUL")
+            ):
+                if cur_shot_type != last_tracked_shot_type:
+                    result_display_ticks = 1
+                    last_tracked_shot_type = cur_shot_type
+                else:
+                    result_display_ticks += 1
+                if result_display_ticks >= 3:
+                    self.match_manager.last_shot_result = {
+                        "shot_id": self.match_manager.shot_seq_id,
+                        "is_scored": False,
+                        "points_awarded": 0,
+                        "shot_type": "READY",
+                        "reason_code": "READY_NEXT_INNING",
+                        "message": "1적구(대기) ⇒ 0쿠션 ⇒ 2적구(대기)",
+                        "cushions_before_first_hit": 0,
+                        "cushions_before_second_hit": 0,
+                        "total_cushions": 0,
+                        "first_ball_hit": False,
+                        "second_ball_hit": False,
+                    }
+                    result_display_ticks = 0
+                    last_tracked_shot_type = "READY"
+                    if self.match_manager.is_timer_paused or self.match_manager.is_match_paused:
+                        await self.ws_manager.broadcast_event(
+                            "SCORE_UPDATED", self.match_manager.get_match_payload()
+                        )
+            else:
+                result_display_ticks = 0
+                last_tracked_shot_type = cur_shot_type
+
             if (
                 self.match_manager.fsm_state == MatchState.WAIT_SHOT
                 and not self.match_manager.is_timer_paused
@@ -2272,7 +2312,14 @@ async def serve_index() -> Any:
     """루트 접속 시 static/index.html이 존재하면 반환하고, 없으면 서버 상태 JSON을 반환합니다."""
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():
-        return FileResponse(str(index_file))
+        return FileResponse(
+            str(index_file),
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
     return JSONResponse(
         {
             "project": settings.PROJECT_NAME,

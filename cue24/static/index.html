@@ -1425,34 +1425,14 @@
       transition: all 0.25s cubic-bezier(0.22, 1, 0.36, 1);
     }
 
-    .state-banner.theme-live {
+    .state-banner.theme-live,
+    .state-banner.theme-chance,
+    .state-banner.theme-score,
+    .state-banner.theme-bank,
+    .state-banner.theme-miss {
       background: linear-gradient(135deg, rgba(12, 24, 48, 0.96), rgba(14, 116, 144, 0.42));
       border-color: #38bdf8;
       box-shadow: 0 0 18px rgba(56, 189, 248, 0.32);
-    }
-
-    .state-banner.theme-chance {
-      background: linear-gradient(135deg, rgba(45, 28, 6, 0.96), rgba(180, 83, 9, 0.45));
-      border-color: #fbbf24;
-      box-shadow: 0 0 22px rgba(251, 191, 36, 0.42);
-    }
-
-    .state-banner.theme-score {
-      background: linear-gradient(135deg, rgba(6, 46, 34, 0.96), rgba(5, 150, 105, 0.48));
-      border-color: #34d399;
-      box-shadow: 0 0 24px rgba(16, 185, 129, 0.52);
-    }
-
-    .state-banner.theme-bank {
-      background: linear-gradient(135deg, rgba(59, 15, 64, 0.96), rgba(217, 119, 6, 0.52));
-      border-color: #fde047;
-      box-shadow: 0 0 26px rgba(245, 158, 11, 0.58);
-    }
-
-    .state-banner.theme-miss {
-      background: linear-gradient(135deg, rgba(48, 12, 24, 0.96), rgba(190, 18, 60, 0.42));
-      border-color: #fb7185;
-      box-shadow: 0 0 18px rgba(244, 63, 94, 0.38);
     }
 
     .state-code {
@@ -1472,28 +1452,6 @@
       overflow: hidden;
       text-overflow: ellipsis;
       text-shadow: 0 1px 8px rgba(56, 189, 248, 0.45);
-    }
-
-    .state-banner.theme-chance .state-code {
-      color: #fde047;
-      text-shadow: 0 0 10px rgba(250, 204, 21, 0.65);
-    }
-
-    .state-banner.theme-score .state-code {
-      color: #6ee7b7;
-      font-size: clamp(0.78rem, 1.28vh, 0.92rem);
-      text-shadow: 0 0 12px rgba(52, 211, 153, 0.7);
-    }
-
-    .state-banner.theme-bank .state-code {
-      color: #fde047;
-      font-size: clamp(0.78rem, 1.28vh, 0.92rem);
-      text-shadow: 0 0 14px rgba(251, 191, 36, 0.8);
-    }
-
-    .state-banner.theme-miss .state-code {
-      color: #fda4af;
-      text-shadow: 0 0 10px rgba(251, 113, 133, 0.55);
     }
 
     .live-pulse-dot {
@@ -3165,6 +3123,35 @@
       }
     }
 
+    let bannerResetTimerId = null;
+    let bannerPendingResetKey = null;
+    let bannerResetDoneKey = null;
+    let currentShotLockedBankCount = 0;
+
+    function resetLiveBannerToWaiting() {
+      currentShotLockedBankCount = 0;
+      const bannerEl = document.getElementById('liveStateBanner');
+      const codeEl = document.getElementById('bannerCode');
+      const msgEl = document.getElementById('bannerMsg');
+      if (!bannerEl || !codeEl || !msgEl) return;
+
+      const pill = (cls, text) => `<span class="bc-pill ${cls}">${text}</span>`;
+      const arrow = `<span class="bc-arrow">⇒</span>`;
+
+      bannerEl.classList.remove('theme-live', 'theme-chance', 'theme-score', 'theme-bank', 'theme-miss');
+      bannerEl.classList.add('theme-live');
+      codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적`;
+      msgEl.innerHTML = [
+        pill('ball-wait', '1적구'),
+        arrow,
+        pill('ball-wait', '0쿠션'),
+        arrow,
+        pill('ball-wait', '2적구'),
+        arrow,
+        pill('ball-wait', '득점대기'),
+      ].join('');
+    }
+
     function renderLiveBroadcastBanner(data, last, p1NameKo, p2NameKo) {
       const bannerEl = document.getElementById('liveStateBanner');
       const codeEl = document.getElementById('bannerCode');
@@ -3173,9 +3160,56 @@
 
       const rawShotType = String(last.shot_type || 'READY').toUpperCase();
       const rawMsg = String(last.message || '');
+      const fsmState = String((data && data.fsm_state) || 'WAIT_SHOT').toUpperCase();
       const cBefore1 = Math.max(0, Number(last.cushions_before_first_hit ?? 0));
       const cBefore2 = Math.max(0, Number(last.cushions_before_second_hit ?? last.total_cushions ?? 0));
       const totalC = Math.max(cBefore2, Number(last.total_cushions ?? 0));
+
+      const isScored =
+        rawShotType === 'REGULAR_3C' ||
+        rawShotType === 'BANK_SHOT' ||
+        Boolean(last.is_scored);
+
+      const isFailed =
+        !isScored &&
+        (rawShotType === 'MISS' ||
+          rawShotType === 'FOUL' ||
+          rawShotType === 'TIME_OUT_FOUL');
+
+      // 새 샷이 진행 중(IN_PROGRESS)이거나 대기 초기 상태(READY)면 3초 리셋 타이머 해제
+      if (rawShotType === 'IN_PROGRESS' || rawShotType === 'READY') {
+        if (bannerResetTimerId) {
+          clearTimeout(bannerResetTimerId);
+          bannerResetTimerId = null;
+        }
+        bannerPendingResetKey = null;
+        if (rawShotType === 'IN_PROGRESS') {
+          bannerResetDoneKey = null;
+        } else if (rawShotType === 'READY') {
+          resetLiveBannerToWaiting();
+          return;
+        }
+      }
+
+      // 득점성공/실패 판정 완료(WAIT_SHOT 복귀) 시 3초 동안 결과를 보여준 뒤 다음 이닝을 위해 초기 대기 상태로 자동 리셋
+      if ((isScored || isFailed) && fsmState !== 'SHOT_IN_PROGRESS') {
+        const resultKey = `${last.shot_id ?? ''}_${rawShotType}_${data ? data.current_inning : ''}_${data ? data.active_player_id : ''}`;
+        if (bannerResetDoneKey === resultKey) {
+          resetLiveBannerToWaiting();
+          return;
+        }
+        if (bannerPendingResetKey !== resultKey) {
+          if (bannerResetTimerId) {
+            clearTimeout(bannerResetTimerId);
+          }
+          bannerPendingResetKey = resultKey;
+          bannerResetTimerId = setTimeout(() => {
+            bannerResetDoneKey = resultKey;
+            bannerResetTimerId = null;
+            resetLiveBannerToWaiting();
+          }, 3000);
+        }
+      }
 
       const b1Hit =
         last.first_ball_hit !== undefined
@@ -3194,44 +3228,50 @@
             rawShotType === 'REGULAR_3C' ||
             rawShotType === 'BANK_SHOT';
 
-      // 수구 출발 후 1적구보다 쿠션이 먼저 맞았거나(cBefore1 >= 1 또는 !b1Hit 상태에서 쿠션 발생) 뱅크샷 판정인 경우
+      // 백엔드에서 1적구 선충돌(cBefore1 === 0, b1Hit === true)로 확정된 경우 선쿠션 오잠금 즉시 해제
+      if (rawShotType === 'IN_PROGRESS' && totalC === 0 && !b1Hit) {
+        currentShotLockedBankCount = 0;
+      }
+      if (b1Hit && cBefore1 === 0 && rawShotType !== 'BANK_SHOT') {
+        currentShotLockedBankCount = 0;
+      } else if (cBefore1 >= 1) {
+        currentShotLockedBankCount = cBefore1;
+      } else if (!b1Hit && totalC >= 1) {
+        currentShotLockedBankCount = totalC;
+      }
+
+      // 수구 출발 후 1적구보다 쿠션이 먼저 맞았거나(cBefore1 >= 1) 뱅크샷 판정인 경우
       const isBank =
         rawShotType === 'BANK_SHOT' ||
         cBefore1 >= 1 ||
         (!b1Hit && totalC >= 1) ||
         rawMsg.includes('뱅크');
 
-      const isScored =
-        rawShotType === 'REGULAR_3C' ||
-        rawShotType === 'BANK_SHOT' ||
-        Boolean(last.is_scored);
-
-      const isFailed =
-        !isScored &&
-        (rawShotType === 'MISS' ||
-          rawShotType === 'FOUL' ||
-          rawShotType === 'TIME_OUT_FOUL');
-
-      // 처음부터 끝까지 단일 추적 배너 모드 유지 (결과창 별도 전환 없음)
       bannerEl.classList.remove('theme-live', 'theme-chance', 'theme-score', 'theme-bank', 'theme-miss');
       bannerEl.classList.add('theme-live');
-      codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적`;
 
       const pill = (cls, text) => `<span class="bc-pill ${cls}">${text}</span>`;
       const arrow = `<span class="bc-arrow">⇒</span>`;
 
-      // 1) 뱅크(쿠션) 먼저 맞은 경우: [N뱅크] ⇒ [1적구] ⇒ [2적구] ⇒ [득점대기/득점성공/득점실패]
+      // 1) 수구로 쿠션을 먼저 친 경우: [선행 쿠션누적수] ⇒ [1적구] ⇒ [이후 쿠션누적수(있을 경우만)] ⇒ [2적구] ⇒ [득점성공/실패]
       if (isBank) {
-        const bankCount = Math.max(1, cBefore1 || (!b1Hit ? totalC : 1));
+        const firstCushCount = Math.max(
+          1,
+          cBefore1 || currentShotLockedBankCount || (!b1Hit ? totalC : 1)
+        );
         const cTot = isScored
           ? Math.max(3, totalC || 3)
-          : Math.max(bankCount, totalC);
-        const cushCls = cTot >= 3 ? 'cush-ready' : 'cush-normal';
-        const cushIcon = cTot >= 3 ? '🔥 ' : '⚡ ';
-        const bankLabel =
-          b1Hit && cTot > bankCount
-            ? `${cushIcon}${bankCount}뱅크·총${cTot}쿠션`
-            : `${cushIcon}${bankCount}뱅크(${cTot}쿠션)`;
+          : Math.max(firstCushCount, totalC);
+        const firstCushCls = firstCushCount >= 3 ? 'cush-ready' : 'cush-normal';
+        const firstCushIcon = firstCushCount >= 3 ? '🔥 ' : '⚡ ';
+        const firstCushLabel = `${firstCushIcon}${firstCushCount}쿠션`;
+
+        if (isScored) {
+          const bankPts = currentRuleMode === 'PBA' ? '+2점' : '+1점';
+          codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (🏆 ${bankPts} 득점!)`;
+        } else {
+          codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적`;
+        }
 
         const verdictCls = isScored
           ? 'verdict-score'
@@ -3248,15 +3288,27 @@
           ? '🔥 득점찬스'
           : '득점대기';
 
-        msgEl.innerHTML = [
-          pill(cushCls, bankLabel),
+        const parts = [
+          pill(firstCushCls, firstCushLabel),
           arrow,
           pill(b1Hit ? 'ball-hit' : 'ball-wait', b1Hit ? '🎯 1적구' : '1적구'),
+        ];
+
+        // 1적구 충돌 이후 추가 쿠션이 있을 경우에만 중간 쿠션누적수 표시 (없으면 생략)
+        if (b1Hit && cTot > firstCushCount) {
+          const postCushCls = cTot >= 3 ? 'cush-ready' : 'cush-normal';
+          const postCushIcon = cTot >= 3 ? '🔥 ' : '⚡ ';
+          parts.push(arrow, pill(postCushCls, `${postCushIcon}${cTot}쿠션`));
+        }
+
+        parts.push(
           arrow,
           pill(b2Hit ? 'ball-hit' : 'ball-wait', b2Hit ? '🎯 2적구' : '2적구'),
           arrow,
-          pill(verdictCls, verdictTxt),
-        ].join('');
+          pill(verdictCls, verdictTxt)
+        );
+
+        msgEl.innerHTML = parts.join('');
         return;
       }
 
@@ -3264,6 +3316,12 @@
       const cTot = isScored ? Math.max(3, totalC || 3) : totalC;
       const cCls = cTot >= 3 ? 'cush-ready' : cTot >= 1 ? 'cush-normal' : 'ball-wait';
       const cTxt = cTot >= 3 ? `🔥 ${cTot}쿠션` : cTot >= 1 ? `⚡ ${cTot}쿠션` : '0쿠션';
+
+      if (isScored) {
+        codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (🏆 +1점 득점!)`;
+      } else {
+        codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적`;
+      }
 
       const verdictCls = isScored
         ? 'verdict-score'

@@ -724,6 +724,8 @@ class MatchManager:
                 "cushions_before_second_hit", 3
             ),
             "total_cushions": shot_eval.get("total_cushions", 3),
+            "first_ball_hit": bool(shot_eval.get("first_ball_hit", True)),
+            "second_ball_hit": bool(shot_eval.get("second_ball_hit", True)),
         }
 
         payload = self.get_match_payload()
@@ -900,6 +902,8 @@ class MatchManager:
                 "cushions_before_second_hit", 0
             ),
             "total_cushions": shot_eval.get("total_cushions", 0),
+            "first_ball_hit": bool(shot_eval.get("first_ball_hit", is_scored)),
+            "second_ball_hit": bool(shot_eval.get("second_ball_hit", is_scored)),
         }
 
         payload = self.get_match_payload()
