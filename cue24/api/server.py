@@ -1690,9 +1690,14 @@ class LiveStreamReader:
                         else int(self.causal_kiss_fsm.cushion_count)
                     )
                     se_c_now = int(self.scoring_engine.total_cushion_count)
-                    live_total_cushions = max(fsm_c_now, se_c_now)
+                    live_total_cushions = (
+                        fsm_c_now
+                        if require_rest_displacement
+                        else max(fsm_c_now, se_c_now)
+                    )
                     if (
-                        self.causal_kiss_fsm.state == CausalShotState.IN_PLAY
+                        not require_rest_displacement
+                        and self.causal_kiss_fsm.state == CausalShotState.IN_PLAY
                         and self.causal_kiss_fsm.second_target_ball is None
                     ):
                         self.causal_kiss_fsm.cushion_count = max(
@@ -1955,27 +1960,34 @@ class LiveStreamReader:
 
                 # [Step 4: 실제 영상(require_rest_displacement=True)에서는 CausalKissSafeFSM 단독 판정 적용]
                 if require_rest_displacement:
+                    prev_last = self.match_manager.last_shot_result or {}
                     is_valid_causal = bool(
                         causal_res.scored or shot_eval.get("already_dispatched", False)
                     )
                     shot_eval["is_scored"] = is_valid_causal
-                    final_tot_cush = max(
-                        int(causal_res.total_cushions),
-                        int(self.scoring_engine.total_cushion_count),
+                    final_tot_cush = int(causal_res.total_cushions)
+                    b1_was_hit = bool(
+                        "B1" in causal_res.shot_event_tokens
+                        or is_valid_causal
+                        or (
+                            str(prev_last.get("shot_type", "")) in ("IN_PROGRESS", "REGULAR_3C", "BANK_SHOT")
+                            and bool(prev_last.get("first_ball_hit", False))
+                        )
                     )
-                    shot_eval["cushions_before_first_hit"] = int(causal_res.cushions_before_first_hit)
+                    b2_was_hit = bool(
+                        "B2" in causal_res.shot_event_tokens
+                        or is_valid_causal
+                    )
+                    c_before_first_val = (
+                        int(causal_res.cushions_before_first_hit)
+                        if b1_was_hit
+                        else final_tot_cush
+                    )
+                    shot_eval["cushions_before_first_hit"] = c_before_first_val
                     shot_eval["cushions_before_second_hit"] = int(causal_res.cushions_at_second_hit)
                     shot_eval["total_cushions"] = final_tot_cush
-                    shot_eval["first_ball_hit"] = bool(
-                        self.causal_kiss_fsm.first_target_ball is not None
-                        or self.scoring_engine.first_object_ball_id is not None
-                        or is_valid_causal
-                    )
-                    shot_eval["second_ball_hit"] = bool(
-                        self.causal_kiss_fsm.second_target_ball is not None
-                        or self.scoring_engine.second_object_ball_id is not None
-                        or is_valid_causal
-                    )
+                    shot_eval["first_ball_hit"] = b1_was_hit
+                    shot_eval["second_ball_hit"] = b2_was_hit
                     if is_valid_causal:
                         is_bank_final = bool(
                             causal_res.is_bank_shot or causal_res.cushions_before_first_hit >= 1

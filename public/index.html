@@ -3198,36 +3198,34 @@
       const isBank =
         rawShotType === 'BANK_SHOT' ||
         cBefore1 >= 1 ||
-        (!b1Hit && totalC >= 1 && rawShotType === 'IN_PROGRESS') ||
+        (!b1Hit && totalC >= 1) ||
         rawMsg.includes('뱅크');
 
+      const isScored =
+        rawShotType === 'REGULAR_3C' ||
+        rawShotType === 'BANK_SHOT' ||
+        Boolean(last.is_scored);
+
+      const isFailed =
+        !isScored &&
+        (rawShotType === 'MISS' ||
+          rawShotType === 'FOUL' ||
+          rawShotType === 'TIME_OUT_FOUL');
+
+      // 처음부터 끝까지 단일 추적 배너 모드 유지 (결과창 별도 전환 없음)
       bannerEl.classList.remove('theme-live', 'theme-chance', 'theme-score', 'theme-bank', 'theme-miss');
+      bannerEl.classList.add('theme-live');
+      codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적`;
 
       const pill = (cls, text) => `<span class="bc-pill ${cls}">${text}</span>`;
       const arrow = `<span class="bc-arrow">⇒</span>`;
 
-      if (rawShotType === 'TIME_OUT_FOUL') {
-        bannerEl.classList.add('theme-miss');
-        codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (⏰ 40초 시간초과)`;
-        msgEl.innerHTML = [
-          pill('ball-miss', '1적구 불발'),
-          arrow,
-          pill('ball-wait', '0쿠션'),
-          arrow,
-          pill('ball-miss', '2적구 불발'),
-          arrow,
-          pill('verdict-miss', '❌ 득점실패'),
-        ].join('');
-        return;
-      }
-
-      // 1) 수구 출발 후 쿠션이 먼저 맞은 경우 (뱅크샷 모드: 쿠션(1뱅크/2뱅크/3뱅크) ⇒ 1적구 ⇒ 2적구 ⇒ 득점완료/실패)
+      // 1) 뱅크(쿠션) 먼저 맞은 경우: [N뱅크] ⇒ [1적구] ⇒ [2적구] ⇒ [득점대기/득점성공/득점실패]
       if (isBank) {
         const bankCount = Math.max(1, cBefore1 || (!b1Hit ? totalC : 1));
-        const cTot =
-          rawShotType === 'BANK_SHOT'
-            ? Math.max(3, totalC || 3)
-            : Math.max(bankCount, totalC);
+        const cTot = isScored
+          ? Math.max(3, totalC || 3)
+          : Math.max(bankCount, totalC);
         const cushCls = cTot >= 3 ? 'cush-ready' : 'cush-normal';
         const cushIcon = cTot >= 3 ? '🔥 ' : '⚡ ';
         const bankLabel =
@@ -3235,40 +3233,21 @@
             ? `${cushIcon}${bankCount}뱅크·총${cTot}쿠션`
             : `${cushIcon}${bankCount}뱅크(${cTot}쿠션)`;
 
-        if (rawShotType === 'BANK_SHOT') {
-          bannerEl.classList.add('theme-bank');
-          const bankPts = currentRuleMode === 'PBA' ? '+2점' : '+1점';
-          codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (💎 ${bankCount}뱅크 ${bankPts})`;
-          msgEl.innerHTML = [
-            pill('cush-ready', bankLabel),
-            arrow,
-            pill('ball-hit', '🎯 1적구'),
-            arrow,
-            pill('ball-hit', '🎯 2적구'),
-            arrow,
-            pill('verdict-bank', '💎 득점완료'),
-          ].join('');
-          return;
-        }
+        const verdictCls = isScored
+          ? 'verdict-score'
+          : isFailed
+          ? 'verdict-miss'
+          : cTot >= 3 && b1Hit
+          ? 'cush-ready'
+          : 'ball-wait';
+        const verdictTxt = isScored
+          ? '🏆 득점성공'
+          : isFailed
+          ? '❌ 득점실패'
+          : cTot >= 3 && b1Hit
+          ? '🔥 득점찬스'
+          : '득점대기';
 
-        if (rawShotType === 'MISS' || rawShotType === 'FOUL') {
-          bannerEl.classList.add('theme-miss');
-          codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (${bankCount}뱅크 불발)`;
-          msgEl.innerHTML = [
-            pill(cushCls, bankLabel),
-            arrow,
-            pill(b1Hit ? 'ball-hit' : 'ball-miss', b1Hit ? '🎯 1적구' : '1적구 불발'),
-            arrow,
-            pill('ball-miss', '2적구 불발'),
-            arrow,
-            pill('verdict-miss', '❌ 득점실패'),
-          ].join('');
-          return;
-        }
-
-        // 뱅크샷 실시간 진행 중 (IN_PROGRESS)
-        bannerEl.classList.add(cTot >= 3 && b1Hit ? 'theme-chance' : 'theme-live');
-        codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (⚡ ${bankCount}뱅크 진행 중)`;
         msgEl.innerHTML = [
           pill(cushCls, bankLabel),
           arrow,
@@ -3276,51 +3255,31 @@
           arrow,
           pill(b2Hit ? 'ball-hit' : 'ball-wait', b2Hit ? '🎯 2적구' : '2적구'),
           arrow,
-          pill(cTot >= 3 && b1Hit ? 'cush-ready' : 'ball-wait', cTot >= 3 && b1Hit ? '🔥 득점찬스' : '득점대기'),
+          pill(verdictCls, verdictTxt),
         ].join('');
         return;
       }
 
-      // 2) 기본 대기 및 일반샷 모드 (수구가 1적구를 먼저 맞춘 경우: 1적구 ⇒ 쿠션 누적 ⇒ 2적구 ⇒ 득점성공/실패)
-      if (rawShotType === 'REGULAR_3C') {
-        bannerEl.classList.add('theme-score');
-        const cTot = Math.max(3, totalC || 3);
-        codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (🏆 +1점 득점!)`;
-        msgEl.innerHTML = [
-          pill('ball-hit', '🎯 1적구'),
-          arrow,
-          pill('cush-ready', `🔥 ${cTot}쿠션`),
-          arrow,
-          pill('ball-hit', '🎯 2적구'),
-          arrow,
-          pill('verdict-score', '🏆 득점성공'),
-        ].join('');
-        return;
-      }
+      // 2) 1적구 먼저 충돌 및 기본 대기: [1적구] ⇒ [N쿠션] ⇒ [2적구] ⇒ [득점대기/득점성공/득점실패]
+      const cTot = isScored ? Math.max(3, totalC || 3) : totalC;
+      const cCls = cTot >= 3 ? 'cush-ready' : cTot >= 1 ? 'cush-normal' : 'ball-wait';
+      const cTxt = cTot >= 3 ? `🔥 ${cTot}쿠션` : cTot >= 1 ? `⚡ ${cTot}쿠션` : '0쿠션';
 
-      if (rawShotType === 'MISS' || rawShotType === 'FOUL') {
-        bannerEl.classList.add('theme-miss');
-        const cCls = totalC >= 3 ? 'cush-ready' : totalC >= 1 ? 'cush-normal' : 'ball-wait';
-        const cTxt = totalC >= 3 ? `🔥 ${totalC}쿠션` : totalC >= 1 ? `⚡ ${totalC}쿠션` : '0쿠션';
-        codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (공격권 교대)`;
-        msgEl.innerHTML = [
-          pill(b1Hit ? 'ball-hit' : 'ball-miss', b1Hit ? '🎯 1적구' : '1적구 불발'),
-          arrow,
-          pill(cCls, cTxt),
-          arrow,
-          pill('ball-miss', '2적구 불발'),
-          arrow,
-          pill('verdict-miss', '❌ 득점실패'),
-        ].join('');
-        return;
-      }
+      const verdictCls = isScored
+        ? 'verdict-score'
+        : isFailed
+        ? 'verdict-miss'
+        : cTot >= 3 && b1Hit
+        ? 'cush-ready'
+        : 'ball-wait';
+      const verdictTxt = isScored
+        ? '🏆 득점성공'
+        : isFailed
+        ? '❌ 득점실패'
+        : cTot >= 3 && b1Hit
+        ? '🔥 득점찬스'
+        : '득점대기';
 
-      // 대기(READY) 및 일반샷 주행 중(IN_PROGRESS) 단일 추적 모드
-      const isChance = totalC >= 3 && b1Hit;
-      bannerEl.classList.add(isChance ? 'theme-chance' : 'theme-live');
-      const cCls = totalC >= 3 ? 'cush-ready' : totalC >= 1 ? 'cush-normal' : 'ball-wait';
-      const cTxt = totalC >= 3 ? `🔥 ${totalC}쿠션` : totalC >= 1 ? `⚡ ${totalC}쿠션` : '0쿠션';
-      codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적`;
       msgEl.innerHTML = [
         pill(b1Hit ? 'ball-hit' : 'ball-wait', b1Hit ? '🎯 1적구' : '1적구'),
         arrow,
@@ -3328,7 +3287,7 @@
         arrow,
         pill(b2Hit ? 'ball-hit' : 'ball-wait', b2Hit ? '🎯 2적구' : '2적구'),
         arrow,
-        pill(isChance ? 'cush-ready' : 'ball-wait', isChance ? '🔥 득점찬스' : '득점대기'),
+        pill(verdictCls, verdictTxt),
       ].join('');
     }
 
