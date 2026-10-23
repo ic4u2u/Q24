@@ -1413,7 +1413,10 @@
       align-items: center;
       justify-content: center;
       width: 100%;
-      padding: 0.65vh 12px;
+      max-width: 100%;
+      box-sizing: border-box;
+      overflow: hidden;
+      padding: 0.55vh 8px;
       border-radius: 12px;
       background: linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 58, 138, 0.38));
       border: 1.5px solid rgba(56, 189, 248, 0.45);
@@ -1456,13 +1459,18 @@
       display: flex;
       align-items: center;
       justify-content: center;
+      width: 100%;
+      max-width: 100%;
       gap: 6px;
       font-family: 'Chakra Petch', sans-serif;
-      font-size: clamp(0.76rem, 1.25vh, 0.9rem);
+      font-size: clamp(0.74rem, 1.2vh, 0.88rem);
       font-weight: 900;
       color: #38bdf8;
-      letter-spacing: 0.8px;
+      letter-spacing: 0.6px;
       margin-bottom: 3px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
       text-shadow: 0 1px 8px rgba(56, 189, 248, 0.45);
     }
 
@@ -1473,13 +1481,13 @@
 
     .state-banner.theme-score .state-code {
       color: #6ee7b7;
-      font-size: clamp(0.82rem, 1.35vh, 0.96rem);
+      font-size: clamp(0.78rem, 1.28vh, 0.92rem);
       text-shadow: 0 0 12px rgba(52, 211, 153, 0.7);
     }
 
     .state-banner.theme-bank .state-code {
       color: #fde047;
-      font-size: clamp(0.84rem, 1.38vh, 0.98rem);
+      font-size: clamp(0.78rem, 1.28vh, 0.92rem);
       text-shadow: 0 0 14px rgba(251, 191, 36, 0.8);
     }
 
@@ -1502,25 +1510,30 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      flex-wrap: nowrap;
-      gap: 4px;
+      flex-wrap: wrap;
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
+      gap: 3px 3px;
       font-family: 'Chakra Petch', sans-serif;
-      font-size: clamp(0.82rem, 1.38vh, 0.98rem);
+      font-size: clamp(0.7rem, 1.15vh, 0.84rem);
       color: #f8fafc;
       font-weight: 800;
-      line-height: 1.25;
-      white-space: nowrap;
+      line-height: 1.2;
       overflow: hidden;
-      text-overflow: ellipsis;
     }
 
     .bc-pill {
       display: inline-flex;
       align-items: center;
-      padding: 2px 8px;
-      border-radius: 7px;
+      justify-content: center;
+      padding: 2px 5px;
+      border-radius: 6px;
       font-weight: 900;
-      letter-spacing: 0.2px;
+      letter-spacing: 0px;
+      white-space: nowrap;
+      flex-shrink: 1;
+      min-width: 0;
       transition: transform 0.15s ease;
     }
 
@@ -1528,66 +1541,67 @@
       background: rgba(56, 189, 248, 0.22);
       border: 1px solid #38bdf8;
       color: #7dd3fc;
-      font-size: clamp(0.84rem, 1.42vh, 1.02rem);
+      font-size: clamp(0.68rem, 1.12vh, 0.82rem);
     }
 
     .bc-pill.cush-ready {
       background: rgba(245, 158, 11, 0.32);
       border: 1.5px solid #fde047;
       color: #fef08a;
-      font-size: clamp(0.9rem, 1.55vh, 1.12rem);
-      box-shadow: 0 0 10px rgba(251, 191, 36, 0.45);
+      font-size: clamp(0.7rem, 1.16vh, 0.85rem);
+      box-shadow: 0 0 8px rgba(251, 191, 36, 0.4);
     }
 
     .bc-pill.ball-hit {
       background: rgba(16, 185, 129, 0.28);
       border: 1px solid #34d399;
       color: #6ee7b7;
-      font-size: clamp(0.84rem, 1.4vh, 1.0rem);
+      font-size: clamp(0.68rem, 1.12vh, 0.82rem);
     }
 
     .bc-pill.ball-wait {
       background: rgba(51, 65, 85, 0.45);
       border: 1px dashed #64748b;
       color: #94a3b8;
-      font-size: clamp(0.76rem, 1.22vh, 0.88rem);
+      font-size: clamp(0.66rem, 1.08vh, 0.8rem);
     }
 
     .bc-pill.ball-miss {
       background: rgba(244, 63, 94, 0.24);
       border: 1px solid #fb7185;
       color: #fda4af;
-      font-size: clamp(0.82rem, 1.35vh, 0.96rem);
+      font-size: clamp(0.68rem, 1.12vh, 0.82rem);
     }
 
     .bc-pill.verdict-score {
       background: linear-gradient(90deg, #059669, #10b981);
       border: 1.5px solid #a7f3d0;
       color: #ffffff;
-      font-size: clamp(0.92rem, 1.6vh, 1.14rem);
-      box-shadow: 0 0 12px rgba(16, 185, 129, 0.65);
+      font-size: clamp(0.72rem, 1.18vh, 0.86rem);
+      box-shadow: 0 0 10px rgba(16, 185, 129, 0.6);
     }
 
     .bc-pill.verdict-bank {
       background: linear-gradient(90deg, #d97706, #db2777);
       border: 1.5px solid #fde047;
       color: #ffffff;
-      font-size: clamp(0.94rem, 1.62vh, 1.16rem);
-      box-shadow: 0 0 14px rgba(245, 158, 11, 0.75);
+      font-size: clamp(0.72rem, 1.18vh, 0.86rem);
+      box-shadow: 0 0 12px rgba(245, 158, 11, 0.7);
     }
 
     .bc-pill.verdict-miss {
       background: rgba(225, 29, 72, 0.35);
       border: 1.5px solid #fb7185;
       color: #ffe4e6;
-      font-size: clamp(0.88rem, 1.48vh, 1.06rem);
+      font-size: clamp(0.7rem, 1.15vh, 0.84rem);
     }
 
     .bc-arrow {
       color: #94a3b8;
       font-weight: 900;
-      font-size: clamp(0.8rem, 1.3vh, 0.95rem);
-      margin: 0 1px;
+      font-size: clamp(0.64rem, 1.02vh, 0.76rem);
+      margin: 0;
+      flex-shrink: 0;
     }
 
     /* 요구사항 3: '이닝별득점' 간소화 및 현재 이닝 하이라이트 표시 (INNING SCORE SHEET) */
@@ -2213,10 +2227,18 @@
         </div>
       </div>
 
-      <!-- 모니터 화면 바로 아래 생동감 넘치는 실시간 생중계 HUD 배너 배치 -->
+      <!-- 모니터 화면 바로 아래 생동감 넘치는 실시간 득점 추적 HUD 배너 배치 -->
       <div id="liveStateBanner" class="state-banner theme-live">
-        <div id="bannerCode" class="state-code"><span class="live-pulse-dot"></span> 실시간 생중계 대기</div>
-        <div id="bannerMsg" class="state-message">경기 시작 대기 중 (1번 선수 선공 - 흰공 수구)</div>
+        <div id="bannerCode" class="state-code"><span class="live-pulse-dot"></span> 실시간 득점 추적</div>
+        <div id="bannerMsg" class="state-message">
+          <span class="bc-pill ball-wait">1적구</span>
+          <span class="bc-arrow">⇒</span>
+          <span class="bc-pill ball-wait">0쿠션</span>
+          <span class="bc-arrow">⇒</span>
+          <span class="bc-pill ball-wait">2적구</span>
+          <span class="bc-arrow">⇒</span>
+          <span class="bc-pill ball-wait">득점대기</span>
+        </div>
       </div>
 
       <!-- 중앙 허브 통합: 현재 이닝 배지 + 40초 10초 단위 4구간(빨간색~파란색 그라데이션) 샷 타이머 바 -->
@@ -3172,60 +3194,102 @@
             rawShotType === 'REGULAR_3C' ||
             rawShotType === 'BANK_SHOT';
 
+      // 수구 출발 후 1적구보다 쿠션이 먼저 맞았거나(cBefore1 >= 1 또는 !b1Hit 상태에서 쿠션 발생) 뱅크샷 판정인 경우
       const isBank =
         rawShotType === 'BANK_SHOT' ||
-        (b1Hit && cBefore1 >= 1) ||
+        cBefore1 >= 1 ||
+        (!b1Hit && totalC >= 1 && rawShotType === 'IN_PROGRESS') ||
         rawMsg.includes('뱅크');
 
       bannerEl.classList.remove('theme-live', 'theme-chance', 'theme-score', 'theme-bank', 'theme-miss');
 
       const pill = (cls, text) => `<span class="bc-pill ${cls}">${text}</span>`;
       const arrow = `<span class="bc-arrow">⇒</span>`;
-      const cushPill = (cnt) =>
-        pill(cnt >= 3 ? 'cush-ready' : 'cush-normal', `${cnt >= 3 ? '🔥 ' : '⚡ '}${cnt}쿠션`);
 
-      if (rawShotType === 'BANK_SHOT') {
-        bannerEl.classList.add('theme-bank');
-        const bankPts = currentRuleMode === 'PBA' ? '+2점' : '+1점';
-        codeEl.innerHTML = `💎 BANK SHOT! 뱅크샷 득점 성공! (${bankPts})`;
-        const c1 = Math.max(1, cBefore1 || totalC || 3);
-        const cTot = Math.max(3, totalC || 3);
-        if (c1 >= cTot) {
-          // 3쿠션 뱅크샷: 3쿠션 => 1적구 => 2적구 => 뱅크샷성공
-          msgEl.innerHTML = [
-            cushPill(cTot),
-            arrow,
-            pill('ball-hit', '🎯 1적구'),
-            arrow,
-            pill('ball-hit', '🎯 2적구'),
-            arrow,
-            pill('verdict-bank', '💎 뱅크샷성공'),
-          ].join('');
-        } else {
-          // 1~2쿠션 뱅크샷: 선쿠션 => 1적구 => 총3쿠션 => 2적구 => 뱅크샷성공
-          msgEl.innerHTML = [
-            cushPill(c1),
-            arrow,
-            pill('ball-hit', '🎯 1적구'),
-            arrow,
-            cushPill(cTot),
-            arrow,
-            pill('ball-hit', '🎯 2적구'),
-            arrow,
-            pill('verdict-bank', '💎 뱅크샷성공'),
-          ].join('');
-        }
+      if (rawShotType === 'TIME_OUT_FOUL') {
+        bannerEl.classList.add('theme-miss');
+        codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (⏰ 40초 시간초과)`;
+        msgEl.innerHTML = [
+          pill('ball-miss', '1적구 불발'),
+          arrow,
+          pill('ball-wait', '0쿠션'),
+          arrow,
+          pill('ball-miss', '2적구 불발'),
+          arrow,
+          pill('verdict-miss', '❌ 득점실패'),
+        ].join('');
         return;
       }
 
+      // 1) 수구 출발 후 쿠션이 먼저 맞은 경우 (뱅크샷 모드: 쿠션(1뱅크/2뱅크/3뱅크) ⇒ 1적구 ⇒ 2적구 ⇒ 득점완료/실패)
+      if (isBank) {
+        const bankCount = Math.max(1, cBefore1 || (!b1Hit ? totalC : 1));
+        const cTot =
+          rawShotType === 'BANK_SHOT'
+            ? Math.max(3, totalC || 3)
+            : Math.max(bankCount, totalC);
+        const cushCls = cTot >= 3 ? 'cush-ready' : 'cush-normal';
+        const cushIcon = cTot >= 3 ? '🔥 ' : '⚡ ';
+        const bankLabel =
+          b1Hit && cTot > bankCount
+            ? `${cushIcon}${bankCount}뱅크·총${cTot}쿠션`
+            : `${cushIcon}${bankCount}뱅크(${cTot}쿠션)`;
+
+        if (rawShotType === 'BANK_SHOT') {
+          bannerEl.classList.add('theme-bank');
+          const bankPts = currentRuleMode === 'PBA' ? '+2점' : '+1점';
+          codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (💎 ${bankCount}뱅크 ${bankPts})`;
+          msgEl.innerHTML = [
+            pill('cush-ready', bankLabel),
+            arrow,
+            pill('ball-hit', '🎯 1적구'),
+            arrow,
+            pill('ball-hit', '🎯 2적구'),
+            arrow,
+            pill('verdict-bank', '💎 득점완료'),
+          ].join('');
+          return;
+        }
+
+        if (rawShotType === 'MISS' || rawShotType === 'FOUL') {
+          bannerEl.classList.add('theme-miss');
+          codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (${bankCount}뱅크 불발)`;
+          msgEl.innerHTML = [
+            pill(cushCls, bankLabel),
+            arrow,
+            pill(b1Hit ? 'ball-hit' : 'ball-miss', b1Hit ? '🎯 1적구' : '1적구 불발'),
+            arrow,
+            pill('ball-miss', '2적구 불발'),
+            arrow,
+            pill('verdict-miss', '❌ 득점실패'),
+          ].join('');
+          return;
+        }
+
+        // 뱅크샷 실시간 진행 중 (IN_PROGRESS)
+        bannerEl.classList.add(cTot >= 3 && b1Hit ? 'theme-chance' : 'theme-live');
+        codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (⚡ ${bankCount}뱅크 진행 중)`;
+        msgEl.innerHTML = [
+          pill(cushCls, bankLabel),
+          arrow,
+          pill(b1Hit ? 'ball-hit' : 'ball-wait', b1Hit ? '🎯 1적구' : '1적구'),
+          arrow,
+          pill(b2Hit ? 'ball-hit' : 'ball-wait', b2Hit ? '🎯 2적구' : '2적구'),
+          arrow,
+          pill(cTot >= 3 && b1Hit ? 'cush-ready' : 'ball-wait', cTot >= 3 && b1Hit ? '🔥 득점찬스' : '득점대기'),
+        ].join('');
+        return;
+      }
+
+      // 2) 기본 대기 및 일반샷 모드 (수구가 1적구를 먼저 맞춘 경우: 1적구 ⇒ 쿠션 누적 ⇒ 2적구 ⇒ 득점성공/실패)
       if (rawShotType === 'REGULAR_3C') {
         bannerEl.classList.add('theme-score');
-        codeEl.innerHTML = `🏆 SCORE! 일반 3쿠션 득점 성공! (+1점)`;
         const cTot = Math.max(3, totalC || 3);
+        codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (🏆 +1점 득점!)`;
         msgEl.innerHTML = [
           pill('ball-hit', '🎯 1적구'),
           arrow,
-          cushPill(cTot),
+          pill('cush-ready', `🔥 ${cTot}쿠션`),
           arrow,
           pill('ball-hit', '🎯 2적구'),
           arrow,
@@ -3234,108 +3298,37 @@
         return;
       }
 
-      if (rawShotType === 'IN_PROGRESS') {
-        if (totalC >= 3 && b1Hit) {
-          bannerEl.classList.add('theme-chance');
-          codeEl.innerHTML = `<span class="live-pulse-dot"></span> 🔥 3쿠션 달성! 제2적구 득점 찬스!`;
-        } else if (isBank) {
-          bannerEl.classList.add('theme-chance');
-          codeEl.innerHTML = `<span class="live-pulse-dot"></span> ⚡ 실시간 뱅크샷 궤적 중계`;
-        } else {
-          bannerEl.classList.add('theme-live');
-          codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 생중계 추적 중`;
-        }
-
-        if (isBank) {
-          const cFirst = Math.max(1, cBefore1 || totalC);
-          if (!b1Hit) {
-            msgEl.innerHTML = [
-              cushPill(totalC),
-              arrow,
-              pill('ball-wait', '1적구 대기'),
-              arrow,
-              pill('ball-wait', '2적구 대기'),
-            ].join('');
-          } else if (totalC > cFirst) {
-            msgEl.innerHTML = [
-              cushPill(cFirst),
-              arrow,
-              pill('ball-hit', '🎯 1적구'),
-              arrow,
-              cushPill(totalC),
-              arrow,
-              pill(b2Hit ? 'ball-hit' : 'ball-wait', b2Hit ? '🎯 2적구' : '2적구 돌진중'),
-            ].join('');
-          } else {
-            msgEl.innerHTML = [
-              cushPill(cFirst),
-              arrow,
-              pill('ball-hit', '🎯 1적구'),
-              arrow,
-              pill(b2Hit ? 'ball-hit' : 'ball-wait', b2Hit ? '🎯 2적구' : '2적구 돌진중'),
-            ].join('');
-          }
-        } else {
-          msgEl.innerHTML = [
-            pill(b1Hit ? 'ball-hit' : 'ball-wait', b1Hit ? '🎯 1적구' : '1적구 대기'),
-            arrow,
-            cushPill(totalC),
-            arrow,
-            pill(b2Hit ? 'ball-hit' : 'ball-wait', b2Hit ? '🎯 2적구' : '2적구 대기'),
-          ].join('');
-        }
-        return;
-      }
-
-      if (rawShotType === 'MISS' || rawShotType === 'FOUL' || rawShotType === 'TIME_OUT_FOUL') {
+      if (rawShotType === 'MISS' || rawShotType === 'FOUL') {
         bannerEl.classList.add('theme-miss');
-        if (rawShotType === 'TIME_OUT_FOUL') {
-          codeEl.innerHTML = `⏰ 40초 시간 초과 파울 (공격권 교대)`;
-          msgEl.innerHTML = [
-            pill('ball-miss', '제한시간 만료'),
-            arrow,
-            pill('verdict-miss', '❌ 공격권교대'),
-          ].join('');
-          return;
-        }
-        codeEl.innerHTML = `❌ 아슬아슬한 불발! (공격권 교대)`;
-        if (isBank && cBefore1 >= 1) {
-          msgEl.innerHTML = [
-            cushPill(totalC),
-            arrow,
-            pill(b1Hit ? 'ball-hit' : 'ball-miss', b1Hit ? '🎯 1적구' : '1적구 불발'),
-            arrow,
-            pill('ball-miss', '2적구 불발'),
-            arrow,
-            pill('verdict-miss', '❌ 득점실패'),
-          ].join('');
-        } else {
-          msgEl.innerHTML = [
-            pill(b1Hit ? 'ball-hit' : 'ball-miss', b1Hit ? '🎯 1적구' : '1적구 불발'),
-            arrow,
-            cushPill(totalC),
-            arrow,
-            pill('ball-miss', '2적구 불발'),
-            arrow,
-            pill('verdict-miss', '❌ 득점실패'),
-          ].join('');
-        }
+        const cCls = totalC >= 3 ? 'cush-ready' : totalC >= 1 ? 'cush-normal' : 'ball-wait';
+        const cTxt = totalC >= 3 ? `🔥 ${totalC}쿠션` : totalC >= 1 ? `⚡ ${totalC}쿠션` : '0쿠션';
+        codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적 (공격권 교대)`;
+        msgEl.innerHTML = [
+          pill(b1Hit ? 'ball-hit' : 'ball-miss', b1Hit ? '🎯 1적구' : '1적구 불발'),
+          arrow,
+          pill(cCls, cTxt),
+          arrow,
+          pill('ball-miss', '2적구 불발'),
+          arrow,
+          pill('verdict-miss', '❌ 득점실패'),
+        ].join('');
         return;
       }
 
-      // 기본 대기 상태 (WAIT_SHOT / READY)
-      bannerEl.classList.add('theme-live');
-      const shooterName = data.active_player_id === 'P2' ? p2NameKo : p1NameKo;
-      const shooterBall = data.active_player_id === 'P2' ? '🟡 노란공' : '⚪ 흰공';
-      codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 생중계 대기 중`;
+      // 대기(READY) 및 일반샷 주행 중(IN_PROGRESS) 단일 추적 모드
+      const isChance = totalC >= 3 && b1Hit;
+      bannerEl.classList.add(isChance ? 'theme-chance' : 'theme-live');
+      const cCls = totalC >= 3 ? 'cush-ready' : totalC >= 1 ? 'cush-normal' : 'ball-wait';
+      const cTxt = totalC >= 3 ? `🔥 ${totalC}쿠션` : totalC >= 1 ? `⚡ ${totalC}쿠션` : '0쿠션';
+      codeEl.innerHTML = `<span class="live-pulse-dot"></span> 실시간 득점 추적`;
       msgEl.innerHTML = [
-        pill('cush-normal', `${shooterName} (${shooterBall})`),
+        pill(b1Hit ? 'ball-hit' : 'ball-wait', b1Hit ? '🎯 1적구' : '1적구'),
         arrow,
-        pill('ball-wait', '1적구'),
+        pill(cCls, cTxt),
         arrow,
-        pill('ball-wait', '3쿠션'),
+        pill(b2Hit ? 'ball-hit' : 'ball-wait', b2Hit ? '🎯 2적구' : '2적구'),
         arrow,
-        pill('ball-wait', '2적구'),
+        pill(isChance ? 'cush-ready' : 'ball-wait', isChance ? '🔥 득점찬스' : '득점대기'),
       ].join('');
     }
 

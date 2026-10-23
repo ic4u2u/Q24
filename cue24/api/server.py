@@ -1649,6 +1649,8 @@ class LiveStreamReader:
                     else self.causal_kiss_fsm.cushion_count
                 ),
             )
+            prev_causal_cushions = int(self.causal_kiss_fsm.cushion_count)
+            prev_causal_c_before = int(self.causal_kiss_fsm.cushions_before_first_hit)
             prev_events_count = len(self.scoring_engine.events)
             prev_causal_events_count = len(self.causal_kiss_fsm.event_log)
 
@@ -1820,16 +1822,26 @@ class LiveStreamReader:
             # 주행 중 쿠션 횟수나 목적구 타격이 새로 감지되면 점수판 UI에 실시간 반영
             elif (
                 self.scoring_engine.total_cushion_count != prev_cushions
+                or int(self.causal_kiss_fsm.cushion_count) != prev_causal_cushions
+                or int(self.causal_kiss_fsm.cushions_before_first_hit) != prev_causal_c_before
                 or len(self.scoring_engine.events) != prev_events_count
                 or len(self.causal_kiss_fsm.event_log) != prev_causal_events_count
             ):
-                b1_done = bool(
-                    self.causal_kiss_fsm.first_target_ball is not None
-                    or self.scoring_engine.first_object_ball_id is not None
+                b1_done = (
+                    bool(self.causal_kiss_fsm.first_target_ball is not None)
+                    if require_rest_displacement
+                    else bool(
+                        self.causal_kiss_fsm.first_target_ball is not None
+                        or self.scoring_engine.first_object_ball_id is not None
+                    )
                 )
-                b2_done = bool(
-                    self.causal_kiss_fsm.second_target_ball is not None
-                    or self.scoring_engine.second_object_ball_id is not None
+                b2_done = (
+                    bool(self.causal_kiss_fsm.second_target_ball is not None)
+                    if require_rest_displacement
+                    else bool(
+                        self.causal_kiss_fsm.second_target_ball is not None
+                        or self.scoring_engine.second_object_ball_id is not None
+                    )
                 )
                 if self.causal_kiss_fsm.first_target_ball is not None:
                     c_before_now = int(self.causal_kiss_fsm.cushions_before_first_hit)
