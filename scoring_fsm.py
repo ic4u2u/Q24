@@ -24,6 +24,12 @@ from three_cushion_vision.causal_kiss_fsm import (
 )
 from three_cushion_vision.scoring_fsm import ThreeCushionScoringFSM
 from ball_identity_tracker import LabHungarianBallIdentifier
+from cue_flow_physics_tracker import (
+    CueFlowEvent,
+    CueFlowPhysicsTwin,
+    CueTrajectorySegment,
+    FlowEventType,
+)
 
 BallID = BallColor
 
@@ -283,6 +289,10 @@ __all__ = [
     "BallID",
     "CausalKissSafeFSM",
     "CueBallLifecycleTracker",
+    "CueFlowEvent",
+    "CueFlowPhysicsTwin",
+    "CueTrajectorySegment",
+    "FlowEventType",
     "FrameSnapshot",
     "LabHungarianBallIdentifier",
     "LifecycleSample",

@@ -38,6 +38,12 @@ import numpy as np
 import torch
 
 from billiard_nanogpt import BALL_R, TABLE_H, TABLE_W, BilliardNanoGPT
+from cue_flow_physics_tracker import (
+    CueFlowEvent,
+    CueFlowPhysicsTwin,
+    CueTrajectorySegment,
+    FlowEventType,
+)
 
 BALL_DIAM = BALL_R * 2.0  # 61.5mm
 
@@ -194,6 +200,7 @@ class CausalKissSafeFSM:
         self.onset_time: Dict[BallColor, Optional[float]] = self.onset_candidate_time
         self.first_mover_from_idle: Optional[BallColor] = None
         self.shot_event_tokens: List[str] = []
+        self.flow_twin: CueFlowPhysicsTwin = CueFlowPhysicsTwin()
         self._reset_shot()
 
     def _reset_shot(self) -> None:
@@ -235,6 +242,7 @@ class CausalKissSafeFSM:
 
         self.stop_counter: int = 0
         self.cue_path: List[CuePathPoint] = []
+        self.cue_trajectory_log: List[Tuple[float, np.ndarray, np.ndarray, float]] = []
         self.cue_lifecycle_path: List[
             Tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
         ] = []
@@ -1295,6 +1303,14 @@ class CausalKissSafeFSM:
                     f"pos=({pos_v[0]:.1f}, {pos_v[1]:.1f}) "
                     f"[선쿠션:{self.cushions_before_first_hit} + 후쿠션:{self.cushions_after_first_hit} = 총:{self.cushion_count}]"
                 )
+                self.flow_twin.record_event(
+                    t_v,
+                    FlowEventType.CUSHION_HIT,
+                    f"쿠션 반사 ({rail.name})",
+                    pos_v.copy(),
+                    self.flow_twin.twin_vel.copy(),
+                    len(self._logged_cushion_frames),
+                )
 
     @staticmethod
     def _compute_line_fit_rmse(pts: np.ndarray) -> float:
@@ -2094,8 +2110,60 @@ class CausalKissSafeFSM:
                 ):
                     self._geom_one_bank_recovered = True
 
+            # 제1적구 충돌 이전 구간까지의 선쿠션을 먼저 평가하고, pooltool TOI 물리 판별기로 선접촉 순서를 확정합니다.
+            if best_hit_idx >= 2:
+                self._update_polyline_cushion_counts(up_to_path_idx=best_hit_idx - 1)
+            first_contact_type, verified_pre_cushions = (
+                self.flow_twin.resolve_first_contact_order(
+                    self.cue_trajectory_log,
+                    t1_init,
+                    self.cushions_before_first_hit,
+                )
+            )
+            if (
+                first_contact_type == "CUSHION_FIRST"
+                and verified_pre_cushions > self.cushions_before_first_hit
+            ):
+                self._geom_one_bank_recovered = True
+                self._locked_pre_b1_cushions = max(
+                    self._locked_pre_b1_cushions, verified_pre_cushions
+                )
+                self.cushions_before_first_hit = verified_pre_cushions
+                if (
+                    pre_hit_rail_pt is not None
+                    and not any(
+                        ev.event_type == FlowEventType.CUSHION_HIT
+                        for ev in self.flow_twin.events
+                    )
+                ):
+                    self.flow_twin.record_event(
+                        max(0.0, t_hit_exact - 0.01),
+                        FlowEventType.CUSHION_HIT,
+                        "선쿠션 반사 (CUSHION_FIRST)",
+                        pre_hit_rail_pt.copy(),
+                        self.flow_twin.twin_vel.copy(),
+                        1,
+                    )
+
+            b1_hit_pos = (
+                self.cue_path[best_hit_idx].pos.copy()
+                if self.cue_path and best_hit_idx < len(self.cue_path)
+                else f_curr.pos[cue_c].copy()
+            )
+            b1_hit_vel = f_curr.vel[cue_c].copy() if cue_c is not None else self.flow_twin.twin_vel.copy()
+            self.flow_twin.record_event(
+                t_hit_exact,
+                FlowEventType.FIRST_BALL_HIT,
+                f"제1적구 접촉 ({target_color.name}, {first_contact_type})",
+                b1_hit_pos,
+                b1_hit_vel,
+                self.cushions_before_first_hit,
+            )
+
             # 제1적구 충돌 직후 반사 벡터가 형성될 수 있도록 전체 현재 cue_path(f_post2 포함)를 기준으로 역추적 감사 및 평가
             self._retroactive_cushion_audit()
+            if first_contact_type == "CUSHION_FIRST" and self.cushions_before_first_hit < verified_pre_cushions:
+                self.cushions_before_first_hit = verified_pre_cushions
             self.is_bank_shot = bool(self.cushions_before_first_hit >= 1)
 
             self.event_log.append(
@@ -2104,15 +2172,35 @@ class CausalKissSafeFSM:
             self._check_double_hit_foul(t, f_prev, f_curr, f_post2)
 
         elif target_color == self.first_target_ball:
+            cue_c = self.active_cue_ball or self.assigned_cue_ball
             self.event_log.append(
                 f"[{t:.2f}s] [수구-제1적구 재키스] {target_color.name} 재접촉 (득점 무관)"
             )
+            if cue_c is not None:
+                self.flow_twin.record_event(
+                    t,
+                    FlowEventType.FIRST_BALL_REHIT,
+                    f"제1적구 재접촉 ({target_color.name})",
+                    f_curr.pos[cue_c].copy(),
+                    f_curr.vel[cue_c].copy(),
+                    self.cushion_count,
+                )
 
         elif self.second_target_ball is None:
             # 제2적구 최초 충돌 확정 순간 전생애 궤적 역추적 감사(_retroactive_cushion_audit)로 쿠션 개수를 최종 집계
             self._retroactive_cushion_audit()
             self.second_target_ball = target_color
             self.cushions_at_second_hit = self.cushion_count
+            cue_c = self.active_cue_ball or self.assigned_cue_ball
+            if cue_c is not None:
+                self.flow_twin.record_event(
+                    t,
+                    FlowEventType.SECOND_BALL_HIT,
+                    f"제2적구 접촉 ({target_color.name})",
+                    f_curr.pos[cue_c].copy(),
+                    f_curr.vel[cue_c].copy(),
+                    self.cushions_at_second_hit,
+                )
             self._sync_shot_event_tokens()
             grammar_valid, grammar_bank, _, _ = self._parse_event_grammar_on_b2()
 
@@ -2589,6 +2677,13 @@ class CausalKissSafeFSM:
                 if init_norm >= 5.0:
                     self.initial_stroke_dir = init_vec / init_norm
                 self._initial_stroke_samples = [pos_map[cue].copy()]
+                self.flow_twin.lock_cue_ball_at_start(
+                    t,
+                    cue,
+                    self.stroke_origin_pos,
+                    pos_map[cue],
+                    vel_map[cue],
+                )
 
                 # 출발 직전 히스토리 프레임을 cue_path에 적재하여 초구 1쿠션 뱅크샷 꼭짓점이 누락되지 않도록 보존
                 other_cs = [c for c in BallColor if c != cue]
@@ -2620,6 +2715,9 @@ class CausalKissSafeFSM:
                         self.all_ball_paths[bc].append(
                             (s_h.frame_idx, s_h.t, s_h.pos[bc].copy())
                         )
+                    self.cue_trajectory_log.append(
+                        (s_h.t, p_h.copy(), s_h.vel[cue].copy(), min_d_t)
+                    )
                     self.cue_lifecycle_path.append(
                         (
                             s_h.t,
@@ -2685,6 +2783,19 @@ class CausalKissSafeFSM:
                 self.all_ball_paths[bc].append(
                     (self.frame_counter, t, pos_map[bc].copy())
                 )
+            obs_cue = (
+                p_cue_now.copy()
+                if coords_mm.get(cue_c) is not None
+                else None
+            )
+            self.flow_twin.step_physics_twin(
+                t,
+                obs_cue,
+                {oc: pos_map[oc].copy() for oc in other_cs},
+            )
+            self.cue_trajectory_log.append(
+                (t, p_cue_now.copy(), vel_map[cue_c].copy(), min_d_targets)
+            )
             self.cue_lifecycle_path.append(
                 (
                     t,
@@ -2798,6 +2909,17 @@ class CausalKissSafeFSM:
         if not self.score_dispatched:
             self._update_polyline_cushion_counts()
         self._sync_shot_event_tokens()
+
+        if self.cue_path:
+            final_cue_pos = self.cue_path[-1].pos.copy()
+            self.flow_twin.record_event(
+                t,
+                FlowEventType.STROKE_STOP,
+                "수구 정지 확정",
+                final_cue_pos,
+                np.zeros(2, dtype=np.float64),
+                self.cushions_at_second_hit if self.score_dispatched else self.cushion_count,
+            )
 
         scored = (
             self.state == ShotState.VALID_SCORE_PENDING or self.score_dispatched
