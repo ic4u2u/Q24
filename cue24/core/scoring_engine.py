@@ -381,6 +381,7 @@ class ScoringEngine:
         결정론적 4단계 FSM(VALID_SCORE_PENDING vs NO_SCORE_LOCKED) 상태를 전이합니다.
         """
         # 목적구 충돌 시 동일 레일 잠금(_same_rail_locked) 및 코너 카운트 해제
+        prev_last_cushion_hit_pos = self._last_cushion_hit_pos
         self._last_rail_hit = None
         self._last_cushion_hit_pos = None
         self._corner_bounce_count_in_zone = 0
@@ -393,16 +394,38 @@ class ScoringEngine:
 
         if self.first_object_ball_id is None:
             t1_origin = self._initial_ball_positions.get(target_ball_id, cue_pos)
-            # 고속 수구가 제1적구를 먼저 맞히고 직후(또는 동일 구간) 쿠션을 맞혔는데
-            # 제1적구 위치 변위 확정보다 쿠션 반사가 1프레임 먼저 감지된 경우 역전 복원 (O -> T1 -> C 기하 검증)
+            # 고속 수구가 제1적구를 먼저 맞히고 직후(또는 동일 구간) 쿠션을 맞혔거나
+            # 수구/제1적구가 쿠션에 붙어 출발하여 직선 통로(O -> T1) 내에서 선쿠션이 먼저 찍힌 경우 역전 복원
             if (
-                self.cushion_count_before_first_hit == 1
+                self.cushion_count_before_first_hit >= 1
                 and self._stroke_origin_pos is not None
-                and self._last_cushion_hit_pos is not None
             ):
                 ox_c, oy_c = self._stroke_origin_pos
-                cx_last, cy_last = self._last_cushion_hit_pos
                 d_o_t1 = math.hypot(t1_origin[0] - ox_c, t1_origin[1] - oy_c)
+                is_direct_corridor = d_o_t1 <= 115.0
+                if not is_direct_corridor and d_o_t1 > 20.0:
+                    ux_d = (t1_origin[0] - ox_c) / d_o_t1
+                    uy_d = (t1_origin[1] - oy_c) / d_o_t1
+                    max_corr_dev = 0.0
+                    pre_cnt = 0
+                    for f_l, pt_l, _, _ in self._cue_trajectory_log:
+                        if f_l <= frame_idx:
+                            vx_l = pt_l[0] - ox_c
+                            vy_l = pt_l[1] - oy_c
+                            proj_l = vx_l * ux_d + vy_l * uy_d
+                            if 10.0 <= proj_l <= d_o_t1 + 15.0:
+                                pre_cnt += 1
+                                dev_l = math.hypot(vx_l - proj_l * ux_d, vy_l - proj_l * uy_d)
+                                if dev_l > max_corr_dev:
+                                    max_corr_dev = dev_l
+                    if pre_cnt >= 1 and max_corr_dev <= 62.0:
+                        is_direct_corridor = True
+
+                cx_last, cy_last = (
+                    prev_last_cushion_hit_pos
+                    if prev_last_cushion_hit_pos is not None
+                    else cue_pos
+                )
                 d_o_c = math.hypot(cx_last - ox_c, cy_last - oy_c)
                 d_c_t1 = math.hypot(cx_last - t1_origin[0], cy_last - t1_origin[1])
                 d_rail_last = min(
@@ -411,14 +434,15 @@ class ScoringEngine:
                     cy_last,
                     self.table_height_mm - cy_last,
                 )
-                if d_o_c >= d_o_t1 - 5.0 and d_c_t1 <= 140.0:
+                if is_direct_corridor or (d_o_c >= d_o_t1 - 25.0 and d_c_t1 <= 155.0):
+                    restored_c = self.cushion_count_before_first_hit
                     self.cushion_count_before_first_hit = 0
-                    if d_rail_last <= 58.0:
-                        self.cushion_count_after_first_hit += 1
+                    if d_rail_last <= 58.0 and d_o_c >= d_o_t1 - 25.0:
+                        self.cushion_count_after_first_hit += restored_c
                     else:
-                        self.total_cushion_count = max(0, self.total_cushion_count - 1)
+                        self.total_cushion_count = max(0, self.total_cushion_count - restored_c)
                         self.cushion_count_before_second_hit = max(
-                            0, self.cushion_count_before_second_hit - 1
+                            0, self.cushion_count_before_second_hit - restored_c
                         )
 
             # [규칙 4: 1쿠션 넣어치기(원뱅크 걸어치기) 기하학적 1쿠션 보장 검증]
@@ -429,24 +453,31 @@ class ScoringEngine:
             if self._stroke_origin_pos is not None:
                 ox, oy = self._stroke_origin_pos
                 d_o_t1_ref = math.hypot(t1_origin[0] - ox, t1_origin[1] - oy)
+                origin_rail_ref = min(
+                    ox,
+                    self.table_width_mm - ox,
+                    oy,
+                    self.table_height_mm - oy,
+                )
                 for _, pt_log, _, _ in self._cue_trajectory_log:
                     d_o_pt = math.hypot(pt_log[0] - ox, pt_log[1] - oy)
-                    if 20.0 <= d_o_pt < d_o_t1_ref - 5.0:
+                    if 45.0 <= d_o_pt < d_o_t1_ref - 15.0:
                         r_pt = min(
                             pt_log[0],
                             self.table_width_mm - pt_log[0],
                             pt_log[1],
                             self.table_height_mm - pt_log[1],
                         )
-                        if r_pt < pre_t1_min_rail:
-                            pre_t1_min_rail = r_pt
+                        if origin_rail_ref > 68.0 or r_pt < origin_rail_ref - 8.0:
+                            if r_pt < pre_t1_min_rail:
+                                pre_t1_min_rail = r_pt
                 self._min_rail_dist_before_first_hit = pre_t1_min_rail
 
             if (
                 self.cushion_count_before_first_hit == 0
                 and self._stroke_origin_pos is not None
                 and self._initial_stroke_dir is not None
-                and self._min_rail_dist_before_first_hit <= 58.0
+                and self._min_rail_dist_before_first_hit <= 54.0
             ):
                 ox, oy = self._stroke_origin_pos
                 origin_rail_dist = min(
@@ -456,7 +487,7 @@ class ScoringEngine:
                     self.table_height_mm - oy,
                 )
                 actually_approached_rail = (
-                    self._min_rail_dist_before_first_hit <= 48.0
+                    (origin_rail_dist > 68.0 and self._min_rail_dist_before_first_hit <= 48.0)
                     or (origin_rail_dist - self._min_rail_dist_before_first_hit) >= 15.0
                 )
                 dx_init, dy_init = self._initial_stroke_dir
@@ -482,8 +513,9 @@ class ScoringEngine:
 
                 if (
                     actually_approached_rail
-                    and impact_param > 42.0
-                    and (deflection_from_init >= 8.0 or impact_param > 72.0)
+                    and dist_hit > 115.0
+                    and impact_param > 65.0
+                    and deflection_from_init >= 14.0
                 ):
                     self.cushion_count_before_first_hit = 1
                     self.total_cushion_count = max(1, self.total_cushion_count)
