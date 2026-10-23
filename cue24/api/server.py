@@ -1934,9 +1934,7 @@ class LiveStreamReader:
                     or self.vision_kinematics.object_ball_kiss_occurred
                 )
                 shot_eval["object_ball_kiss_occurred"] = ob_kiss
-                shot_eval["double_hit_foul"] = bool(
-                    causal_res.double_hit_foul or has_double_touch_foul
-                )
+                shot_eval["double_hit_foul"] = False
                 shot_eval["centroid_shift_corrected_count"] = int(
                     causal_res.centroid_shift_corrected_count
                     + self.vision_kinematics.centroid_shift_corrected_count
@@ -1946,9 +1944,7 @@ class LiveStreamReader:
                 # [Step 4: 실제 영상(require_rest_displacement=True)에서는 CausalKissSafeFSM 단독 판정 적용]
                 if require_rest_displacement:
                     is_valid_causal = bool(
-                        (causal_res.scored or shot_eval.get("already_dispatched", False))
-                        and not has_double_touch_foul
-                        and not causal_res.double_hit_foul
+                        causal_res.scored or shot_eval.get("already_dispatched", False)
                     )
                     shot_eval["is_scored"] = is_valid_causal
                     final_tot_cush = max(
@@ -1987,10 +1983,6 @@ class LiveStreamReader:
                                 shot_eval["message"] = f"{c_b1_final}쿠션 ⇒ 1적구 ⇒ {c_b2}쿠션 ⇒ 2적구 ⇒ 뱅크샷성공"
                         else:
                             shot_eval["message"] = f"1적구 ⇒ {c_b2}쿠션 ⇒ 2적구 ⇒ 득점성공"
-                    elif causal_res.double_hit_foul or has_double_touch_foul:
-                        shot_eval["shot_type"] = "FOUL"
-                        shot_eval["reason_code"] = "DOUBLE_HIT_FOUL"
-                        shot_eval["message"] = "파울 (투터치/밀어치기 감지): 공격권이 상대방으로 넘어갑니다."
                     else:
                         shot_eval["shot_type"] = "MISS"
                         shot_eval["reason_code"] = str(causal_res.fail_reason or "SECOND_BALL_MISSED")
@@ -2024,17 +2016,6 @@ class LiveStreamReader:
                             if is_bank_final
                             else f"득점 인정 (일반 3쿠션): 총 {c_b2}쿠션 후 제2적구 충돌 성공!"
                         )
-                elif (
-                    not bool(shot_eval.get("is_scored", False))
-                    and causal_res.double_hit_foul
-                    and not has_double_touch_foul
-                ):
-                    shot_eval["is_scored"] = False
-                    shot_eval["shot_type"] = "FOUL"
-                    shot_eval["reason_code"] = "DOUBLE_HIT_FOUL"
-                    shot_eval["message"] = (
-                        "파울 (투터치/밀어치기 감지): 근접 충돌 직후 수구 재가속·비정상 추격 차단"
-                    )
 
                 # 0.3mm 초미세 스침 / 1쿠션 넣어치기 뱅크샷 / 시속 35km 고속 코너 반사 등 정밀 구출 및 동기화
                 if (

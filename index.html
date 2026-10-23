@@ -3298,15 +3298,6 @@
           ].join('');
           return;
         }
-        if (rawShotType === 'FOUL') {
-          codeEl.innerHTML = `🚨 파울 감지! (공격권 교대)`;
-          msgEl.innerHTML = [
-            pill('ball-miss', '투터치/파울'),
-            arrow,
-            pill('verdict-miss', '❌ 득점실패'),
-          ].join('');
-          return;
-        }
         codeEl.innerHTML = `❌ 아슬아슬한 불발! (공격권 교대)`;
         if (isBank && cBefore1 >= 1) {
           msgEl.innerHTML = [
