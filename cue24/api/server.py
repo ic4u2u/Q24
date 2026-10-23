@@ -1433,11 +1433,6 @@ class LiveStreamReader:
                             best_onset_id = bid
                 if best_onset_id is not None:
                     first_moving_id = best_onset_id
-                    mover_color = str(ball_states[best_onset_id].color).upper()
-                    if is_opening_unlocked or require_rest_displacement:
-                        self.match_manager.active_player_id = (
-                            "P2" if mover_color == "YELLOW" else "P1"
-                        )
 
             # 2순위: 만약 스트로크 순간 큐대/손 가림으로 인해 지정 수구는 안 보였지만
             # 다른 공(제1적구 또는 상대방 수구)이 강하게(>= 35.0mm) 튀어나간 경우:
@@ -1463,6 +1458,14 @@ class LiveStreamReader:
                         break
 
             if first_moving_id is not None:
+                # 샷 시작 직전 원래 공격 선수와 이닝 상태를 백업 (유령 샷 취소 시 100% 원복 보장)
+                self.match_manager._pre_shot_player_id = self.match_manager.active_player_id
+                self.match_manager._pre_shot_inning = self.match_manager.current_inning
+                self.match_manager._pre_shot_p2_had_slot = (
+                    self.match_manager.current_inning
+                    in self.match_manager.players["P2"].inning_scores
+                )
+
                 # 현재 턴의 지정 수구를 이번 샷의 수구(Cue Ball)로 영구 고정! (상대방 공 노이즈 턴 하이재킹 원천 차단)
                 self.tracker.cue_ball_id = first_moving_id
                 cue_id = first_moving_id
@@ -1474,17 +1477,15 @@ class LiveStreamReader:
 
                 # [절대 원칙]
                 # 1) 흰공(WHITE) = 1번 선수(선공 P1), 노란공(YELLOW) = 2번 선수(후공 P2) 100% 고정!
-                # 2) 상대방 공의 미세 흔들림이나 스트로크 시 가려짐 때문에 공격권이 강탈되거나 가짜 점수가 올라가는 것을 원천 차단!
+                # 2) 후공(P2) 샷 이후 선공(P1)이 치면 반드시 다음 이닝(current_inning + 1)으로 동기화!
                 self.match_manager.players["P1"].cue_ball_color = "WHITE"
                 self.match_manager.players["P2"].cue_ball_color = "YELLOW"
-                compensated_prev_shot = False
-                if not require_rest_displacement:
-                    reconcile_res = self.match_manager.reconcile_cue_ball_stroke(
-                        stroked_cue_color=str(cue_state.color).upper(),
-                        compensate_missed_score=True,
-                        force_sync_player=True,
-                    )
-                    compensated_prev_shot = bool(reconcile_res.get("compensated", False))
+                reconcile_res = self.match_manager.reconcile_cue_ball_stroke(
+                    stroked_cue_color=str(cue_state.color).upper(),
+                    compensate_missed_score=(not require_rest_displacement),
+                    force_sync_player=True,
+                )
+                compensated_prev_shot = bool(reconcile_res.get("compensated", False))
                 self.match_manager.sync_active_player_to_current_inning(
                     self.match_manager.active_player_id
                 )

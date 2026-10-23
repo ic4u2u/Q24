@@ -127,6 +127,9 @@ class MatchManager:
         self._last_shot_inning: int = 1
         self._last_shot_was_miss: bool = False
         self._last_shot_prev_run: int = 0
+        self._pre_shot_player_id: str = "P1"
+        self._pre_shot_inning: int = 1
+        self._pre_shot_p2_had_slot: bool = False
         self.shot_seq_id: int = 0
         self.last_scored_shot_id: int = -1
         self.score_dispatched_for_current_shot: bool = False
@@ -530,16 +533,31 @@ class MatchManager:
         # Case 2: 흰공 타구 = 1번 선수(P1), 노란공 타구 = 2번 선수(P2) 100% 일치 동기화
         if force_sync_player and self.active_player_id != stroked_player_id:
             if self.active_player_id == "P2" and stroked_player_id == "P1":
-                # 후공(P2)이 이미 현재 이닝에 타구한 기록이 있다면 다음 이닝(current_inning + 1)의 P1 차례로 진행
+                # 후공(P2)이 이미 현재 이닝에 타구한 기록이 있거나 현재 이닝의 P2 슬롯이 열려 있었다면 다음 이닝(current_inning + 1)의 P1 차례로 진행
+                p2 = self.players["P2"]
                 if (
-                    self._last_shot_player_id == "P2"
-                    and self._last_shot_inning == self.current_inning
+                    (
+                        self._last_shot_player_id == "P2"
+                        and self._last_shot_inning == self.current_inning
+                    )
+                    or p2.innings >= self.current_inning
+                    or self.current_inning in p2.inning_scores
                 ):
                     self.current_inning += 1
             self.players[self.active_player_id].current_run = 0
             self._last_shot_was_miss = False
             self.sync_active_player_to_current_inning(stroked_player_id)
         else:
+            if stroked_player_id == "P1":
+                p2 = self.players["P2"]
+                if (
+                    self._last_shot_player_id == "P2"
+                    and self._last_shot_inning == self.current_inning
+                ) or (
+                    p2.innings >= self.current_inning
+                    and self.current_inning in p2.inning_scores
+                ):
+                    self.current_inning += 1
             self.sync_active_player_to_current_inning(self.active_player_id)
 
         return {
@@ -559,6 +577,15 @@ class MatchManager:
         self.is_timer_paused = self.is_match_paused
         self.players["P1"].cue_ball_color = "WHITE"
         self.players["P2"].cue_ball_color = "YELLOW"
+        restored_pid = self._pre_shot_player_id or self.active_player_id
+        restored_inn = max(1, self._pre_shot_inning or self.current_inning)
+        if restored_pid == "P1" and not self._pre_shot_p2_had_slot:
+            p2 = self.players["P2"]
+            if p2.inning_scores.get(restored_inn, 0) == 0 and p2.innings == restored_inn:
+                p2.inning_scores.pop(restored_inn, None)
+                p2.innings = max(0, restored_inn - 1)
+        self.current_inning = restored_inn
+        self.active_player_id = restored_pid
         self.sync_active_player_to_current_inning(self.active_player_id)
         return self.get_match_payload()
 

@@ -3174,7 +3174,7 @@
 
       const isBank =
         rawShotType === 'BANK_SHOT' ||
-        cBefore1 >= 1 ||
+        (b1Hit && cBefore1 >= 1) ||
         rawMsg.includes('뱅크');
 
       bannerEl.classList.remove('theme-live', 'theme-chance', 'theme-score', 'theme-bank', 'theme-miss');

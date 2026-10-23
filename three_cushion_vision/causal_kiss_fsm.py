@@ -1302,11 +1302,26 @@ class CausalKissSafeFSM:
                     first_ball_absorbed_momentum = True
 
             if self.first_target_ball is None:
-                # 제1적구 최초 타격 시:
-                if (
+                # 제1적구 최초 타격 시 (제1적구가 쿠션 레일에 붙어 있는 경우 포함):
+                # 1) 수구와 제1적구 중심 거리가 물리적 접촉권(<= 68.5mm) 이내이면서 수구 굴절(>= 2.2도) 또는 제1적구 미세 반응(>= 1.2mm)이 동반된 경우
+                # 2) 일반 근접(<= THIN_HIT_MAX_DIST_MM)에서 꼭짓점 굴절이 발생한 경우
+                net_disp_t1 = float(np.linalg.norm(p_y_after - p_y_before))
+                step_disp_t1 = float(np.linalg.norm(f_curr.pos[ball_y] - p_y_before))
+                max_disp_t1 = max(net_disp_t1, step_disp_t1)
+                cue_deflect_t1 = max(
+                    cue_bend_deg,
+                    self._angle_between_deg(v_x_before, v_x_after),
+                )
+                if d_min <= 68.5 and (
+                    cue_deflect_t1 >= 2.2
+                    or max_disp_t1 >= 1.2
+                    or has_cue_vertex
+                ):
+                    phenomenon_b_hit = True
+                elif (
                     d_min <= self.THIN_HIT_MAX_DIST_MM
-                    and has_cue_vertex
-                    and (not is_bouncing_on_rail or float(np.linalg.norm(p_y_after - p_y_before)) >= 3.0)
+                    and (has_cue_vertex or cue_deflect_t1 >= 3.2)
+                    and (not is_bouncing_on_rail or max_disp_t1 >= 1.5)
                 ):
                     phenomenon_b_hit = True
             elif not first_ball_absorbed_momentum:
