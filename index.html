@@ -3878,7 +3878,7 @@
 
       if (mode === 'UPLOAD' || mode === 'CAMERA') {
         if (emptyGuide) {
-          emptyGuide.classList.add('hidden');
+          emptyGuide.classList.remove('show');
         }
         if (streamImg) {
           streamImg.style.opacity = '0';
@@ -4441,7 +4441,13 @@
       }
     }
 
+    let lastVisionSyncSignature = '';
+
     function syncBrowserVisionToScoreboard() {
+      const sig = `${browserVisionState.fsmState}|${browserVisionState.cushionCount}|${browserVisionState.hitBalls.join(',')}|${browserVisionState.firstContactIsCushion}`;
+      if (sig === lastVisionSyncSignature) return;
+      lastVisionSyncSignature = sig;
+
       const st = lastScoreboardData || cloudState;
       st.fsm_state = browserVisionState.fsmState;
       st.vision_diagnostics = {
@@ -4542,7 +4548,9 @@
         if (clientSourceMode !== 'UPLOAD' && clientSourceMode !== 'CAMERA') return;
         if (localVideo.readyState >= 2) {
           if (!localVideo.paused && !localVideo.ended) {
-            detectTableAndBallsOnOffscreen(localVideo, W, H);
+            if (browserVisionState.frameCounter % 2 === 0) {
+              detectTableAndBallsOnOffscreen(localVideo, W, H);
+            }
             stepBrowserVisionFSM();
           }
           renderBrowserVisionOverlay(visionCanvas, localVideo, W, H);
@@ -4558,14 +4566,14 @@
       if (streamImg) {
         streamImg.addEventListener('load', () => {
           if (clientSourceMode === 'SERVER' && emptyGuide) {
-            emptyGuide.classList.add('hidden');
+            emptyGuide.classList.remove('show');
           }
         });
         streamImg.addEventListener('error', () => {
           if (clientSourceMode === 'SERVER') {
             streamImg.style.display = 'none';
             if (emptyGuide) {
-              emptyGuide.classList.remove('hidden');
+              emptyGuide.classList.add('show');
             }
           }
         });

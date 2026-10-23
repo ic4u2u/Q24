@@ -131,6 +131,8 @@ class LiveStreamReader:
     # 테스트 녹화 영상(J:\내 드라이브\L-billiard.mp4)에서 경기 초기화/화면 리플레시 즉시 3구 색상 잠금 ->
     # 선공(흰공) 5쿠션 즉시 득점 -> 후공(노란공) 3쿠션 즉시 득점 -> 선공(흰공) 5쿠션 뱅크샷 즉시 득점이 이어지는 시작 프레임
     ACTIVE_SHOT_START_FRAME: int = 7920
+    _INIT_VIDEO_CACHE: Dict[str, Dict[str, Any]] = {}
+    _CACHED_NANOGPT_MODEL: Optional[Any] = None
 
     def __init__(
         self,
@@ -203,7 +205,9 @@ class LiveStreamReader:
         self._init_video_capture(self.video_path)
 
         # [Autoresearch 100% + BilliardNanoGPT + 3체 인과 키스 분리 엔진 통합]
-        self.nanogpt_model = get_or_train_billiard_nanogpt()
+        if LiveStreamReader._CACHED_NANOGPT_MODEL is None:
+            LiveStreamReader._CACHED_NANOGPT_MODEL = get_or_train_billiard_nanogpt()
+        self.nanogpt_model = LiveStreamReader._CACHED_NANOGPT_MODEL
         self.trajectory_restorers: Dict[int, OcclusionTrajectoryRestorer] = {
             1: OcclusionTrajectoryRestorer(self.nanogpt_model, device="cpu"),
             2: OcclusionTrajectoryRestorer(self.nanogpt_model, device="cpu"),
@@ -262,8 +266,28 @@ class LiveStreamReader:
     def _init_video_capture(self, path_str: str) -> None:
         """
         실제 카메라(camera_index) 또는 카메라 대용 테스트 영상 파일(예: J:\\내 드라이브\\L-billiard.mp4)을 오픈하고,
-        당구대 내경 4모서리를 자동 보정한 뒤 타구 준비 구간(620프레임)에 대기시킵니다.
+        당구대 내경 4모서리를 자동 보정한 뒤 타구 준비 구간에 대기시킵니다.
+        (외부 가상 드라이브 J:\\ 접근 병목 방지를 위해 최초 1회 로드 후 메모리 캐시 재사용)
         """
+        if self.camera_index is None and path_str in LiveStreamReader._INIT_VIDEO_CACHE:
+            cached = LiveStreamReader._INIT_VIDEO_CACHE[path_str]
+            self.is_real_video_loaded = bool(cached["is_real_video_loaded"])
+            self.video_width = int(cached["video_width"])
+            self.video_height = int(cached["video_height"])
+            self.video_fps = float(cached["video_fps"])
+            if self.is_real_video_loaded:
+                self.calibrator = TableCalibrator(src_corners=list(cached["src_corners"]))
+                self._update_cached_half_homography()
+                self._table_calibrated = True
+                self._latest_raw_frame = cached["raw_frame"]
+                self._latest_live_jpeg = cached["jpg_bytes"]
+                for _ in range(10):
+                    self.replay_buffer.push_frame(cached["jpg_bytes"])
+                self.replay_buffer.lock_last_shot(
+                    "REGULAR_3C", True, "카메라/테스트 영상 초기 리플레이 준비 완료"
+                )
+                return
+
         cap: Optional[cv2.VideoCapture] = None
         if self.camera_index is not None:
             cap = cv2.VideoCapture(self.camera_index)
@@ -282,22 +306,18 @@ class LiveStreamReader:
             self.video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
             self.video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
 
-            # 타구 직전 준비 구간(585~620프레임)에서 초기 리플레이 버퍼를 적재하고 620프레임에 대기
             if self.camera_index is None:
-                cap.set(
-                    cv2.CAP_PROP_POS_FRAMES,
-                    max(0, self.ACTIVE_SHOT_START_FRAME - 35),
-                )
+                cap.set(cv2.CAP_PROP_POS_FRAMES, self.ACTIVE_SHOT_START_FRAME)
 
-            for idx in range(35):
+            ret, raw_frame = cap.read()
+            if not ret or raw_frame is None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, raw_frame = cap.read()
-                if not ret or raw_frame is None:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    break
-                if idx == 0:
-                    self.calibrator.auto_detect_table_corners(raw_frame)
-                    self._update_cached_half_homography()
-                    self._table_calibrated = True
+
+            if ret and raw_frame is not None:
+                self.calibrator.auto_detect_table_corners(raw_frame)
+                self._update_cached_half_homography()
+                self._table_calibrated = True
                 self._latest_raw_frame = raw_frame
                 ok, buf = cv2.imencode(
                     ".jpg", raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75]
@@ -305,10 +325,18 @@ class LiveStreamReader:
                 if ok:
                     jpg_bytes = buf.tobytes()
                     self._latest_live_jpeg = jpg_bytes
-                    self.replay_buffer.push_frame(jpg_bytes)
-
-            if self.camera_index is None:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, self.ACTIVE_SHOT_START_FRAME)
+                    for _ in range(10):
+                        self.replay_buffer.push_frame(jpg_bytes)
+                    if self.camera_index is None:
+                        LiveStreamReader._INIT_VIDEO_CACHE[path_str] = {
+                            "is_real_video_loaded": True,
+                            "video_width": self.video_width,
+                            "video_height": self.video_height,
+                            "video_fps": self.video_fps,
+                            "src_corners": list(self.calibrator.src_corners),
+                            "raw_frame": raw_frame,
+                            "jpg_bytes": jpg_bytes,
+                        }
 
             self.replay_buffer.lock_last_shot(
                 "REGULAR_3C", True, "카메라/테스트 영상 초기 리플레이 준비 완료"
