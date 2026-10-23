@@ -3810,21 +3810,28 @@
         const delta = Number(payload.delta) || 0;
         const p = st.players[pid];
         p.score = Math.max(0, (p.score || 0) + delta);
-        if (delta >= 2) p.bank_shots = (p.bank_shots || 0) + 1;
+        const isBankShot = Boolean(payload.is_bank) || delta >= 2;
+        if (isBankShot && delta > 0) p.bank_shots = (p.bank_shots || 0) + 1;
         if (delta > 0) {
           p.current_run = (p.current_run || 0) + delta;
           p.high_run = Math.max(p.high_run || 0, p.current_run);
           st.shot_timer.remaining_sec = st.shot_timer.default_sec;
+          st.fsm_state = 'WAIT_SHOT';
           st.last_shot_result = {
-            shot_id: Date.now(),
-            shot_type: delta >= 2 ? 'BANK_SHOT' : 'REGULAR_3C',
+            shot_id: payload.shot_id || Date.now(),
+            shot_type: isBankShot ? 'BANK_SHOT' : 'REGULAR_3C',
             is_scored: true,
             immediate_score: true,
             cue_ball: p.cue_ball_color,
+            cushions_before_first_hit: Number(payload.cushions_before_first_hit ?? (isBankShot ? 1 : 0)),
+            cushions_before_second_hit: Math.max(3, Number(payload.cushions_before_second_hit ?? payload.total_cushions ?? 3)),
+            total_cushions: Math.max(3, Number(payload.total_cushions ?? 3)),
+            first_ball_hit: true,
+            second_ball_hit: true,
             message:
-              delta >= 2
-                ? `득점 성공 (뱅크샷 +2점): ${p.name} 수구 유지!`
-                : `득점 성공 (일반 3쿠션 +1점): ${p.name} 수구 유지!`,
+              isBankShot
+                ? `득점 성공 (뱅크샷 +${delta}점): ${p.name} 수구 유지!`
+                : `득점 성공 (일반 3쿠션 +${delta}점): ${p.name} 수구 유지!`,
           };
         }
         p.average = p.innings > 0 ? p.score / p.innings : 0;
@@ -3846,11 +3853,17 @@
           st.inning_history.push({ inning: st.current_inning, P1: 0, P2: null });
         }
         st.shot_timer.remaining_sec = st.shot_timer.default_sec;
+        st.fsm_state = 'WAIT_SHOT';
         const nextP = st.players[st.active_player_id];
         st.last_shot_result = {
-          shot_id: Date.now(),
+          shot_id: payload.shot_id || Date.now(),
           shot_type: 'MISS',
           is_scored: false,
+          cushions_before_first_hit: Number(payload.cushions_before_first_hit ?? 0),
+          cushions_before_second_hit: Number(payload.cushions_before_second_hit ?? 0),
+          total_cushions: Number(payload.total_cushions ?? 0),
+          first_ball_hit: Boolean(payload.first_ball_hit),
+          second_ball_hit: Boolean(payload.second_ball_hit),
           message: `공격권 교대 -> ${nextP.name} (${nextP.cue_ball_color === 'YELLOW' ? '노란공' : '흰공'} 수구)`,
         };
       } else if (action === 'USE_TIMEOUT') {
@@ -4181,21 +4194,33 @@
     }
 
     // ------------------------------------------------------------------
-    // [3. 브라우저 내장 실시간 AI 3구 색상 추적 엔진 (시뮬레이션 없는 순수 영상 픽셀 분석)]
-    // 업로드된 영상이나 실시간 카메라 화면에서 흰공(WHITE), 노란공(YELLOW), 빨간공(RED)의
-    // 실제 좌표를 추출하고, 수구 이동 궤적·쿠션 충돌·적구 타격을 판독합니다.
+    // [3. 브라우저 내장 실시간 AI 3구 클러스터 추적 & 3쿠션 인과 판독 엔진]
+    // 로컬 파이썬 서버와 동일하게 파란색 라사지 내측 쿠션 경계를 자동 캘리브레이션하고,
+    // 2D 연결 블롭(Blob) 클러스터링 + 유색구 반사광 차폐 + 수구↔1적구 충돌 스왑 방어 + 관성 법칙 1적구 판정을 수행합니다.
     // ------------------------------------------------------------------
     const browserVisionState = {
       balls: {
-        WHITE: { x: 160, y: 180, vx: 0, vy: 0, detected: false },
-        YELLOW: { x: 460, y: 180, vx: 0, vy: 0, detected: false },
-        RED: { x: 320, y: 120, vx: 0, vy: 0, detected: false },
+        WHITE: { x: 0, y: 0, prevX: 0, prevY: 0, vx: 0, vy: 0, speed: 0, detected: false, missing: 0 },
+        YELLOW: { x: 0, y: 0, prevX: 0, prevY: 0, vx: 0, vy: 0, speed: 0, detected: false, missing: 0 },
+        RED: { x: 0, y: 0, prevX: 0, prevY: 0, vx: 0, vy: 0, speed: 0, detected: false, missing: 0 },
+      },
+      restPos: {
+        WHITE: null,
+        YELLOW: null,
+        RED: null,
       },
       trail: [],
       fsmState: 'WAIT_SHOT',
+      shotId: 1,
+      activeCueColor: 'WHITE',
       cushionCount: 0,
+      cushionsBeforeFirstHit: 0,
+      cushionsBeforeSecondHit: 0,
+      minRailDistBeforeFirstHit: 999,
       lastCushionSide: '',
       lastCushionFrame: -20,
+      firstTargetBall: null,
+      secondTargetBall: null,
       hitBalls: [],
       firstContactIsCushion: false,
       firstContactDecided: false,
@@ -4203,22 +4228,203 @@
       stillFrames: 0,
       frameCounter: 0,
       shotActiveFrames: 0,
-      cooldownFrames: 10,
-      tableBounds: { left: 38, right: 602, top: 34, bottom: 326 },
+      cooldownFrames: 8,
+      tableBounds: { left: 66, right: 574, top: 44, bottom: 312 },
+      boundsCalibrated: false,
     };
 
     function resetBrowserVisionShotState() {
       browserVisionState.trail = [];
       browserVisionState.fsmState = 'WAIT_SHOT';
       browserVisionState.cushionCount = 0;
+      browserVisionState.cushionsBeforeFirstHit = 0;
+      browserVisionState.cushionsBeforeSecondHit = 0;
+      browserVisionState.minRailDistBeforeFirstHit = 999;
       browserVisionState.lastCushionSide = '';
       browserVisionState.lastCushionFrame = -20;
+      browserVisionState.firstTargetBall = null;
+      browserVisionState.secondTargetBall = null;
       browserVisionState.hitBalls = [];
       browserVisionState.firstContactIsCushion = false;
       browserVisionState.firstContactDecided = false;
       browserVisionState.movingFrames = 0;
       browserVisionState.stillFrames = 0;
       browserVisionState.shotActiveFrames = 0;
+      ['WHITE', 'YELLOW', 'RED'].forEach((k) => {
+        const b = browserVisionState.balls[k];
+        if (b.detected) {
+          browserVisionState.restPos[k] = { x: b.x, y: b.y };
+        }
+      });
+    }
+
+    function calibrateTableBoundsFromCloth(imgData, W, H) {
+      const colBlue = new Int32Array(W);
+      const rowBlue = new Int32Array(H);
+      const step = 4;
+      for (let y = 12; y < H - 12; y += step) {
+        for (let x = 12; x < W - 12; x += step) {
+          const i = (y * W + x) * 4;
+          const r = imgData[i];
+          const g = imgData[i + 1];
+          const b = imgData[i + 2];
+          if (b > r + 35 && b > g + 10 && b > 95) {
+            colBlue[x] += 1;
+            rowBlue[y] += 1;
+          }
+        }
+      }
+      const minColHits = Math.max(8, Math.floor(((H - 24) / step) * 0.36));
+      const minRowHits = Math.max(14, Math.floor(((W - 24) / step) * 0.36));
+
+      let left = 0;
+      let right = W - 1;
+      let top = 0;
+      let bottom = H - 1;
+
+      for (let x = 12; x < W - 12; x += step) {
+        if (colBlue[x] >= minColHits) {
+          left = x;
+          break;
+        }
+      }
+      for (let x = W - 16; x >= 12; x -= step) {
+        if (colBlue[x] >= minColHits) {
+          right = x;
+          break;
+        }
+      }
+      for (let y = 12; y < H - 12; y += step) {
+        if (rowBlue[y] >= minRowHits) {
+          top = y;
+          break;
+        }
+      }
+      for (let y = H - 16; y >= 12; y -= step) {
+        if (rowBlue[y] >= minRowHits) {
+          bottom = y;
+          break;
+        }
+      }
+
+      if (right - left >= W * 0.55 && bottom - top >= H * 0.45) {
+        // 외곽 파란 레일 폭(약 8px)만큼 안쪽이 실제 당구공 중심이 닿는 내측 쿠션 코(Nose) 경계
+        const insetX = 9;
+        const insetY = 9;
+        const newBounds = {
+          left: left + insetX,
+          right: right - insetX,
+          top: top + insetY,
+          bottom: bottom - insetY,
+        };
+        if (!browserVisionState.boundsCalibrated) {
+          browserVisionState.tableBounds = newBounds;
+          browserVisionState.boundsCalibrated = true;
+        } else {
+          const tb = browserVisionState.tableBounds;
+          tb.left = tb.left * 0.85 + newBounds.left * 0.15;
+          tb.right = tb.right * 0.85 + newBounds.right * 0.15;
+          tb.top = tb.top * 0.85 + newBounds.top * 0.15;
+          tb.bottom = tb.bottom * 0.85 + newBounds.bottom * 0.15;
+        }
+      }
+    }
+
+    function clusterPointsIntoBlobs(pts, maxLinkDist = 6.5) {
+      const n = pts.length;
+      if (n === 0) return [];
+      const visited = new Uint8Array(n);
+      const blobs = [];
+
+      for (let i = 0; i < n; i++) {
+        if (visited[i]) continue;
+        visited[i] = 1;
+        const queue = [i];
+        let sumX = 0;
+        let sumY = 0;
+        let sumW = 0;
+        let minX = 9999;
+        let maxX = -9999;
+        let minY = 9999;
+        let maxY = -9999;
+        let count = 0;
+
+        while (queue.length > 0) {
+          const curIdx = queue.pop();
+          const p = pts[curIdx];
+          sumX += p.x * p.w;
+          sumY += p.y * p.w;
+          sumW += p.w;
+          if (p.x < minX) minX = p.x;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.y > maxY) maxY = p.y;
+          count += 1;
+
+          for (let j = 0; j < n; j++) {
+            if (visited[j]) continue;
+            const q = pts[j];
+            if (Math.abs(p.x - q.x) <= maxLinkDist && Math.abs(p.y - q.y) <= maxLinkDist) {
+              visited[j] = 1;
+              queue.push(j);
+            }
+          }
+        }
+
+        const spanX = maxX - minX + 2;
+        const spanY = maxY - minY + 2;
+        const maxSpan = Math.max(spanX, spanY);
+        const minSpan = Math.max(2, Math.min(spanX, spanY));
+        const aspect = maxSpan / minSpan;
+
+        // 당구공 크기(지름 약 10~16px)에 부합하고 길쭉한 큐대/손이 아닌 원형 블롭만 채택
+        if (count >= 2 && count <= 75 && maxSpan <= 28 && aspect <= 2.4) {
+          blobs.push({
+            x: sumX / sumW,
+            y: sumY / sumW,
+            count,
+            score: sumW,
+            aspect,
+          });
+        }
+      }
+      return blobs;
+    }
+
+    function pickBestBlobForChannel(blobs, ballState, excludedCenters, nearCollision) {
+      if (!blobs || blobs.length === 0) return null;
+      let best = null;
+      let bestScore = -1e9;
+      const predX = ballState.detected ? ballState.x + (nearCollision ? 0 : ballState.vx * 0.85) : 0;
+      const predY = ballState.detected ? ballState.y + (nearCollision ? 0 : ballState.vy * 0.85) : 0;
+
+      for (const b of blobs) {
+        // 이미 확정된 다른 색 공 중심(11px 이내)과 겹치는 반사광 블롭은 철저히 배제
+        let tooCloseToOther = false;
+        for (const ex of excludedCenters) {
+          if (Math.hypot(b.x - ex.x, b.y - ex.y) < 11.5) {
+            tooCloseToOther = true;
+            break;
+          }
+        }
+        if (tooCloseToOther) continue;
+
+        const sizeDiff = Math.abs(b.count - 14);
+        let sc = b.score * 2.2 - sizeDiff * 1.5 - (b.aspect - 1.0) * 8.0;
+        if (ballState.detected) {
+          const dPrev = Math.hypot(b.x - ballState.x, b.y - ballState.y);
+          const dPred = Math.hypot(b.x - predX, b.y - predY);
+          const d = nearCollision ? dPrev : Math.min(dPrev, dPred);
+          const maxGate = 95 + ballState.missing * 45;
+          if (d > maxGate && ballState.missing < 12) continue;
+          sc -= d * 1.35;
+        }
+        if (sc > bestScore) {
+          bestScore = sc;
+          best = b;
+        }
+      }
+      return best;
     }
 
     function detectTableAndBallsOnOffscreen(videoEl, W, H) {
@@ -4235,125 +4441,280 @@
       }
       const imgData = offscreenVisionCtx.getImageData(0, 0, W, H).data;
 
-      let minTableX = W * 0.06;
-      let maxTableX = W * 0.94;
-      let minTableY = H * 0.09;
-      let maxTableY = H * 0.91;
+      if (!browserVisionState.boundsCalibrated || browserVisionState.frameCounter % 30 === 0) {
+        calibrateTableBoundsFromCloth(imgData, W, H);
+      }
 
-      let sumW = { x: 0, y: 0, w: 0 };
-      let sumY = { x: 0, y: 0, w: 0 };
-      let sumR = { x: 0, y: 0, w: 0 };
+      const bounds = browserVisionState.tableBounds;
+      const scanLeft = Math.max(8, Math.floor(bounds.left - 4));
+      const scanRight = Math.min(W - 8, Math.ceil(bounds.right + 4));
+      const scanTop = Math.max(8, Math.floor(bounds.top - 4));
+      const scanBottom = Math.min(H - 8, Math.ceil(bounds.bottom + 4));
 
-      const prevW = browserVisionState.balls.WHITE;
-      const prevY = browserVisionState.balls.YELLOW;
-      const prevR = browserVisionState.balls.RED;
+      const ptsR = [];
+      const ptsY = [];
+      const ptsW = [];
 
-      const step = 4;
-      for (let y = Math.floor(minTableY); y <= Math.floor(maxTableY); y += step) {
-        for (let x = Math.floor(minTableX); x <= Math.floor(maxTableX); x += step) {
+      const step = 2;
+      for (let y = scanTop; y <= scanBottom; y += step) {
+        for (let x = scanLeft; x <= scanRight; x += step) {
           const i = (y * W + x) * 4;
           const r = imgData[i];
           const g = imgData[i + 1];
           const b = imgData[i + 2];
 
-          // 파란색/초록색 당구대 바닥 픽셀은 스킵
-          if (b > r + 22 && b > g + 8) continue;
-          if (g > r + 22 && g > b + 12) continue;
+          // 파란색/초록색 당구대 바닥 픽셀 스킵
+          if (b > r + 18 && b > g + 6) continue;
+          if (g > r + 20 && g > b + 12) continue;
 
-          // 빨간공 (RED): R이 높고 G, B가 낮음
-          if (r > 145 && g < 95 && b < 95 && r - Math.max(g, b) > 60) {
-            const distPenalty = prevR.detected ? Math.hypot(x - prevR.x, y - prevR.y) : 0;
-            const weight = distPenalty < 160 ? 2.5 : 1.0;
-            sumR.x += x * weight;
-            sumR.y += y * weight;
-            sumR.w += weight;
+          const maxC = Math.max(r, g, b);
+          const minC = Math.min(r, g, b);
+          if (maxC < 95) continue;
+
+          // 1) 빨간공 (RED): R이 강하고 G, B 대비 적색 편차가 큼
+          const redDiff = r - Math.max(g, b);
+          if (r >= 130 && redDiff >= 42 && g < 115 && b < 115) {
+            ptsR.push({ x, y, w: 1.0 + redDiff * 0.02 });
           }
-          // 노란공 (YELLOW): R, G가 높고 B가 낮음
-          else if (r > 165 && g > 135 && b < 125 && Math.min(r, g) - b > 50) {
-            const distPenalty = prevY.detected ? Math.hypot(x - prevY.x, y - prevY.y) : 0;
-            const weight = distPenalty < 160 ? 2.5 : 1.0;
-            sumY.x += x * weight;
-            sumY.y += y * weight;
-            sumY.w += weight;
+          // 2) 노란공 (YELLOW): R, G가 모두 높고 B가 낮음
+          else if (r >= 145 && g >= 115 && b < 135 && Math.min(r, g) - b >= 32) {
+            const yelDiff = Math.min(r, g) - b;
+            ptsY.push({ x, y, w: 1.0 + yelDiff * 0.02 });
           }
-          // 흰공 (WHITE): R, G, B 모두 밝고 채도 차이가 작음
-          else if (r > 200 && g > 200 && b > 195 && Math.max(r, g, b) - Math.min(r, g, b) < 38) {
-            const distPenalty = prevW.detected ? Math.hypot(x - prevW.x, y - prevW.y) : 0;
-            const weight = distPenalty < 160 ? 2.5 : 1.0;
-            sumW.x += x * weight;
-            sumW.y += y * weight;
-            sumW.w += weight;
+          // 3) 흰공 (WHITE): R, G, B 모두 밝고 채도 편차가 낮음
+          else if (r >= 170 && g >= 170 && b >= 158 && maxC - minC <= 46) {
+            ptsW.push({ x, y, w: 1.0 + (minC - 150) * 0.02 });
           }
         }
       }
 
-      const bounds = {
-        left: minTableX + 12,
-        right: maxTableX - 12,
-        top: minTableY + 12,
-        bottom: maxTableY - 12,
-      };
-      browserVisionState.tableBounds = bounds;
+      const blobsR = clusterPointsIntoBlobs(ptsR, 5.0);
+      const blobsY = clusterPointsIntoBlobs(ptsY, 5.0);
 
-      const alpha = 0.58;
-      const updateBall = (key, sum) => {
-        const b = browserVisionState.balls[key];
-        if (sum.w >= 3) {
-          const nx = Math.max(bounds.left, Math.min(bounds.right, sum.x / sum.w));
-          const ny = Math.max(bounds.top, Math.min(bounds.bottom, sum.y / sum.w));
-          const ox = b.detected ? b.x : nx;
-          const oy = b.detected ? b.y : ny;
-          const sx = ox + (nx - ox) * alpha;
-          const sy = oy + (ny - oy) * alpha;
-          b.vx = sx - ox;
-          b.vy = sy - oy;
-          b.x = sx;
-          b.y = sy;
-          b.detected = true;
-        } else {
-          b.vx = 0;
-          b.vy = 0;
-          b.detected = false;
+      const bR = browserVisionState.balls.RED;
+      const bY = browserVisionState.balls.YELLOW;
+      const bW = browserVisionState.balls.WHITE;
+
+      const nearCollisionRY = bR.detected && bY.detected && Math.hypot(bR.x - bY.x, bR.y - bY.y) <= 32;
+      const chosenR = pickBestBlobForChannel(blobsR, bR, [], nearCollisionRY);
+      const excludedForY = chosenR ? [{ x: chosenR.x, y: chosenR.y }] : [];
+      const chosenY = pickBestBlobForChannel(blobsY, bY, excludedForY, nearCollisionRY);
+
+      // RED / YELLOW로 확정된 공 반경(9.5px) 내부의 조명 하이라이트 픽셀은 WHITE 후보에서 원천 제거!
+      const excludedForW = [];
+      if (chosenR) excludedForW.push({ x: chosenR.x, y: chosenR.y });
+      else if (bR.detected) excludedForW.push({ x: bR.x, y: bR.y });
+      if (chosenY) excludedForW.push({ x: chosenY.x, y: chosenY.y });
+      else if (bY.detected) excludedForW.push({ x: bY.x, y: bY.y });
+
+      const filteredPtsW = ptsW.filter((p) =>
+        excludedForW.every((ex) => Math.hypot(p.x - ex.x, p.y - ex.y) >= 9.5)
+      );
+      const blobsW = clusterPointsIntoBlobs(filteredPtsW, 5.0);
+      const nearCollisionW =
+        bW.detected &&
+        excludedForW.some((ex) => Math.hypot(bW.x - ex.x, bW.y - ex.y) <= 34);
+      const chosenW = pickBestBlobForChannel(blobsW, bW, excludedForW, nearCollisionW);
+
+      const wasStationaryPre = {
+        WHITE: bW.speed < 0.85,
+        YELLOW: bY.speed < 0.85,
+        RED: bR.speed < 0.85,
+      };
+      const prePos = {
+        WHITE: { x: bW.x, y: bW.y, detected: bW.detected },
+        YELLOW: { x: bY.x, y: bY.y, detected: bY.detected },
+        RED: { x: bR.x, y: bR.y, detected: bR.detected },
+      };
+
+      const applyBlobUpdate = (key, blob) => {
+        const st = browserVisionState.balls[key];
+        if (blob) {
+          const prevX = st.detected ? st.x : blob.x;
+          const prevY = st.detected ? st.y : blob.y;
+          const alpha = st.detected ? 0.78 : 1.0;
+          const nx = prevX + (blob.x - prevX) * alpha;
+          const ny = prevY + (blob.y - prevY) * alpha;
+          st.prevX = prevX;
+          st.prevY = prevY;
+          st.vx = nx - prevX;
+          st.vy = ny - prevY;
+          st.speed = Math.hypot(st.vx, st.vy);
+          st.x = nx;
+          st.y = ny;
+          st.detected = true;
+          st.missing = 0;
+        } else if (st.detected) {
+          st.missing += 1;
+          st.prevX = st.x;
+          st.prevY = st.y;
+          // 정지 공이거나 다른 공과 근접 충돌 중일 때는 관성 투사로 상대 공을 덮어쓰지 않고 제자리 유지
+          const nearOtherNow = ['WHITE', 'YELLOW', 'RED'].some(
+            (ok) =>
+              ok !== key &&
+              browserVisionState.balls[ok].detected &&
+              Math.hypot(st.x - browserVisionState.balls[ok].x, st.y - browserVisionState.balls[ok].y) <= 34
+          );
+          if (st.speed >= 1.6 && st.missing <= 4 && !nearOtherNow) {
+            st.x = Math.max(bounds.left, Math.min(bounds.right, st.x + st.vx * 0.85));
+            st.y = Math.max(bounds.top, Math.min(bounds.bottom, st.y + st.vy * 0.85));
+            st.vx *= 0.85;
+            st.vy *= 0.85;
+            st.speed = Math.hypot(st.vx, st.vy);
+          } else {
+            st.vx = 0;
+            st.vy = 0;
+            st.speed = 0;
+          }
         }
       };
 
-      updateBall('WHITE', sumW);
-      updateBall('YELLOW', sumY);
-      updateBall('RED', sumR);
+      applyBlobUpdate('RED', chosenR);
+      applyBlobUpdate('YELLOW', chosenY);
+      applyBlobUpdate('WHITE', chosenW);
+
+      // [수구 ↔ 1적구 충돌 시 ID 스왑 방어 가드]
+      // 주행 중이던 수구가 정지해 있던 1적구를 정면 타격한 직후,
+      // 1적구 라벨은 제자리에 머물고 수구 라벨이 법선 방향으로 튀어나간 경우 즉시 두 공 좌표를 역스왑!
+      if (browserVisionState.fsmState === 'SHOT_IN_PROGRESS') {
+        const cueKey = browserVisionState.activeCueColor || 'WHITE';
+        const cueSt = browserVisionState.balls[cueKey];
+        const preCue = prePos[cueKey];
+        if (cueSt.detected && preCue && preCue.detected) {
+          for (const targetKey of ['WHITE', 'YELLOW', 'RED']) {
+            if (targetKey === cueKey || !wasStationaryPre[targetKey]) continue;
+            const tarSt = browserVisionState.balls[targetKey];
+            const preTar = prePos[targetKey];
+            if (!tarSt.detected || !preTar || !preTar.detected) continue;
+            const dxPre = preTar.x - preCue.x;
+            const dyPre = preTar.y - preCue.y;
+            const distPre = Math.hypot(dxPre, dyPre);
+            if (distPre > 1e-3 && distPre <= 38) {
+              const nx = dxPre / distPre;
+              const ny = dyPre / distPre;
+              const tarStayDist = Math.hypot(tarSt.x - preTar.x, tarSt.y - preTar.y);
+              const cueDepartX = cueSt.x - preTar.x;
+              const cueDepartY = cueSt.y - preTar.y;
+              const cueDepartDist = Math.hypot(cueDepartX, cueDepartY);
+              const cueDepartCos =
+                cueDepartDist > 1e-3 ? (cueDepartX * nx + cueDepartY * ny) / cueDepartDist : 0;
+              if (
+                tarStayDist <= 6.5 &&
+                cueDepartDist >= 4.0 &&
+                cueDepartCos >= 0.72 &&
+                cueSt.speed > Math.max(1.5, tarSt.speed * 1.4)
+              ) {
+                const tmpX = cueSt.x;
+                const tmpY = cueSt.y;
+                cueSt.x = tarSt.x;
+                cueSt.y = tarSt.y;
+                cueSt.vx = cueSt.x - preCue.x;
+                cueSt.vy = cueSt.y - preCue.y;
+                cueSt.speed = Math.hypot(cueSt.vx, cueSt.vy);
+
+                tarSt.x = tmpX;
+                tarSt.y = tmpY;
+                tarSt.vx = tarSt.x - preTar.x;
+                tarSt.vy = tarSt.y - preTar.y;
+                tarSt.speed = Math.hypot(tarSt.vx, tarSt.vy);
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    function segmentToSegmentMinDist(ax, ay, bx, by, cx, cy, dx, dy) {
+      let minD = 9999;
+      const steps = 6;
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const px = ax + (bx - ax) * t;
+        const py = ay + (by - ay) * t;
+        const qx = cx + (dx - cx) * t;
+        const qy = cy + (dy - cy) * t;
+        const d = Math.hypot(px - qx, py - qy);
+        if (d < minD) minD = d;
+      }
+      return minD;
     }
 
     function stepBrowserVisionFSM() {
       browserVisionState.frameCounter += 1;
       const st = lastScoreboardData || cloudState;
-      const activeId = st.active_player_id || 'P1';
-      const activeP = st.players[activeId];
-      const cueColor = (activeP && activeP.cue_ball_color) || 'WHITE';
-      const otherColor = cueColor === 'WHITE' ? 'YELLOW' : 'WHITE';
-
-      const cueBall = browserVisionState.balls[cueColor];
-      const objBall1 = browserVisionState.balls[otherColor];
-      const objBall2 = browserVisionState.balls.RED;
-      const speed = Math.hypot(cueBall.vx, cueBall.vy);
       const bounds = browserVisionState.tableBounds;
 
-      // 대기 상태(WAIT_SHOT) -> 실제 수구 움직임이 감지될 때만 샷 진행 진입
+      // 대기 상태(WAIT_SHOT) -> 정지 앵커(restPos) 갱신 및 실제 출발한 수구(WHITE/YELLOW) 감지
       if (browserVisionState.fsmState === 'WAIT_SHOT') {
+        ['WHITE', 'YELLOW', 'RED'].forEach((k) => {
+          const b = browserVisionState.balls[k];
+          if (!b.detected) return;
+          if (!browserVisionState.restPos[k]) {
+            browserVisionState.restPos[k] = { x: b.x, y: b.y };
+          } else if (b.speed < 0.9) {
+            browserVisionState.restPos[k].x = browserVisionState.restPos[k].x * 0.85 + b.x * 0.15;
+            browserVisionState.restPos[k].y = browserVisionState.restPos[k].y * 0.85 + b.y * 0.15;
+          }
+        });
+
         if (browserVisionState.cooldownFrames > 0) {
           browserVisionState.cooldownFrames -= 1;
           return;
         }
-        if (cueBall.detected && speed > 1.8) {
+
+        const activeId = st.active_player_id || 'P1';
+        const expectedColor =
+          (st.players && st.players[activeId] && st.players[activeId].cue_ball_color) || 'WHITE';
+
+        let movingCandidate = null;
+        for (const candKey of [expectedColor, expectedColor === 'WHITE' ? 'YELLOW' : 'WHITE']) {
+          const b = browserVisionState.balls[candKey];
+          const anchor = browserVisionState.restPos[candKey];
+          if (!b.detected || !anchor) continue;
+          const disp = Math.hypot(b.x - anchor.x, b.y - anchor.y);
+          if (b.speed >= 1.35 && disp >= 4.2) {
+            movingCandidate = candKey;
+            break;
+          }
+        }
+
+        if (movingCandidate) {
           browserVisionState.movingFrames += 1;
           if (browserVisionState.movingFrames >= 2) {
             browserVisionState.fsmState = 'SHOT_IN_PROGRESS';
-            browserVisionState.trail = [{ x: cueBall.x, y: cueBall.y }];
+            browserVisionState.shotId = Date.now();
+            browserVisionState.activeCueColor = movingCandidate;
+
+            // 출발한 수구 색상에 맞춰 공격 선수 자동 동기화 (WHITE=P1, YELLOW=P2)
+            const targetPlayerId = movingCandidate === 'YELLOW' ? 'P2' : 'P1';
+            if (st.active_player_id !== targetPlayerId) {
+              st.active_player_id = targetPlayerId;
+              if (targetPlayerId === 'P2' && (st.players.P2.innings || 0) === 0) {
+                st.players.P2.innings = 1;
+              }
+            }
+
+            const cueB = browserVisionState.balls[movingCandidate];
+            const ancB = browserVisionState.restPos[movingCandidate] || { x: cueB.x, y: cueB.y };
+            browserVisionState.trail = [
+              { x: ancB.x, y: ancB.y },
+              { x: cueB.x, y: cueB.y },
+            ];
             browserVisionState.cushionCount = 0;
+            browserVisionState.cushionsBeforeFirstHit = 0;
+            browserVisionState.cushionsBeforeSecondHit = 0;
+            browserVisionState.minRailDistBeforeFirstHit = 999;
+            browserVisionState.lastCushionSide = '';
+            browserVisionState.lastCushionFrame = browserVisionState.frameCounter;
+            browserVisionState.firstTargetBall = null;
+            browserVisionState.secondTargetBall = null;
             browserVisionState.hitBalls = [];
             browserVisionState.firstContactIsCushion = false;
             browserVisionState.firstContactDecided = false;
             browserVisionState.stillFrames = 0;
             browserVisionState.shotActiveFrames = 0;
-            syncBrowserVisionToScoreboard();
+            syncBrowserVisionToScoreboard(true);
           }
         } else {
           browserVisionState.movingFrames = 0;
@@ -4363,85 +4724,166 @@
 
       if (browserVisionState.fsmState === 'SHOT_IN_PROGRESS') {
         browserVisionState.shotActiveFrames += 1;
+        const cueColor = browserVisionState.activeCueColor || 'WHITE';
+        const otherColor = cueColor === 'WHITE' ? 'YELLOW' : 'WHITE';
+        const targetKeys = [otherColor, 'RED'];
+
+        const cueBall = browserVisionState.balls[cueColor];
+        const maxBallSpeed = Math.max(
+          browserVisionState.balls.WHITE.speed || 0,
+          browserVisionState.balls.YELLOW.speed || 0,
+          browserVisionState.balls.RED.speed || 0
+        );
+
         if (cueBall.detected) {
           browserVisionState.trail.push({ x: cueBall.x, y: cueBall.y });
-          if (browserVisionState.trail.length > 75) browserVisionState.trail.shift();
+          if (browserVisionState.trail.length > 90) browserVisionState.trail.shift();
+
+          if (!browserVisionState.firstTargetBall) {
+            const dRailNow = Math.min(
+              Math.abs(cueBall.x - bounds.left),
+              Math.abs(bounds.right - cueBall.x),
+              Math.abs(cueBall.y - bounds.top),
+              Math.abs(bounds.bottom - cueBall.y)
+            );
+            const ancCue = browserVisionState.restPos[cueColor];
+            const dispFromStart = ancCue ? Math.hypot(cueBall.x - ancCue.x, cueBall.y - ancCue.y) : 99;
+            if (dispFromStart >= 9 && dRailNow < browserVisionState.minRailDistBeforeFirstHit) {
+              browserVisionState.minRailDistBeforeFirstHit = dRailNow;
+            }
+          }
         }
 
-        // 1) 실제 영상 픽셀 기반 적구 충돌(Kiss) 검사
-        const checkObjHit = (label, targetBall) => {
-          if (!cueBall.detected || !targetBall.detected || browserVisionState.hitBalls.includes(label)) {
-            return false;
-          }
-          const dist = Math.hypot(cueBall.x - targetBall.x, cueBall.y - targetBall.y);
-          if (dist <= 34) {
-            browserVisionState.hitBalls.push(label);
-            if (!browserVisionState.firstContactDecided) {
+        // 1) 적구 충돌 판정 (서브프레임 최단 거리 <= 21px OR 관성의 법칙에 따른 정지 적구 이탈 >= 3.8px)
+        let hitAnyTargetThisFrame = false;
+        for (const tKey of targetKeys) {
+          if (browserVisionState.hitBalls.includes(tKey)) continue;
+          const tBall = browserVisionState.balls[tKey];
+          if (!tBall.detected) continue;
+
+          const dSub = cueBall.detected
+            ? segmentToSegmentMinDist(
+                cueBall.prevX || cueBall.x,
+                cueBall.prevY || cueBall.y,
+                cueBall.x,
+                cueBall.y,
+                tBall.prevX || tBall.x,
+                tBall.prevY || tBall.y,
+                tBall.x,
+                tBall.y
+              )
+            : 999;
+
+          const tAnchor = browserVisionState.restPos[tKey];
+          const dispFromRest = tAnchor ? Math.hypot(tBall.x - tAnchor.x, tBall.y - tAnchor.y) : 0;
+
+          // 관성의 법칙: 제1적구 피격 전 정지해 있던 적구가 3.8px 이상 움직이면 100% 수구가 1적구를 충돌한 것!
+          const inertiaFirstHit =
+            !browserVisionState.firstTargetBall && dispFromRest >= 3.8 && tBall.speed >= 0.85;
+          const directHit = dSub <= 21.5 && (dispFromRest >= 2.2 || cueBall.speed >= 1.2);
+
+          if (directHit || inertiaFirstHit) {
+            browserVisionState.hitBalls.push(tKey);
+            hitAnyTargetThisFrame = true;
+            if (!browserVisionState.firstTargetBall) {
+              browserVisionState.firstTargetBall = tKey;
+              // 수구가 쿠션에 실제로 닿지 않았는데(minRailDist > 12px) 1적구가 맞았다면 선행 쿠션 오탐을 0으로 강제 초기화!
+              if (browserVisionState.minRailDistBeforeFirstHit > 12.5) {
+                if (browserVisionState.cushionsBeforeFirstHit > 0) {
+                  browserVisionState.cushionCount = Math.max(
+                    0,
+                    browserVisionState.cushionCount - browserVisionState.cushionsBeforeFirstHit
+                  );
+                }
+                browserVisionState.cushionsBeforeFirstHit = 0;
+                browserVisionState.firstContactIsCushion = false;
+              } else {
+                browserVisionState.firstContactIsCushion = browserVisionState.cushionsBeforeFirstHit >= 1;
+              }
               browserVisionState.firstContactDecided = true;
-              browserVisionState.firstContactIsCushion = false;
+            } else if (!browserVisionState.secondTargetBall) {
+              browserVisionState.secondTargetBall = tKey;
+              browserVisionState.cushionsBeforeSecondHit = browserVisionState.cushionCount;
             }
-            return true;
           }
-          return false;
-        };
+        }
 
-        const hitOther = checkObjHit(otherColor, objBall1);
-        const hitRed = checkObjHit('RED', objBall2);
-
-        // 2) 실제 영상 픽셀 기반 쿠션(레일) 충돌 검사
-        let hitSide = '';
+        // 2) 쿠션(레일) 반사 감지 (미타격 적구 반경 24px 이내에서는 1적구 충돌 굴절이 쿠션으로 오인되지 않도록 억제)
+        let nearUnhitTarget = false;
         if (cueBall.detected) {
-          if (cueBall.x <= bounds.left + 14) hitSide = 'LEFT';
-          else if (cueBall.x >= bounds.right - 14) hitSide = 'RIGHT';
-          else if (cueBall.y <= bounds.top + 14) hitSide = 'TOP';
-          else if (cueBall.y >= bounds.bottom - 14) hitSide = 'BOTTOM';
+          for (const tKey of targetKeys) {
+            if (browserVisionState.hitBalls.includes(tKey)) continue;
+            const tb = browserVisionState.balls[tKey];
+            if (tb.detected && Math.hypot(cueBall.x - tb.x, cueBall.y - tb.y) <= 24) {
+              nearUnhitTarget = true;
+              break;
+            }
+          }
+        }
+
+        let hitSide = '';
+        if (cueBall.detected && !hitAnyTargetThisFrame && !nearUnhitTarget) {
+          const margin = 11.5;
+          if (cueBall.x <= bounds.left + margin) hitSide = 'LEFT';
+          else if (cueBall.x >= bounds.right - margin) hitSide = 'RIGHT';
+          else if (cueBall.y <= bounds.top + margin) hitSide = 'TOP';
+          else if (cueBall.y >= bounds.bottom - margin) hitSide = 'BOTTOM';
         }
 
         if (
           hitSide &&
-          !hitOther &&
-          !hitRed &&
-          browserVisionState.hitBalls.length < 2 &&
+          !browserVisionState.secondTargetBall &&
           (hitSide !== browserVisionState.lastCushionSide ||
-            browserVisionState.frameCounter - browserVisionState.lastCushionFrame > 10)
+            browserVisionState.frameCounter - browserVisionState.lastCushionFrame > 8)
         ) {
           browserVisionState.cushionCount += 1;
           browserVisionState.lastCushionSide = hitSide;
           browserVisionState.lastCushionFrame = browserVisionState.frameCounter;
-          if (!browserVisionState.firstContactDecided && browserVisionState.hitBalls.length === 0) {
+          if (!browserVisionState.firstTargetBall) {
+            browserVisionState.cushionsBeforeFirstHit = browserVisionState.cushionCount;
             browserVisionState.firstContactDecided = true;
             browserVisionState.firstContactIsCushion = true;
+          } else {
+            browserVisionState.cushionsBeforeSecondHit = browserVisionState.cushionCount;
           }
         }
 
-        // 3) 3쿠션 이상 + 제1적구·제2적구 모두 타격 시 즉시 득점 판정
-        if (browserVisionState.hitBalls.length >= 2 && browserVisionState.cushionCount >= 3) {
-          const isBank = browserVisionState.firstContactIsCushion;
-          const delta = isBank ? 2 : 1;
-          syncBrowserVisionToScoreboard();
+        // 3) 제2적구 충돌 즉시 득점/실패 판정
+        if (browserVisionState.secondTargetBall && browserVisionState.cushionCount >= 3) {
+          const isBank = browserVisionState.cushionsBeforeFirstHit >= 1;
+          const delta = isBank && st.rule_mode === 'PBA' ? 2 : 1;
+          const activeId = st.active_player_id || 'P1';
           applyLocalCloudAction('ADJUST_SCORE', {
             player_id: activeId,
             delta,
+            is_bank: isBank,
+            shot_id: browserVisionState.shotId,
+            cushions_before_first_hit: browserVisionState.cushionsBeforeFirstHit,
+            cushions_before_second_hit: browserVisionState.cushionCount,
+            total_cushions: browserVisionState.cushionCount,
           });
-          if (isBank) {
-            st.last_shot_result.shot_type = 'BANK_SHOT';
-            st.last_shot_result.message = `뱅크샷 득점 성공 (+2점) — 쿠션 선접촉 후 3쿠션 및 제1·2적구 적중!`;
-            renderScoreboard(st);
-          }
           resetBrowserVisionShotState();
-          browserVisionState.cooldownFrames = 48;
+          browserVisionState.cooldownFrames = 28;
           return;
         }
 
-        // 4) 수구 정지 감지 -> 미스(공격권 교대) 판정
-        if (speed < 0.85) {
+        // 4) 모든 공 정지 확인 -> 미스(공격권 교대) 판정
+        if (maxBallSpeed < 0.75) {
           browserVisionState.stillFrames += 1;
-          if (browserVisionState.stillFrames >= 24) {
-            if (browserVisionState.hitBalls.length > 0 || browserVisionState.cushionCount >= 2) {
-              applyLocalCloudAction('SWITCH_TURN', {});
+          if (browserVisionState.stillFrames >= 14) {
+            if (browserVisionState.hitBalls.length > 0 || browserVisionState.cushionCount >= 1 || browserVisionState.shotActiveFrames >= 8) {
+              applyLocalCloudAction('SWITCH_TURN', {
+                shot_id: browserVisionState.shotId,
+                cushions_before_first_hit: browserVisionState.cushionsBeforeFirstHit,
+                cushions_before_second_hit: browserVisionState.cushionsBeforeSecondHit,
+                total_cushions: browserVisionState.cushionCount,
+                first_ball_hit: Boolean(browserVisionState.firstTargetBall),
+                second_ball_hit: Boolean(browserVisionState.secondTargetBall),
+              });
             }
             resetBrowserVisionShotState();
-            syncBrowserVisionToScoreboard();
+            browserVisionState.cooldownFrames = 12;
+            return;
           }
         } else {
           browserVisionState.stillFrames = 0;
@@ -4453,9 +4895,9 @@
 
     let lastVisionSyncSignature = '';
 
-    function syncBrowserVisionToScoreboard() {
-      const sig = `${browserVisionState.fsmState}|${browserVisionState.cushionCount}|${browserVisionState.hitBalls.join(',')}|${browserVisionState.firstContactIsCushion}`;
-      if (sig === lastVisionSyncSignature) return;
+    function syncBrowserVisionToScoreboard(force = false) {
+      const sig = `${browserVisionState.fsmState}|${browserVisionState.cushionCount}|${browserVisionState.cushionsBeforeFirstHit}|${browserVisionState.hitBalls.join(',')}|${browserVisionState.firstContactIsCushion}`;
+      if (!force && sig === lastVisionSyncSignature) return;
       lastVisionSyncSignature = sig;
 
       const st = lastScoreboardData || cloudState;
@@ -4465,6 +4907,19 @@
         hit_object_balls: [...browserVisionState.hitBalls],
         first_contact_is_cushion: browserVisionState.firstContactIsCushion,
       };
+      if (browserVisionState.fsmState === 'SHOT_IN_PROGRESS') {
+        st.last_shot_result = {
+          shot_id: browserVisionState.shotId,
+          shot_type: 'IN_PROGRESS',
+          is_scored: false,
+          cushions_before_first_hit: browserVisionState.cushionsBeforeFirstHit,
+          cushions_before_second_hit: browserVisionState.cushionsBeforeSecondHit,
+          total_cushions: browserVisionState.cushionCount,
+          first_ball_hit: Boolean(browserVisionState.firstTargetBall),
+          second_ball_hit: Boolean(browserVisionState.secondTargetBall),
+          message: '실시간 추적 중',
+        };
+      }
       renderScoreboard(st);
     }
 
@@ -4472,71 +4927,12 @@
       const ctx = canvasEl.getContext('2d');
       ctx.clearRect(0, 0, W, H);
 
-      // 업로드된 비디오(또는 실시간 카메라) 프레임을 캔버스에 직접 그려 어떤 브라우저에서도 영상이 100% 선명하게 표시되도록 보장
+      // 로컬 서버 화면과 동일하게 불필요한 박스/텍스트 오버레이 없이 깨끗한 원본 영상을 그대로 송출합니다.
       if (videoEl && videoEl.readyState >= 2) {
         try {
           ctx.drawImage(videoEl, 0, 0, W, H);
         } catch (_) {}
       }
-
-      const bounds = browserVisionState.tableBounds;
-      ctx.strokeStyle = 'rgba(56, 189, 248, 0.45)';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(
-        bounds.left,
-        bounds.top,
-        bounds.right - bounds.left,
-        bounds.bottom - bounds.top
-      );
-
-      // 수구 이동 궤적 폴리라인 렌더링
-      if (browserVisionState.trail.length > 1) {
-        ctx.beginPath();
-        browserVisionState.trail.forEach((pt, idx) => {
-          if (idx === 0) ctx.moveTo(pt.x, pt.y);
-          else ctx.lineTo(pt.x, pt.y);
-        });
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.88)';
-        ctx.lineWidth = 3;
-        ctx.stroke();
-      }
-
-      // 3구 바운딩 서클 및 라벨 표시 (실제 감지된 공만 표시)
-      const ballMeta = [
-        { key: 'WHITE', label: 'WHITE', stroke: '#f8fafc', text: '#f8fafc' },
-        { key: 'YELLOW', label: 'YELLOW', stroke: '#fde047', text: '#fde047' },
-        { key: 'RED', label: 'RED', stroke: '#ef4444', text: '#f87171' },
-      ];
-      ballMeta.forEach((m) => {
-        const b = browserVisionState.balls[m.key];
-        if (!b.detected) return;
-        ctx.beginPath();
-        ctx.arc(b.x, b.y, 13, 0, Math.PI * 2);
-        ctx.strokeStyle = m.stroke;
-        ctx.lineWidth = 2.5;
-        ctx.stroke();
-
-        ctx.fillStyle = 'rgba(2, 6, 23, 0.78)';
-        ctx.fillRect(b.x - 24, b.y - 28, 48, 13);
-        ctx.fillStyle = m.text;
-        ctx.font = 'bold 9px JetBrains Mono, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText(m.label, b.x, b.y - 18);
-      });
-
-      // 좌측 상단 HUD 오버레이
-      ctx.textAlign = 'left';
-      ctx.fillStyle = 'rgba(2, 6, 23, 0.78)';
-      ctx.fillRect(14, 44, 340, 26);
-      ctx.fillStyle = '#38bdf8';
-      ctx.font = 'bold 12px Pretendard, sans-serif';
-      const hitCount = browserVisionState.hitBalls.length;
-      const bankTag = browserVisionState.firstContactIsCushion ? ' [뱅크샷 궤적]' : '';
-      ctx.fillText(
-        `AI 비전 실시간 판독 · 쿠션: ${browserVisionState.cushionCount}C · 적구타격: ${hitCount}/2${bankTag}`,
-        22,
-        61
-      );
     }
 
     function startBrowserVisionLoop() {
@@ -4553,14 +4949,13 @@
       const H = 360;
       visionCanvas.width = W;
       visionCanvas.height = H;
+      browserVisionState.boundsCalibrated = false;
 
       function loop() {
         if (clientSourceMode !== 'UPLOAD' && clientSourceMode !== 'CAMERA') return;
         if (localVideo.readyState >= 2) {
           if (!localVideo.paused && !localVideo.ended) {
-            if (browserVisionState.frameCounter % 2 === 0) {
-              detectTableAndBallsOnOffscreen(localVideo, W, H);
-            }
+            detectTableAndBallsOnOffscreen(localVideo, W, H);
             stepBrowserVisionFSM();
           }
           renderBrowserVisionOverlay(visionCanvas, localVideo, W, H);
