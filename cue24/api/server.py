@@ -641,7 +641,7 @@ class LiveStreamReader:
         return out if len(out) == 3 else None
 
     def sync_vision_and_lock_balls_now(
-        self, seek_to_active_shot: bool = True
+        self, seek_to_active_shot: bool = True, rewind_to_start: bool = False
     ) -> Dict[str, Any]:
         """
         [경기 초기화 또는 화면 리플레시 시 즉시 호출]
@@ -673,7 +673,10 @@ class LiveStreamReader:
 
         if self.is_real_video_loaded and self._video_cap is not None:
             is_virtual_drive = str(self.video_path).upper().startswith("J:")
-            if is_virtual_drive and self._latest_raw_frame is not None:
+            if self.camera_index is None and rewind_to_start:
+                self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, raw_frame = self._video_cap.read()
+            elif is_virtual_drive and self._latest_raw_frame is not None and not rewind_to_start:
                 ret = True
                 raw_frame = self._latest_raw_frame
             else:
@@ -686,7 +689,7 @@ class LiveStreamReader:
                 if not ret or raw_frame is None:
                     self._video_cap.set(
                         cv2.CAP_PROP_POS_FRAMES,
-                        0 if is_virtual_drive else self.ACTIVE_SHOT_START_FRAME,
+                        0 if (is_virtual_drive or rewind_to_start) else self.ACTIVE_SHOT_START_FRAME,
                     )
                     ret, raw_frame = self._video_cap.read()
 
@@ -790,10 +793,13 @@ class LiveStreamReader:
     def reset_match_and_vision(self, full_factory_reset: bool = True) -> Dict[str, Any]:
         """
         [경기시작 / 경기 초기화] 클릭 또는 /api/match/reset 호출 시:
-        점수판 전체(점수, 이닝, 타이머, 선수 진영) 초기화와 동시에 비전 추적 엔진 및 3구 색상 잠금을 즉시 재가동합니다.
+        점수판 전체(점수, 이닝, 타이머, 선수 진영) 초기화와 동시에 영상을 처음(0프레임)으로 되감고
+        비전 추적 엔진 및 3구 색상 잠금을 즉시 재가동합니다.
         """
         self.match_manager.reset_match(full_factory_reset=full_factory_reset)
-        return self.sync_vision_and_lock_balls_now(seek_to_active_shot=True)
+        return self.sync_vision_and_lock_balls_now(
+            seek_to_active_shot=False, rewind_to_start=True
+        )
 
     @staticmethod
     def _crop_ball_patch(

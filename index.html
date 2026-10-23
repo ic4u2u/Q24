@@ -3464,7 +3464,7 @@
       }
     }
 
-    // 요구사항 5: [경기시작] 클릭 시 테스트 버전 기준 전체 상태 완벽 초기화, [경기종료], [일시정지]
+    // 요구사항 5: [경기시작] 클릭 시 테스트 버전 기준 전체 상태 완벽 초기화 및 영상 처음부터 플레이, [경기종료], [일시정지]
     async function startMatch() {
       hideVarPopup();
       closePlayerNameModal();
@@ -3480,25 +3480,34 @@
       const elapsedEl = document.getElementById('matchElapsedDigits');
       if (elapsedEl) elapsedEl.textContent = '00:00:00';
 
+      // 업로드된 로컬 영상이 있는 경우 0초(처음)로 되감아 즉시 재생
+      const localVideo = document.getElementById('camLocalVideo');
+      if (localVideo && (clientSourceMode === 'UPLOAD' || localVideo.src)) {
+        restartUploadedVideo();
+        updateVideoPlaybarTime();
+      }
+
       if (clientSourceMode === 'SERVER') {
         try {
           const res = await fetch('/api/match/reset', { method: 'POST' });
           if (res.ok) {
             const data = await res.json();
             renderScoreboard(data);
-            switchToLiveCam();
+            switchToLiveCam(true);
             return;
           }
         } catch (err) {
           if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ action: 'RESET_MATCH' }));
-            switchToLiveCam();
+            switchToLiveCam(true);
             return;
           }
         }
       }
       applyLocalCloudAction('RESET_MATCH', {});
-      switchToLiveCam();
+      if (clientSourceMode === 'SERVER') {
+        switchToLiveCam(true);
+      }
     }
 
     async function endMatch() {
