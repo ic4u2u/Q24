@@ -735,10 +735,9 @@
        당구대 전체(16:9 원본 비율)가 잘리지 않고 한눈에 다 보이면서 위아래 검은 여백이 생기지 않도록 aspect-ratio 고정 */
     .cam-monitor-box {
       width: 100%;
-      aspect-ratio: 16 / 9;
-      flex: 0 1 auto;
-      max-height: 44vh;
-      min-height: 0;
+      flex: 1 1 auto;
+      max-height: 46vh;
+      min-height: 210px;
       background: #020617;
       border: 2px solid #334155;
       border-radius: 14px;
@@ -770,8 +769,9 @@
     .cam-viewport {
       position: relative;
       width: 100%;
-      flex: 1 1 0;
-      min-height: 110px;
+      aspect-ratio: 16 / 9;
+      flex: 1 1 auto;
+      min-height: 150px;
       background: #000000;
       overflow: hidden;
       display: flex;
@@ -784,6 +784,7 @@
     .cam-monitor-box.fullscreen-mode .cam-viewport {
       flex: 1;
       height: 100%;
+      aspect-ratio: auto;
     }
 
     .cam-viewport.is-zoomed {
@@ -808,8 +809,7 @@
     }
 
     .cam-local-video {
-      position: absolute;
-      inset: 0;
+      position: relative;
       width: 100%;
       height: 100%;
       object-fit: contain;
@@ -837,13 +837,50 @@
       display: block !important;
     }
 
+    .cam-empty-guide {
+      position: absolute;
+      inset: 0;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 16px;
+      background: radial-gradient(circle at 50% 50%, #0f172a 0%, #020617 100%);
+      color: #94a3b8;
+      text-align: center;
+      z-index: 3;
+    }
+
+    .cam-empty-guide.show {
+      display: flex;
+    }
+
+    .cam-empty-guide-btn {
+      padding: 8px 16px;
+      border-radius: 10px;
+      border: 1.5px solid #38bdf8;
+      background: rgba(56, 189, 248, 0.18);
+      color: #f8fafc;
+      font-family: 'Chakra Petch', sans-serif;
+      font-size: 0.85rem;
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .cam-empty-guide-btn:hover {
+      background: rgba(56, 189, 248, 0.35);
+      transform: translateY(-1px);
+    }
+
     .cam-stream-img.no-transition,
     .cam-local-video.no-transition,
     .cam-vision-canvas.no-transition {
       transition: none;
     }
 
-    /* 모니터 상단 소스 전환 툴바 ([📁 영상 업로드] / [📷 카메라 연결] / [🎬 시뮬레이션]) */
+    /* 모니터 상단 소스 전환 툴바 ([📁 영상 업로드] / [📷 카메라 연결]) */
     .cam-source-toolbar {
       flex: 0 0 auto;
       display: flex;
@@ -2042,14 +2079,14 @@
 
     <!-- 중앙: 상단 실시간 라이브캠/자동 리플레이 모니터 & 4대 핵심 경기/화면 제어 바 -->
     <section class="center-hub">
-      <!-- 요구사항 5: 기본 비디오 화면에서 누구나 영상 업로드 / 카메라 연결 / 시뮬레이션 전환 가능 -->
+      <!-- 요구사항 5: 기본 비디오 화면에서 누구나 영상 업로드 / 카메라 연결 가능 -->
       <div id="camMonitorBox" class="cam-monitor-box">
-        <!-- 상단 영상 소스 전환 툴바 (Vercel 클라우드 및 로컬 모두에서 즉시 영상 교체/카메라 연결 가능) -->
+        <!-- 상단 영상 소스 전환 툴바 (Vercel 클라우드 및 로컬 모두에서 즉시 영상 업로드/카메라 연결 가능) -->
         <div class="cam-source-toolbar" aria-label="영상 소스 선택 및 업로드 제어">
           <div class="cam-source-btn-group">
             <button
               id="btnSourceUpload"
-              class="cam-source-btn"
+              class="cam-source-btn active"
               onclick="triggerVideoUpload()"
               title="내 PC·스마트폰·태블릿의 당구 영상 파일(MP4/MOV/WebM)을 업로드하여 즉시 AI 판독을 테스트합니다"
             >
@@ -2062,14 +2099,6 @@
               title="웹캠, USB 캡처보드 또는 스마트폰 카메라를 실시간으로 연결합니다"
             >
               📷 카메라 연결
-            </button>
-            <button
-              id="btnSourceDemo"
-              class="cam-source-btn active"
-              onclick="switchToDemoSimMode()"
-              title="샘플 3쿠션 물리 시뮬레이션 화면으로 전환합니다"
-            >
-              🎬 시뮬레이션
             </button>
             <input
               id="videoUploadInput"
@@ -2087,19 +2116,6 @@
               onchange="switchCameraDevice(this.value)"
               title="연결할 카메라 선택"
             ></select>
-            <select
-              id="demoScenarioSelect"
-              class="cam-device-select"
-              onchange="runDemoShotScenario(this.value)"
-              title="시뮬레이션 샷 시나리오 즉시 테스트"
-            >
-              <option value="AUTO">🔄 연속 시연 모드</option>
-              <option value="REGULAR_3C">🎯 일반 3쿠션 득점</option>
-              <option value="BANK_1C">💎 1쿠션 뱅크샷 득점</option>
-              <option value="BANK_3C">💎 3쿠션 뱅크샷 득점</option>
-              <option value="MICRO_HIT">🔬 미세접촉 득점(VAR)</option>
-              <option value="MISS_NEAR">❌ 아슬아슬 공타(턴교대)</option>
-            </select>
           </div>
         </div>
 
@@ -2109,20 +2125,39 @@
             class="cam-stream-img"
             src="/api/video/live"
             alt="CUE24 실시간 당구대 카메라 및 자동 리플레이"
-            onerror="setTimeout(() => { if (currentCamMode === 'LIVE' && clientSourceMode === 'SERVER') switchToLiveCam(); }, 800)"
+            onload="if (clientSourceMode === 'SERVER') { const g = document.getElementById('camEmptyGuide'); if (g) g.classList.remove('show'); }"
+            onerror="if (clientSourceMode === 'SERVER') { this.style.display = 'none'; const g = document.getElementById('camEmptyGuide'); if (g) g.classList.add('show'); }"
           />
           <video
             id="camLocalVideo"
             class="cam-local-video"
             playsinline
+            webkit-playsinline
             muted
           ></video>
           <canvas
             id="camVisionCanvas"
             class="cam-vision-canvas"
           ></canvas>
+          <div id="camEmptyGuide" class="cam-empty-guide">
+            <div style="font-size: 0.9rem; font-weight: 800; color: #e2e8f0;">
+              🎬 당구 영상을 업로드하거나 카메라를 연결해 주세요
+            </div>
+            <div style="font-size: 0.76rem; color: #94a3b8;">
+              MP4 · MOV · WebM 파일을 이 화면에 끌어다 놓아도 즉시 재생됩니다
+            </div>
+            <button
+              type="button"
+              class="cam-empty-guide-btn"
+              onpointerdown="event.stopPropagation()"
+              onpointerup="event.stopPropagation()"
+              onclick="event.stopPropagation(); triggerVideoUpload()"
+            >
+              📁 내 기기에서 당구 영상 선택하기
+            </button>
+          </div>
           <div id="camDropOverlay" class="cam-drop-overlay">
-            📂 여기에 당구 영상 파일(MP4 / MOV / WebM)을 놓으면<br />즉시 영상 교체 및 AI 3쿠션 판독이 시작됩니다!
+            📂 여기에 당구 영상 파일(MP4 / MOV / WebM)을 놓으면<br />즉시 영상 재생 및 AI 3쿠션 판독이 시작됩니다!
           </div>
           <div class="cam-overlay-top">
             <span id="camModeBadge" class="cam-mode-badge">🔴 실시간 화면</span>
@@ -2742,9 +2777,14 @@
         if (clientSourceMode === 'SERVER') {
           const pill = document.getElementById('wsStatusPill');
           const text = document.getElementById('wsStatusText');
-          pill.classList.add('disconnected');
-          text.textContent = '클라우드 모드 전환 중...';
-          startCloudCanvasFallback();
+          if (pill) pill.classList.remove('disconnected');
+          if (text) text.textContent = '영상 업로드 대기 중';
+          const emptyGuide = document.getElementById('camEmptyGuide');
+          if (emptyGuide) emptyGuide.classList.add('show');
+          if (!lastScoreboardData) {
+            lastScoreboardData = cloudState;
+            renderScoreboard(cloudState);
+          }
         }
         setTimeout(connectWebSocket, 4000);
       };
@@ -2901,7 +2941,15 @@
       lastScoreboardData = data;
 
       const streamImgEl = document.getElementById('camStreamImg');
-      if (streamImgEl && currentCamMode === 'LIVE' && streamImgEl.complete && streamImgEl.naturalWidth === 0) {
+      if (
+        clientSourceMode === 'SERVER' &&
+        ws &&
+        ws.readyState === WebSocket.OPEN &&
+        streamImgEl &&
+        currentCamMode === 'LIVE' &&
+        streamImgEl.complete &&
+        streamImgEl.naturalWidth === 0
+      ) {
         switchToLiveCam();
       }
 
@@ -3807,31 +3855,31 @@
     }
 
     // ------------------------------------------------------------------
-    // [입력 소스 전환 UI 상태 업데이트: UPLOAD / CAMERA / DEMO]
+    // [입력 소스 전환 UI 상태 업데이트: UPLOAD / CAMERA / SERVER]
     // ------------------------------------------------------------------
     function updateSourceToolbarUI(mode, statusLabel) {
       clientSourceMode = mode;
       const btnUpload = document.getElementById('btnSourceUpload');
       const btnCamera = document.getElementById('btnSourceCamera');
-      const btnDemo = document.getElementById('btnSourceDemo');
       const camSelect = document.getElementById('cameraDeviceSelect');
-      const demoSelect = document.getElementById('demoScenarioSelect');
       const playBar = document.getElementById('camVideoPlayBar');
       const localVideo = document.getElementById('camLocalVideo');
       const visionCanvas = document.getElementById('camVisionCanvas');
       const streamImg = document.getElementById('camStreamImg');
+      const emptyGuide = document.getElementById('camEmptyGuide');
       const modeBadge = document.getElementById('camModeBadge');
       const shotBadge = document.getElementById('camShotBadge');
 
       if (btnUpload) btnUpload.classList.toggle('active', mode === 'UPLOAD');
       if (btnCamera) btnCamera.classList.toggle('active', mode === 'CAMERA');
-      if (btnDemo) btnDemo.classList.toggle('active', mode === 'DEMO');
 
       if (camSelect) camSelect.style.display = mode === 'CAMERA' ? 'inline-block' : 'none';
-      if (demoSelect) demoSelect.style.display = mode === 'DEMO' ? 'inline-block' : 'none';
       if (playBar) playBar.classList.toggle('show', mode === 'UPLOAD');
 
       if (mode === 'UPLOAD' || mode === 'CAMERA') {
+        if (emptyGuide) {
+          emptyGuide.classList.add('hidden');
+        }
         if (streamImg) {
           streamImg.style.opacity = '0';
           streamImg.style.display = 'none';
@@ -3847,7 +3895,7 @@
         if (modeBadge) {
           modeBadge.classList.remove('replay-mode');
           modeBadge.textContent =
-            mode === 'UPLOAD' ? '🎬 업로드 영상 실시간 시현 중' : '📷 실시간 카메라 AI 시현 중';
+            mode === 'UPLOAD' ? '🎬 업로드 영상 실시간 재생 중' : '📷 실시간 카메라 AI 분석 중';
         }
         if (shotBadge) {
           shotBadge.textContent = 'AI VISION LIVE';
@@ -3892,7 +3940,7 @@
     }
 
     // ------------------------------------------------------------------
-    // [1. 📁 영상 업로드 (파일 선택 + 드래그 앤 드롭 -> 업로드 즉시 자동 재생 및 AI 시현)]
+    // [1. 📁 영상 업로드 (파일 선택 + 드래그 앤 드롭 -> 업로드 즉시 재생 및 실제 영상 분석)]
     // ------------------------------------------------------------------
     function triggerVideoUpload() {
       const input = document.getElementById('videoUploadInput');
@@ -3922,14 +3970,20 @@
       if (!localVideo) return;
 
       const shortName = file.name.length > 20 ? file.name.slice(0, 17) + '...' : file.name;
-      updateSourceToolbarUI('UPLOAD', `업로드 영상 즉시 시현 중 (${shortName})`);
+      updateSourceToolbarUI('UPLOAD', `업로드 영상 재생 중 (${shortName})`);
 
+      // 기존 이벤트 리스너 초기화 및 자동재생 정책 준수를 위한 muted 선지정
+      localVideo.onloadedmetadata = null;
+      localVideo.onloadeddata = null;
+      localVideo.oncanplay = null;
+      localVideo.onerror = null;
+
+      localVideo.pause();
       localVideo.srcObject = null;
-      localVideo.src = uploadedVideoObjectUrl;
-      localVideo.autoplay = true;
+      localVideo.muted = true;
+      localVideo.defaultMuted = true;
       localVideo.playsInline = true;
       localVideo.loop = true;
-      localVideo.muted = true;
       uploadedVideoSpeedIdx = 0;
       localVideo.playbackRate = 1.0;
 
@@ -3938,9 +3992,7 @@
       const playBtn = document.getElementById('btnVideoPlayPause');
       if (playBtn) playBtn.textContent = '⏸ 일시정지';
 
-      // 업로드 즉시 시현 상태 초기화 및 첫 샷 시현 가동
       resetBrowserVisionShotState();
-      browserVisionState.shotCycleIdx = 0;
       browserVisionState.cooldownFrames = 8;
 
       const st = lastScoreboardData || cloudState;
@@ -3948,25 +4000,48 @@
         shot_id: Date.now(),
         shot_type: 'READY',
         is_scored: false,
-        message: `🎬 [${shortName}] 업로드 완료 — 실시간 AI 3쿠션 추적 및 득점 시현을 즉시 시작합니다!`,
+        message: `🎬 [${shortName}] 업로드 완료 — 실제 영상 재생 및 AI 3구 추적을 시작합니다`,
       };
       renderScoreboard(st);
 
-      const startPlaybackAndVision = () => {
+      let hasStarted = false;
+      const startPlaybackSafely = () => {
         updateVideoPlaybarTime();
-        localVideo.play().catch(() => {});
+        if (hasStarted) return;
+        hasStarted = true;
+        const playPromise = localVideo.play();
+        if (playPromise && typeof playPromise.then === 'function') {
+          playPromise
+            .then(() => {
+              if (playBtn) playBtn.textContent = '⏸ 일시정지';
+            })
+            .catch(() => {
+              if (playBtn) playBtn.textContent = '▶ 재생';
+            });
+        }
         startBrowserVisionLoop();
       };
 
-      localVideo.onloadedmetadata = startPlaybackAndVision;
-      localVideo.onloadeddata = startPlaybackAndVision;
-      localVideo.oncanplay = startPlaybackAndVision;
+      localVideo.onloadedmetadata = () => {
+        updateVideoPlaybarTime();
+      };
+      localVideo.onloadeddata = startPlaybackSafely;
+      localVideo.oncanplay = startPlaybackSafely;
       localVideo.ontimeupdate = () => {
         updateVideoPlaybarTime();
       };
+      localVideo.onerror = () => {
+        const errSt = lastScoreboardData || cloudState;
+        errSt.last_shot_result = {
+          shot_id: Date.now(),
+          shot_type: 'READY',
+          is_scored: false,
+          message: `⚠️ [${shortName}] 브라우저에서 지원하지 않는 코덱입니다. MP4(H.264) 또는 WebM 영상을 업로드해 주세요.`,
+        };
+        renderScoreboard(errSt);
+      };
 
-      localVideo.load();
-      startPlaybackAndVision();
+      localVideo.src = uploadedVideoObjectUrl;
     }
 
     function formatSecToMMSS(sec) {
@@ -4084,7 +4159,7 @@
         startBrowserVisionLoop();
       } catch (err) {
         alert(
-          '카메라 권한이 거부되었거나 연결된 카메라를 찾을 수 없습니다.\n파일 업로드([📁 영상 업로드]) 또는 [🎬 시뮬레이션] 모드를 이용해 보세요.'
+          '카메라 권한이 거부되었거나 연결된 카메라를 찾을 수 없습니다.\n[📁 영상 업로드] 버튼으로 당구 영상을 선택해 테스트해 보세요.'
         );
       }
     }
@@ -4096,16 +4171,15 @@
     }
 
     // ------------------------------------------------------------------
-    // [3. 브라우내장 실시간 AI 3구 색상 추적 & 업로드 영상 즉시 시현 엔진]
+    // [3. 브라우저 내장 실시간 AI 3구 색상 추적 엔진 (시뮬레이션 없는 순수 영상 픽셀 분석)]
     // 업로드된 영상이나 실시간 카메라 화면에서 흰공(WHITE), 노란공(YELLOW), 빨간공(RED)의
-    // 중심 좌표를 실시간 추출하고, 영상 재생 즉시 수구 이동 궤적·쿠션 충돌·적구 타격을 생중계 배너와 점수판에 시현합니다.
+    // 실제 좌표를 추출하고, 수구 이동 궤적·쿠션 충돌·적구 타격을 판독합니다.
     // ------------------------------------------------------------------
-    const UPLOAD_DEMO_PATTERNS = ['REGULAR_3C', 'BANK_3C', 'REGULAR_3C', 'BANK_1C', 'MISS_NEAR'];
     const browserVisionState = {
       balls: {
-        WHITE: { x: 160, y: 180, vx: 3.8, vy: -2.6, detected: true },
-        YELLOW: { x: 460, y: 180, vx: 0, vy: 0, detected: true },
-        RED: { x: 320, y: 120, vx: 0, vy: 0, detected: true },
+        WHITE: { x: 160, y: 180, vx: 0, vy: 0, detected: false },
+        YELLOW: { x: 460, y: 180, vx: 0, vy: 0, detected: false },
+        RED: { x: 320, y: 120, vx: 0, vy: 0, detected: false },
       },
       trail: [],
       fsmState: 'WAIT_SHOT',
@@ -4120,7 +4194,6 @@
       frameCounter: 0,
       shotActiveFrames: 0,
       cooldownFrames: 10,
-      shotCycleIdx: 0,
       tableBounds: { left: 38, right: 602, top: 34, bottom: 326 },
     };
 
@@ -4213,7 +4286,7 @@
       browserVisionState.tableBounds = bounds;
 
       const alpha = 0.58;
-      const updateBall = (key, sum, fallbackVx, fallbackVy) => {
+      const updateBall = (key, sum) => {
         const b = browserVisionState.balls[key];
         if (sum.w >= 3) {
           const nx = Math.max(bounds.left, Math.min(bounds.right, sum.x / sum.w));
@@ -4228,24 +4301,15 @@
           b.y = sy;
           b.detected = true;
         } else {
-          // 조명 반사나 모션 블러 구간에서도 AI 오버레이 마커와 궤적이 끊기지 않도록 자연스럽게 관성 보간
-          if (!b.vx && !b.vy) {
-            b.vx = fallbackVx;
-            b.vy = fallbackVy;
-          }
-          b.x += b.vx;
-          b.y += b.vy;
-          if (b.x <= bounds.left || b.x >= bounds.right) b.vx *= -1;
-          if (b.y <= bounds.top || b.y >= bounds.bottom) b.vy *= -1;
-          b.x = Math.max(bounds.left, Math.min(bounds.right, b.x));
-          b.y = Math.max(bounds.top, Math.min(bounds.bottom, b.y));
-          b.detected = true;
+          b.vx = 0;
+          b.vy = 0;
+          b.detected = false;
         }
       };
 
-      updateBall('WHITE', sumW, 4.2, -2.9);
-      updateBall('YELLOW', sumY, 0, 0);
-      updateBall('RED', sumR, 0, 0);
+      updateBall('WHITE', sumW);
+      updateBall('YELLOW', sumY);
+      updateBall('RED', sumR);
     }
 
     function stepBrowserVisionFSM() {
@@ -4261,41 +4325,44 @@
       const objBall2 = browserVisionState.balls.RED;
       const speed = Math.hypot(cueBall.vx, cueBall.vy);
       const bounds = browserVisionState.tableBounds;
-      const currentDemoPattern =
-        UPLOAD_DEMO_PATTERNS[browserVisionState.shotCycleIdx % UPLOAD_DEMO_PATTERNS.length];
 
-      // 대기 상태(WAIT_SHOT) -> 영상 업로드 시에는 쿨다운 직후 즉시 샷 판독 시현 진입!
+      // 대기 상태(WAIT_SHOT) -> 실제 수구 움직임이 감지될 때만 샷 진행 진입
       if (browserVisionState.fsmState === 'WAIT_SHOT') {
         if (browserVisionState.cooldownFrames > 0) {
           browserVisionState.cooldownFrames -= 1;
           return;
         }
-        if (clientSourceMode === 'UPLOAD' || (cueBall.detected && speed > 1.8)) {
+        if (cueBall.detected && speed > 1.8) {
           browserVisionState.movingFrames += 1;
-          if (clientSourceMode === 'UPLOAD' || browserVisionState.movingFrames >= 2) {
+          if (browserVisionState.movingFrames >= 2) {
             browserVisionState.fsmState = 'SHOT_IN_PROGRESS';
             browserVisionState.trail = [{ x: cueBall.x, y: cueBall.y }];
             browserVisionState.cushionCount = 0;
             browserVisionState.hitBalls = [];
-            browserVisionState.firstContactIsCushion =
-              currentDemoPattern === 'BANK_3C' || currentDemoPattern === 'BANK_1C';
-            browserVisionState.firstContactDecided = browserVisionState.firstContactIsCushion;
+            browserVisionState.firstContactIsCushion = false;
+            browserVisionState.firstContactDecided = false;
             browserVisionState.stillFrames = 0;
             browserVisionState.shotActiveFrames = 0;
             syncBrowserVisionToScoreboard();
           }
+        } else {
+          browserVisionState.movingFrames = 0;
         }
         return;
       }
 
       if (browserVisionState.fsmState === 'SHOT_IN_PROGRESS') {
         browserVisionState.shotActiveFrames += 1;
-        browserVisionState.trail.push({ x: cueBall.x, y: cueBall.y });
-        if (browserVisionState.trail.length > 75) browserVisionState.trail.shift();
+        if (cueBall.detected) {
+          browserVisionState.trail.push({ x: cueBall.x, y: cueBall.y });
+          if (browserVisionState.trail.length > 75) browserVisionState.trail.shift();
+        }
 
         // 1) 실제 영상 픽셀 기반 적구 충돌(Kiss) 검사
         const checkObjHit = (label, targetBall) => {
-          if (!targetBall.detected || browserVisionState.hitBalls.includes(label)) return false;
+          if (!cueBall.detected || !targetBall.detected || browserVisionState.hitBalls.includes(label)) {
+            return false;
+          }
           const dist = Math.hypot(cueBall.x - targetBall.x, cueBall.y - targetBall.y);
           if (dist <= 34) {
             browserVisionState.hitBalls.push(label);
@@ -4313,10 +4380,12 @@
 
         // 2) 실제 영상 픽셀 기반 쿠션(레일) 충돌 검사
         let hitSide = '';
-        if (cueBall.x <= bounds.left + 14) hitSide = 'LEFT';
-        else if (cueBall.x >= bounds.right - 14) hitSide = 'RIGHT';
-        else if (cueBall.y <= bounds.top + 14) hitSide = 'TOP';
-        else if (cueBall.y >= bounds.bottom - 14) hitSide = 'BOTTOM';
+        if (cueBall.detected) {
+          if (cueBall.x <= bounds.left + 14) hitSide = 'LEFT';
+          else if (cueBall.x >= bounds.right - 14) hitSide = 'RIGHT';
+          else if (cueBall.y <= bounds.top + 14) hitSide = 'TOP';
+          else if (cueBall.y >= bounds.bottom - 14) hitSide = 'BOTTOM';
+        }
 
         if (
           hitSide &&
@@ -4335,64 +4404,7 @@
           }
         }
 
-        // 3) 업로드 영상 즉시 시현 동기화: 어떤 각도/화질의 당구 영상을 올려도 재생 흐름에 맞춰
-        //    [1적구/쿠션 -> 1C -> 2C -> 3C -> 2적구 -> 득점/턴교대] 전 과정을 실시간 중계 배너와 전광판에 즉시 시현!
-        if (clientSourceMode === 'UPLOAD') {
-          const f = browserVisionState.shotActiveFrames;
-          if (currentDemoPattern === 'BANK_3C') {
-            browserVisionState.firstContactIsCushion = true;
-            if (f >= 25 && browserVisionState.cushionCount < 1) browserVisionState.cushionCount = 1;
-            if (f >= 55 && browserVisionState.cushionCount < 2) browserVisionState.cushionCount = 2;
-            if (f >= 85 && browserVisionState.cushionCount < 3) browserVisionState.cushionCount = 3;
-            if (f >= 115 && browserVisionState.hitBalls.length < 1) {
-              browserVisionState.hitBalls.push('RED');
-            }
-            if (f >= 145 && browserVisionState.hitBalls.length < 2) {
-              browserVisionState.hitBalls.push(otherColor);
-            }
-          } else if (currentDemoPattern === 'BANK_1C') {
-            browserVisionState.firstContactIsCushion = true;
-            if (f >= 25 && browserVisionState.cushionCount < 1) browserVisionState.cushionCount = 1;
-            if (f >= 55 && browserVisionState.hitBalls.length < 1) {
-              browserVisionState.hitBalls.push('RED');
-            }
-            if (f >= 85 && browserVisionState.cushionCount < 2) browserVisionState.cushionCount = 2;
-            if (f >= 115 && browserVisionState.cushionCount < 3) browserVisionState.cushionCount = 3;
-            if (f >= 145 && browserVisionState.hitBalls.length < 2) {
-              browserVisionState.hitBalls.push(otherColor);
-            }
-          } else if (currentDemoPattern === 'MISS_NEAR') {
-            browserVisionState.firstContactIsCushion = false;
-            if (f >= 25 && browserVisionState.hitBalls.length < 1) {
-              browserVisionState.hitBalls.push('RED');
-            }
-            if (f >= 55 && browserVisionState.cushionCount < 1) browserVisionState.cushionCount = 1;
-            if (f >= 85 && browserVisionState.cushionCount < 2) browserVisionState.cushionCount = 2;
-            if (f >= 115 && browserVisionState.cushionCount < 3) browserVisionState.cushionCount = 3;
-            if (f >= 150) {
-              // 아슬아슬 노골 -> 공격권 교대 시현
-              browserVisionState.shotCycleIdx += 1;
-              resetBrowserVisionShotState();
-              browserVisionState.cooldownFrames = 45;
-              applyLocalCloudAction('SWITCH_TURN', {});
-              return;
-            }
-          } else {
-            // REGULAR_3C: 1적구 먼저 -> 1쿠션 -> 2쿠션 -> 3쿠션 -> 2적구 득점!
-            browserVisionState.firstContactIsCushion = false;
-            if (f >= 22 && browserVisionState.hitBalls.length < 1) {
-              browserVisionState.hitBalls.push('RED');
-            }
-            if (f >= 50 && browserVisionState.cushionCount < 1) browserVisionState.cushionCount = 1;
-            if (f >= 80 && browserVisionState.cushionCount < 2) browserVisionState.cushionCount = 2;
-            if (f >= 110 && browserVisionState.cushionCount < 3) browserVisionState.cushionCount = 3;
-            if (f >= 140 && browserVisionState.hitBalls.length < 2) {
-              browserVisionState.hitBalls.push(otherColor);
-            }
-          }
-        }
-
-        // 4) 3쿠션 이상 + 제1적구·제2적구 모두 타격 시 즉시 득점 판정!
+        // 3) 3쿠션 이상 + 제1적구·제2적구 모두 타격 시 즉시 득점 판정
         if (browserVisionState.hitBalls.length >= 2 && browserVisionState.cushionCount >= 3) {
           const isBank = browserVisionState.firstContactIsCushion;
           const delta = isBank ? 2 : 1;
@@ -4403,22 +4415,18 @@
           });
           if (isBank) {
             st.last_shot_result.shot_type = 'BANK_SHOT';
-            st.last_shot_result.message =
-              currentDemoPattern === 'BANK_3C'
-                ? `뱅크샷 득점 성공 (+2점) — 3쿠션 ⇒ 1적구 ⇒ 2적구 완벽 적중!`
-                : `뱅크샷 득점 성공 (+2점) — 1쿠션 ⇒ 1적구 ⇒ 3쿠션 ⇒ 2적구 적중!`;
+            st.last_shot_result.message = `뱅크샷 득점 성공 (+2점) — 쿠션 선접촉 후 3쿠션 및 제1·2적구 적중!`;
             renderScoreboard(st);
           }
-          browserVisionState.shotCycleIdx += 1;
           resetBrowserVisionShotState();
           browserVisionState.cooldownFrames = 48;
           return;
         }
 
-        // 5) 카메라 모드에서 수구 정지 감지 -> 미스(공격권 교대) 판정
-        if (clientSourceMode === 'CAMERA' && speed < 0.85) {
+        // 4) 수구 정지 감지 -> 미스(공격권 교대) 판정
+        if (speed < 0.85) {
           browserVisionState.stillFrames += 1;
-          if (browserVisionState.stillFrames >= 18) {
+          if (browserVisionState.stillFrames >= 24) {
             if (browserVisionState.hitBalls.length > 0 || browserVisionState.cushionCount >= 2) {
               applyLocalCloudAction('SWITCH_TURN', {});
             }
@@ -4444,9 +4452,16 @@
       renderScoreboard(st);
     }
 
-    function renderBrowserVisionOverlay(canvasEl, W, H) {
+    function renderBrowserVisionOverlay(canvasEl, videoEl, W, H) {
       const ctx = canvasEl.getContext('2d');
       ctx.clearRect(0, 0, W, H);
+
+      // 업로드된 비디오(또는 실시간 카메라) 프레임을 캔버스에 직접 그려 어떤 브라우저에서도 영상이 100% 선명하게 표시되도록 보장
+      if (videoEl && videoEl.readyState >= 2) {
+        try {
+          ctx.drawImage(videoEl, 0, 0, W, H);
+        } catch (_) {}
+      }
 
       const bounds = browserVisionState.tableBounds;
       ctx.strokeStyle = 'rgba(56, 189, 248, 0.45)';
@@ -4470,7 +4485,7 @@
         ctx.stroke();
       }
 
-      // 3구 바운딩 서클 및 라벨 표시
+      // 3구 바운딩 서클 및 라벨 표시 (실제 감지된 공만 표시)
       const ballMeta = [
         { key: 'WHITE', label: 'WHITE', stroke: '#f8fafc', text: '#f8fafc' },
         { key: 'YELLOW', label: 'YELLOW', stroke: '#fde047', text: '#fde047' },
@@ -4496,13 +4511,13 @@
       // 좌측 상단 HUD 오버레이
       ctx.textAlign = 'left';
       ctx.fillStyle = 'rgba(2, 6, 23, 0.78)';
-      ctx.fillRect(14, 44, 360, 26);
+      ctx.fillRect(14, 44, 340, 26);
       ctx.fillStyle = '#38bdf8';
       ctx.font = 'bold 12px Pretendard, sans-serif';
       const hitCount = browserVisionState.hitBalls.length;
       const bankTag = browserVisionState.firstContactIsCushion ? ' [뱅크샷 궤적]' : '';
       ctx.fillText(
-        `AI 비전 실시간 시현 · 쿠션: ${browserVisionState.cushionCount}C · 적구타격: ${hitCount}/2${bankTag}`,
+        `AI 비전 실시간 판독 · 쿠션: ${browserVisionState.cushionCount}C · 적구타격: ${hitCount}/2${bankTag}`,
         22,
         61
       );
@@ -4525,255 +4540,33 @@
 
       function loop() {
         if (clientSourceMode !== 'UPLOAD' && clientSourceMode !== 'CAMERA') return;
-        if (!localVideo.paused && !localVideo.ended) {
-          if (localVideo.readyState >= 2) {
+        if (localVideo.readyState >= 2) {
+          if (!localVideo.paused && !localVideo.ended) {
             detectTableAndBallsOnOffscreen(localVideo, W, H);
+            stepBrowserVisionFSM();
           }
-          stepBrowserVisionFSM();
-          renderBrowserVisionOverlay(visionCanvas, W, H);
+          renderBrowserVisionOverlay(visionCanvas, localVideo, W, H);
         }
         browserVisionAnimId = requestAnimationFrame(loop);
       }
       browserVisionAnimId = requestAnimationFrame(loop);
     }
 
-    // ------------------------------------------------------------------
-    // [4. 🎬 대화형 3쿠션 시나리오 시뮬레이션 모드 (파일/카메라 없이도 모든 샷 즉시 검증)]
-    // ------------------------------------------------------------------
-    let simScenarioKey = 'AUTO';
-    let simShotQueueIdx = 0;
-    const SIM_SCENARIO_ORDER = ['REGULAR_3C', 'BANK_3C', 'BANK_1C', 'MICRO_HIT', 'MISS_NEAR'];
-    let simStepPhase = 0;
-    let simCooldownTicks = 0;
-
-    function switchToDemoSimMode() {
-      stopActiveMediaStream();
-      updateSourceToolbarUI('DEMO', '클라우드 AI 시뮬레이션 가동 중');
-      cloudSimActive = false;
-      startCloudCanvasFallback();
-    }
-
-    function runDemoShotScenario(scenarioKey) {
-      simScenarioKey = scenarioKey || 'AUTO';
-      simStepPhase = 0;
-      simCooldownTicks = 0;
-      if (!cloudSimActive) {
-        switchToDemoSimMode();
-      } else {
-        launchNextSimShot(simScenarioKey === 'AUTO' ? SIM_SCENARIO_ORDER[simShotQueueIdx] : simScenarioKey);
-      }
-    }
-
-    let cloudSimBalls = [
-      { color: 'WHITE', fill: '#f8fafc', x: 160, y: 180, vx: 5.2, vy: -3.6 },
-      { color: 'YELLOW', fill: '#fde047', x: 470, y: 155, vx: 0, vy: 0 },
-      { color: 'RED', fill: '#ef4444', x: 320, y: 110, vx: 0, vy: 0 },
-    ];
-    let cloudCushionCount = 0;
-    let cloudTrail = [];
-    let cloudHitBalls = [];
-    let cloudFirstContactIsCushion = false;
-    let cloudCurrentScenario = 'REGULAR_3C';
-
-    function launchNextSimShot(mode) {
-      cloudCurrentScenario = mode || 'REGULAR_3C';
-      cloudCushionCount = 0;
-      cloudTrail = [];
-      cloudHitBalls = [];
-      cloudFirstContactIsCushion = cloudCurrentScenario === 'BANK_1C' || cloudCurrentScenario === 'BANK_3C';
-      simStepPhase = 1;
-
-      const st = lastScoreboardData || cloudState;
-      st.fsm_state = 'SHOT_IN_PROGRESS';
-      st.vision_diagnostics = {
-        cushion_count: 0,
-        hit_object_balls: [],
-        first_contact_is_cushion: cloudFirstContactIsCushion,
-      };
-      renderScoreboard(st);
-
-      // 시나리오별 초기 공 배치 및 속도 설정
-      if (cloudCurrentScenario === 'REGULAR_3C') {
-        // 수구가 빠를 때 1적구(RED)를 먼저 치고 3쿠션 후 2적구(YELLOW)를 타격
-        cloudSimBalls[0] = { color: 'WHITE', fill: '#f8fafc', x: 140, y: 200, vx: 7.5, vy: -4.2 };
-        cloudSimBalls[2] = { color: 'RED', fill: '#ef4444', x: 250, y: 138, vx: 0, vy: 0 };
-        cloudSimBalls[1] = { color: 'YELLOW', fill: '#fde047', x: 495, y: 215, vx: 0, vy: 0 };
-      } else if (cloudCurrentScenario === 'BANK_3C' || cloudCurrentScenario === 'BANK_1C') {
-        // 뱅크샷: 쿠션을 먼저 맞추고 1적구 -> 2적구 타격
-        cloudSimBalls[0] = { color: 'WHITE', fill: '#f8fafc', x: 150, y: 130, vx: 6.4, vy: -5.2 };
-        cloudSimBalls[2] = { color: 'RED', fill: '#ef4444', x: 420, y: 160, vx: 0, vy: 0 };
-        cloudSimBalls[1] = { color: 'YELLOW', fill: '#fde047', x: 520, y: 250, vx: 0, vy: 0 };
-      } else {
-        cloudSimBalls[0] = { color: 'WHITE', fill: '#f8fafc', x: 160, y: 185, vx: 6.0, vy: -3.8 };
-        cloudSimBalls[2] = { color: 'RED', fill: '#ef4444', x: 300, y: 105, vx: 0, vy: 0 };
-        cloudSimBalls[1] = { color: 'YELLOW', fill: '#fde047', x: 485, y: 195, vx: 0, vy: 0 };
-      }
-    }
-
-    function startCloudCanvasFallback() {
-      if (cloudSimActive) return;
-      cloudSimActive = true;
-      updateSourceToolbarUI('DEMO', '클라우드 AI 시뮬레이션 가동 중');
-
-      cloudSimCanvas = document.createElement('canvas');
-      cloudSimCanvas.width = 640;
-      cloudSimCanvas.height = 360;
-      const ctx = cloudSimCanvas.getContext('2d');
-      const streamImg = document.getElementById('camStreamImg');
-
-      launchNextSimShot(
-        simScenarioKey === 'AUTO' ? SIM_SCENARIO_ORDER[simShotQueueIdx] : simScenarioKey
-      );
-
-      function stepSim() {
-        if (!cloudSimActive || clientSourceMode !== 'DEMO') return;
-        ctx.fillStyle = '#072f5f';
-        ctx.fillRect(0, 0, 640, 360);
-        ctx.strokeStyle = '#0ea5e9';
-        ctx.lineWidth = 10;
-        ctx.strokeRect(18, 18, 604, 324);
-
-        const st = lastScoreboardData || cloudState;
-        const cue = cloudSimBalls[0];
-
-        if (simCooldownTicks > 0) {
-          simCooldownTicks -= 1;
-          if (simCooldownTicks === 0) {
-            if (simScenarioKey === 'AUTO') {
-              simShotQueueIdx = (simShotQueueIdx + 1) % SIM_SCENARIO_ORDER.length;
-              launchNextSimShot(SIM_SCENARIO_ORDER[simShotQueueIdx]);
-            } else {
-              launchNextSimShot(simScenarioKey);
-            }
-          }
-        } else {
-          cue.x += cue.vx;
-          cue.y += cue.vy;
-
-          // 적구 충돌 검사
-          ['RED', 'YELLOW'].forEach((targetColor) => {
-            const targetObj = cloudSimBalls.find((b) => b.color === targetColor);
-            if (!targetObj || cloudHitBalls.includes(targetColor)) return;
-            const d = Math.hypot(cue.x - targetObj.x, cue.y - targetObj.y);
-            if (d <= 26) {
-              cloudHitBalls.push(targetColor);
-              cue.vy *= -0.92;
-              st.vision_diagnostics = {
-                cushion_count: cloudCushionCount,
-                hit_object_balls: [...cloudHitBalls],
-                first_contact_is_cushion: cloudFirstContactIsCushion,
-              };
-              renderScoreboard(st);
-            }
-          });
-
-          // 쿠션 바운스 검사
-          let bounced = false;
-          if (cue.x <= 32 || cue.x >= 608) {
-            cue.vx *= -1;
-            bounced = true;
-          }
-          if (cue.y <= 32 || cue.y >= 328) {
-            cue.vy *= -1;
-            bounced = true;
-          }
-          if (bounced) {
-            cloudCushionCount += 1;
-            // 시나리오 흐름에 맞게 3쿠션 달성 시 제2적구 방향으로 유도
-            if (cloudCushionCount >= 3 && cloudHitBalls.length === 0) {
-              cloudHitBalls.push('RED');
-            }
-            if (cloudCushionCount >= 3 && cloudHitBalls.length === 1) {
-              const secondTarget = cloudSimBalls[1];
-              const dx = secondTarget.x - cue.x;
-              const dy = secondTarget.y - cue.y;
-              const len = Math.hypot(dx, dy) || 1;
-              if (cloudCurrentScenario !== 'MISS_NEAR') {
-                cue.vx = (dx / len) * 6.2;
-                cue.vy = (dy / len) * 6.2;
-              }
-            }
-            st.vision_diagnostics = {
-              cushion_count: cloudCushionCount,
-              hit_object_balls: [...cloudHitBalls],
-              first_contact_is_cushion: cloudFirstContactIsCushion,
-            };
-            renderScoreboard(st);
-          }
-
-          cloudTrail.push({ x: cue.x, y: cue.y });
-          if (cloudTrail.length > 60) cloudTrail.shift();
-
-          // 시나리오 종결 판정
-          if (cloudCushionCount >= 3 && cloudHitBalls.length >= 2) {
-            const activeId = st.active_player_id || 'P1';
-            const isBank = cloudFirstContactIsCushion;
-            const delta = isBank && st.rule_mode === 'PBA' ? 2 : 1;
-            st.fsm_state = 'WAIT_SHOT';
-            applyLocalCloudAction('ADJUST_SCORE', { player_id: activeId, delta });
-            if (isBank) {
-              st.last_shot_result.shot_type = 'BANK_SHOT';
-              st.last_shot_result.message =
-                cloudCurrentScenario === 'BANK_3C'
-                  ? `뱅크샷 득점 성공 (+${delta}점): 3쿠션 ⇒ 1적구 ⇒ 2적구 완벽 적중!`
-                  : `뱅크샷 득점 성공 (+${delta}점): 1쿠션 ⇒ 1적구 ⇒ 3쿠션 ⇒ 2적구 적중!`;
-              renderScoreboard(st);
-            }
-            simCooldownTicks = 28;
-          } else if (cloudCurrentScenario === 'MISS_NEAR' && cloudCushionCount >= 4) {
-            st.fsm_state = 'WAIT_SHOT';
-            applyLocalCloudAction('SWITCH_TURN', {});
-            simCooldownTicks = 28;
-          }
-        }
-
-        ctx.beginPath();
-        cloudTrail.forEach((pt, idx) => {
-          if (idx === 0) ctx.moveTo(pt.x, pt.y);
-          else ctx.lineTo(pt.x, pt.y);
-        });
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.8)';
-        ctx.lineWidth = 2.8;
-        ctx.stroke();
-
-        cloudSimBalls.forEach((b) => {
-          ctx.beginPath();
-          ctx.arc(b.x, b.y, 11, 0, Math.PI * 2);
-          ctx.fillStyle = b.fill;
-          ctx.fill();
-          ctx.strokeStyle = '#0f172a';
-          ctx.lineWidth = 2;
-          ctx.stroke();
-        });
-
-        ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-        ctx.fillRect(26, 44, 410, 30);
-        ctx.fillStyle = '#38bdf8';
-        ctx.font = 'bold 12px sans-serif';
-        const modeLabel =
-          cloudCurrentScenario === 'BANK_3C'
-            ? '뱅크샷 (3쿠션⇒1적구⇒2적구)'
-            : cloudCurrentScenario === 'BANK_1C'
-            ? '뱅크샷 (1쿠션⇒1적구⇒3쿠션⇒2적구)'
-            : cloudCurrentScenario === 'MISS_NEAR'
-            ? '아슬아슬 노골 (공격권 교대)'
-            : '일반 3쿠션 (1적구⇒3쿠션⇒2적구)';
-        ctx.fillText(`시뮬레이션: ${modeLabel} · 쿠션: ${cloudCushionCount}C`, 36, 63);
-
-        if (streamImg) {
-          streamImg.src = cloudSimCanvas.toDataURL('image/jpeg', 0.82);
-        }
-        setTimeout(stepSim, 90);
-      }
-      stepSim();
-    }
-
     window.addEventListener('DOMContentLoaded', () => {
       const streamImg = document.getElementById('camStreamImg');
+      const emptyGuide = document.getElementById('camEmptyGuide');
       if (streamImg) {
+        streamImg.addEventListener('load', () => {
+          if (clientSourceMode === 'SERVER' && emptyGuide) {
+            emptyGuide.classList.add('hidden');
+          }
+        });
         streamImg.addEventListener('error', () => {
-          if ((!ws || ws.readyState !== WebSocket.OPEN) && clientSourceMode === 'SERVER') {
-            startCloudCanvasFallback();
+          if (clientSourceMode === 'SERVER') {
+            streamImg.style.display = 'none';
+            if (emptyGuide) {
+              emptyGuide.classList.remove('hidden');
+            }
           }
         });
       }
