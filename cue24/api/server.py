@@ -37,6 +37,7 @@ from cue24.core.table_calibrator import TableCalibrator
 from cue24.core.var_referee import VARReferee
 from cue24.mcp.billiard_physics_mcp import billiard_mcp_server, physics_ai_engine
 from cue24.services.match_manager import MatchManager, MatchState
+from cue24.services.multi_table_hub import MultiTableEngineHub, TableEngineContext
 from three_cushion_vision.billiard_nanogpt import (
     OcclusionTrajectoryRestorer,
     get_or_train_billiard_nanogpt,
@@ -2461,6 +2462,16 @@ match_manager = MatchManager()
 stream_reader = LiveStreamReader(
     match_manager=match_manager, ws_manager=ws_manager
 )
+table_hub = MultiTableEngineHub(
+    ws_factory=ConnectionManager,
+    reader_factory=lambda mm, wm: LiveStreamReader(match_manager=mm, ws_manager=wm),
+)
+table_hub.register_primary_table(
+    ws_manager=ws_manager,
+    match_manager=match_manager,
+    stream_reader=stream_reader,
+# (closed by existing parenthesis on next line)
+)
 
 
 @asynccontextmanager
@@ -2517,14 +2528,28 @@ async def serve_index() -> Any:
     )
 
 
+@app.get("/api/tables")
+async def list_all_tables() -> Dict[str, Any]:
+    """단일 중앙 코어 엔진이 관제 중인 전체 당구대(TABLE_1 ~ TABLE_4+) 실시간 현황 목록을 반환합니다."""
+    return {
+        "engine": "CUE24-Shared-Single-Core-Engine",
+        "shared_nanogpt_loaded": LiveStreamReader._CACHED_NANOGPT_MODEL is not None,
+        "tables": table_hub.list_tables_summary(min_tables=4),
+    }
+
+
 @app.get("/api/match/state")
-async def get_match_state() -> Dict[str, Any]:
+async def get_match_state(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager = t_ctx.match_manager
     """현재 스코어보드 전체 상태를 조회하는 REST 엔드포인트"""
     return match_manager.get_match_payload()
 
 
 @app.post("/api/match/reset")
-async def reset_match_state() -> Dict[str, Any]:
+async def reset_match_state(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    stream_reader, ws_manager = t_ctx.stream_reader, t_ctx.ws_manager
     """경기를 초기화하고 즉시 3구 색상 잠금 및 실시간 득점 시스템을 가동하여 모든 태블릿 점수판에 브로드캐스트합니다."""
     payload = stream_reader.reset_match_and_vision()
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2532,7 +2557,9 @@ async def reset_match_state() -> Dict[str, Any]:
 
 
 @app.post("/api/match/activate-vision")
-async def activate_vision_now() -> Dict[str, Any]:
+async def activate_vision_now(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    stream_reader, ws_manager = t_ctx.stream_reader, t_ctx.ws_manager
     """화면 리플레시(새로고침) 시 즉시 3구 색상을 잠그고 실시간 득점 시스템 및 샷 클락을 가동합니다."""
     payload = stream_reader.sync_vision_and_lock_balls_now(seek_to_active_shot=True)
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2540,7 +2567,9 @@ async def activate_vision_now() -> Dict[str, Any]:
 
 
 @app.post("/api/match/timeout")
-async def use_match_timeout() -> Dict[str, Any]:
+async def use_match_timeout(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """현재 공격 선수의 타임아웃을 사용하여 타이머를 +40초 연장합니다."""
     payload = match_manager.use_timeout()
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2548,7 +2577,9 @@ async def use_match_timeout() -> Dict[str, Any]:
 
 
 @app.post("/api/match/rule-mode")
-async def change_rule_mode(req: RuleModeRequest) -> Dict[str, Any]:
+async def change_rule_mode(req: RuleModeRequest, table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """경기 룰 모드를 STANDARD(일반 1점) 또는 PBA(뱅크샷 2점)로 전환합니다."""
     payload = match_manager.set_rule_mode(req.rule_mode)
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2556,7 +2587,9 @@ async def change_rule_mode(req: RuleModeRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/match/adjust-score")
-async def adjust_player_score(req: AdjustScoreRequest) -> Dict[str, Any]:
+async def adjust_player_score(req: AdjustScoreRequest, table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """현장 수동 점수 가감(+1 / -1)을 반영하고 브로드캐스트합니다."""
     payload = match_manager.adjust_score(req.player_id, req.delta)
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2564,7 +2597,9 @@ async def adjust_player_score(req: AdjustScoreRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/match/player-name")
-async def update_player_name(req: PlayerNameRequest) -> Dict[str, Any]:
+async def update_player_name(req: PlayerNameRequest, table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """1번 선수(P1) 또는 2번 선수(P2)의 이름(및 핸디)을 변경하고 모든 태블릿에 브로드캐스트합니다."""
     payload = match_manager.set_player_name(req.player_id, req.name, req.handicap)
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2572,7 +2607,9 @@ async def update_player_name(req: PlayerNameRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/match/swap-player-names")
-async def swap_player_names_only_endpoint() -> Dict[str, Any]:
+async def swap_player_names_only_endpoint(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """[선수변경] 좌우 당구공 색상(흰공/노란공) 위치는 그대로 두고 좌우 선수의 이름(및 핸디)만 맞바꿉니다."""
     payload = match_manager.swap_player_names_only()
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2580,7 +2617,9 @@ async def swap_player_names_only_endpoint() -> Dict[str, Any]:
 
 
 @app.post("/api/match/swap-seats-full")
-async def swap_seats_and_balls_endpoint() -> Dict[str, Any]:
+async def swap_seats_and_balls_endpoint(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """[자리바꿈] 좌우 선수의 이름과 당구공 색깔(흰공/노란공 및 해당 진영의 점수·기록 상태)이 함께 통째로 좌우 위치가 바뀌도록 스왑합니다."""
     payload = match_manager.swap_seats_with_balls()
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2588,7 +2627,9 @@ async def swap_seats_and_balls_endpoint() -> Dict[str, Any]:
 
 
 @app.post("/api/match/pause")
-async def toggle_match_pause_endpoint() -> Dict[str, Any]:
+async def toggle_match_pause_endpoint(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """[일시정지] 경기 및 샷 클락 타이머 일시정지/재개 상태를 토글합니다."""
     payload = match_manager.toggle_pause_match()
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2596,7 +2637,9 @@ async def toggle_match_pause_endpoint() -> Dict[str, Any]:
 
 
 @app.post("/api/match/end")
-async def end_match_endpoint() -> Dict[str, Any]:
+async def end_match_endpoint(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """[경기종료] 현재 경기를 종료 처리하고 결과를 브로드캐스트합니다."""
     payload = match_manager.end_match()
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2604,7 +2647,9 @@ async def end_match_endpoint() -> Dict[str, Any]:
 
 
 @app.post("/api/match/swap-players")
-async def swap_players_seat_endpoint() -> Dict[str, Any]:
+async def swap_players_seat_endpoint(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """선공(P1=흰공)/후공(P2=노란공) 수구 색상은 고정한 채 1번 선수와 2번 선수의 자리를 맞바꿉니다."""
     payload = match_manager.swap_player_seats()
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2612,7 +2657,9 @@ async def swap_players_seat_endpoint() -> Dict[str, Any]:
 
 
 @app.post("/api/match/swap-cues")
-async def swap_player_cue_balls() -> Dict[str, Any]:
+async def swap_player_cue_balls(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """P1과 P2의 수구 색상(WHITE <-> YELLOW)을 맞바꿉니다."""
     payload = match_manager.swap_cue_balls()
     await ws_manager.broadcast_event("SCORE_UPDATED", payload)
@@ -2620,13 +2667,15 @@ async def swap_player_cue_balls() -> Dict[str, Any]:
 
 
 @app.get("/api/video/live-frame")
-async def get_single_live_frame() -> Response:
+async def get_single_live_frame(table_id: str = "TABLE_1") -> Response:
+    stream_reader = table_hub.get_table(table_id).stream_reader
     """실시간 라이브캠(L-billiard.mp4 원본 해상도) 단일 JPEG 프레임을 반환합니다."""
     jpg_bytes = stream_reader.read_live_frame_jpeg()
     return Response(content=jpg_bytes, media_type="image/jpeg")
 
 
-async def _mjpeg_live_generator() -> AsyncGenerator[bytes, None]:
+async def _mjpeg_live_generator(table_id: str = "TABLE_1") -> AsyncGenerator[bytes, None]:
+    stream_reader = table_hub.get_table(table_id).stream_reader
     """
     실시간 카메라 또는 테스트 녹화 영상(L-billiard.mp4 원본 1920x1080)을
     절대 시계(Wall-Clock, time.perf_counter) 기준으로 처리 시간을 자동 보정하여
@@ -2661,7 +2710,15 @@ async def _mjpeg_live_generator() -> AsyncGenerator[bytes, None]:
 
 
 @app.get("/api/video/live")
-async def stream_live_video() -> StreamingResponse:
+async def stream_live_video(table_id: str = "TABLE_1") -> StreamingResponse:
+    """보드 중앙 상단 모니터용 테이블별 실시간 1.0배속 MJPEG 라이브캠 스트림 엔드포인트"""
+    return StreamingResponse(
+        _mjpeg_live_generator(table_id=table_id),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+async def _unused_stream_live_video_placeholder() -> StreamingResponse:
     """보드 중앙 상단 모니터용 실시간 1.0배속 MJPEG 라이브캠 스트림 엔드포인트"""
     return StreamingResponse(
         _mjpeg_live_generator(),
@@ -2669,7 +2726,8 @@ async def stream_live_video() -> StreamingResponse:
     )
 
 
-async def _mjpeg_replay_generator(speed: float = 1.0) -> AsyncGenerator[bytes, None]:
+async def _mjpeg_replay_generator(speed: float = 1.0, table_id: str = "TABLE_1") -> AsyncGenerator[bytes, None]:
+    stream_reader = table_hub.get_table(table_id).stream_reader
     """
     3공 정지 후 확정된 직전 샷 클립(원본 해상도)을 지정된 배속(1.0x / 0.5x / 0.25x)으로 **단 1회만** 재생하며,
     1회 재생 완료 시(또는 도중 다음 샷 출발 시) 즉시 LIVE 화면 및 실시간 득점 판독으로 자동 복귀합니다.
@@ -2723,7 +2781,15 @@ async def _mjpeg_replay_generator(speed: float = 1.0) -> AsyncGenerator[bytes, N
 
 
 @app.get("/api/video/replay")
-async def stream_replay_video(speed: float = 1.0) -> StreamingResponse:
+async def stream_replay_video(speed: float = 1.0, table_id: str = "TABLE_1") -> StreamingResponse:
+    """3공 완전 정지 시 직전 샷을 딱 1번만 보여주는 테이블별 MJPEG 리플레이 엔드포인트"""
+    return StreamingResponse(
+        _mjpeg_replay_generator(speed=speed, table_id=table_id),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+async def _unused_stream_replay_video_placeholder(speed: float = 1.0) -> StreamingResponse:
     """3공 완전 정지 시 직전 샷을 딱 1번만 보여주는 MJPEG 리플레이 엔드포인트"""
     return StreamingResponse(
         _mjpeg_replay_generator(speed=speed),
@@ -2732,7 +2798,8 @@ async def stream_replay_video(speed: float = 1.0) -> StreamingResponse:
 
 
 @app.get("/api/video/replay-info")
-async def get_replay_info() -> Dict[str, Any]:
+async def get_replay_info(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    stream_reader = table_hub.get_table(table_id).stream_reader
     """현재 저장된 직전 샷 리플레이 클립 메타데이터 및 원본 비디오 소스 정보를 반환합니다."""
     meta = stream_reader.replay_buffer.get_last_shot_meta()
     meta["video_source"] = stream_reader.video_path
@@ -2749,7 +2816,9 @@ class SwitchVideoSourceRequest(BaseModel):
 
 
 @app.post("/api/video/switch-source")
-async def switch_video_source_endpoint(req: SwitchVideoSourceRequest) -> Dict[str, Any]:
+async def switch_video_source_endpoint(req: SwitchVideoSourceRequest, table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    stream_reader, ws_manager = t_ctx.stream_reader, t_ctx.ws_manager
     """
     [📁 영상 업로드]에서 선택한 영상을 브라우저 간이 루프가 아닌
     파이썬 본체 비전+물리 엔진(LiveStreamReader + CausalKissSafeFSM)에 직접 연결합니다.
@@ -2761,7 +2830,9 @@ async def switch_video_source_endpoint(req: SwitchVideoSourceRequest) -> Dict[st
 
 
 @app.post("/api/match/simulate-shot")
-async def simulate_shot(req: SimulateShotRequest) -> Dict[str, Any]:
+async def simulate_shot(req: SimulateShotRequest, table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    stream_reader, match_manager, ws_manager = t_ctx.stream_reader, t_ctx.match_manager, t_ctx.ws_manager
     """
     태블릿 화면에서 득점(일반 3C/뱅크샷), 공타(2쿠션),
     VAR 현미경 판독(미세 접촉/더블터치) 및 3공 정지 후 직전 샷 자동 리플레이를
@@ -2924,7 +2995,9 @@ class ReconcileCueBallRequest(BaseModel):
 
 
 @app.post("/api/match/reconcile-cue-ball")
-async def reconcile_cue_ball_endpoint(req: ReconcileCueBallRequest) -> Dict[str, Any]:
+async def reconcile_cue_ball_endpoint(req: ReconcileCueBallRequest, table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """
     선수가 치는 공의 색깔(WHITE=P1, YELLOW=P2)을 감지하여
     직전 미인지 득점(+1점)을 자동 소급 보정하고 현재 공격 선수를 수구 색깔에 맞게 동기화합니다.
@@ -2941,7 +3014,9 @@ async def reconcile_cue_ball_endpoint(req: ReconcileCueBallRequest) -> Dict[str,
 
 
 @app.post("/api/match/switch-turn")
-async def switch_player_turn() -> Dict[str, Any]:
+async def switch_player_turn(table_id: str = "TABLE_1") -> Dict[str, Any]:
+    t_ctx = table_hub.get_table(table_id)
+    match_manager, ws_manager = t_ctx.match_manager, t_ctx.ws_manager
     """선공(P1=흰공)/후공(P2=노란공)의 수구 색상은 절대 바꾸지 않고 공격권(턴)만 교대합니다."""
     match_manager.players["P1"].cue_ball_color = "WHITE"
     match_manager.players["P2"].cue_ball_color = "YELLOW"
@@ -2951,7 +3026,10 @@ async def switch_player_turn() -> Dict[str, Any]:
 
 
 @app.websocket("/ws/scoreboard")
-async def websocket_scoreboard_endpoint(websocket: WebSocket) -> None:
+async def websocket_scoreboard_endpoint(websocket: WebSocket, table_id: str = "TABLE_1") -> None:
+    q_tid = websocket.query_params.get("table_id") or table_id or "TABLE_1"
+    t_ctx = table_hub.get_table(q_tid)
+    ws_manager, match_manager, stream_reader = t_ctx.ws_manager, t_ctx.match_manager, t_ctx.stream_reader
     """
     20인치 태블릿 점수판 전용 실시간 양방향 WebSocket 엔드포인트 (/ws/scoreboard)
     """
@@ -2978,7 +3056,7 @@ async def websocket_scoreboard_endpoint(websocket: WebSocket) -> None:
                 await ws_manager.broadcast_event("SCORE_UPDATED", payload)
             elif action == "SIMULATE_SHOT":
                 scenario_name = str(msg.get("scenario", "REGULAR_3C"))
-                await simulate_shot(SimulateShotRequest(scenario=scenario_name))
+                await simulate_shot(SimulateShotRequest(scenario=scenario_name), table_id=t_ctx.table_id)
             elif action == "USE_TIMEOUT":
                 payload = match_manager.use_timeout()
                 await ws_manager.broadcast_event("SCORE_UPDATED", payload)
