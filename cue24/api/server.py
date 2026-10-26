@@ -130,7 +130,7 @@ class LiveStreamReader:
     MOTION_BLUR_CIRC_TH: float = 0.42
     # 테스트 녹화 영상(J:\내 드라이브\L-billiard.mp4)에서 경기 초기화/화면 리플레시 즉시 3구 색상 잠금 ->
     # 선공(흰공) 5쿠션 즉시 득점 -> 후공(노란공) 3쿠션 즉시 득점 -> 선공(흰공) 5쿠션 뱅크샷 즉시 득점이 이어지는 시작 프레임
-    ACTIVE_SHOT_START_FRAME: int = 7920
+    ACTIVE_SHOT_START_FRAME: int = 0
     _INIT_VIDEO_CACHE: Dict[str, Dict[str, Any]] = {}
     _CACHED_NANOGPT_MODEL: Optional[Any] = None
 
@@ -420,8 +420,8 @@ class LiveStreamReader:
                 cv2.drawContours(cmask, [cnt], -1, 255, -1)
                 sub_masks = [
                     (cmask > 0) & (A_ch >= 142),
-                    (cmask > 0) & (A_ch < 142) & (B_ch >= 140),
-                    (cmask > 0) & (A_ch < 142) & (B_ch < 140) & (L_ch >= 135),
+                    (cmask > 0) & (A_ch < 142) & (B_ch >= 164),
+                    (cmask > 0) & (A_ch < 142) & (B_ch < 164) & (L_ch >= 135),
                 ]
                 for sm in sub_masks:
                     scnts, _ = cv2.findContours(
@@ -498,7 +498,7 @@ class LiveStreamReader:
         red_m = cv2.morphologyEx(red_m, cv2.MORPH_CLOSE, self._morph_open_k5)
 
         yel_m = (
-            (B_ch >= 150) & (A_ch < 146) & (L_ch >= 118) & (S_ch >= 82)
+            (B_ch >= 164) & (A_ch < 146) & (L_ch >= 118) & (S_ch >= 100)
         ).astype(np.uint8) * 255
         if self._channel_core_state["YELLOW"]["pos"] is not None:
             yp = self._channel_core_state["YELLOW"]["pos"]
@@ -508,10 +508,10 @@ class LiveStreamReader:
             y0_y, y1_y = max(0, yy_q - 30), min(355, yy_q + 31)
             if x1_y > x0_y and y1_y > y0_y:
                 local_yel = (
-                    (B_ch[y0_y:y1_y, x0_y:x1_y] >= 138)
+                    (B_ch[y0_y:y1_y, x0_y:x1_y] >= 156)
                     & (A_ch[y0_y:y1_y, x0_y:x1_y] < 146)
                     & (L_ch[y0_y:y1_y, x0_y:x1_y] >= 112)
-                    & (S_ch[y0_y:y1_y, x0_y:x1_y] >= 54)
+                    & (S_ch[y0_y:y1_y, x0_y:x1_y] >= 85)
                 ).astype(np.uint8) * 255
                 yel_m[y0_y:y1_y, x0_y:x1_y] = np.maximum(
                     yel_m[y0_y:y1_y, x0_y:x1_y], local_yel
@@ -523,11 +523,11 @@ class LiveStreamReader:
             cv2.bitwise_or(red_m, yel_m), self._morph_kernel, iterations=1
         )
         whi_m = (
-            (L_ch >= 178)
-            & (S_ch <= 86)
-            & (B_ch >= 112)
-            & (B_ch < 146)
-            & (A_ch < 140)
+            (L_ch >= 170)
+            & (S_ch <= 108)
+            & (B_ch >= 108)
+            & (B_ch < 164)
+            & (A_ch < 142)
             & (colored_excl == 0)
         ).astype(np.uint8) * 255
         whi_m = cv2.morphologyEx(whi_m, cv2.MORPH_OPEN, self._morph_open_k5)
@@ -540,10 +540,10 @@ class LiveStreamReader:
             if x1_w > x0_w and y1_w > y0_w and self.match_manager.fsm_state == MatchState.SHOT_IN_PROGRESS:
                 local_whi = (
                     (L_ch[y0_w:y1_w, x0_w:x1_w] >= 158)
-                    & (S_ch[y0_w:y1_w, x0_w:x1_w] <= 92)
+                    & (S_ch[y0_w:y1_w, x0_w:x1_w] <= 112)
                     & (B_ch[y0_w:y1_w, x0_w:x1_w] >= 104)
-                    & (B_ch[y0_w:y1_w, x0_w:x1_w] < 138)
-                    & (A_ch[y0_w:y1_w, x0_w:x1_w] < 138)
+                    & (B_ch[y0_w:y1_w, x0_w:x1_w] < 164)
+                    & (A_ch[y0_w:y1_w, x0_w:x1_w] < 142)
                     & (colored_excl[y0_w:y1_w, x0_w:x1_w] == 0)
                 ).astype(np.uint8) * 255
                 local_whi = cv2.morphologyEx(local_whi, cv2.MORPH_OPEN, self._morph_kernel)
@@ -881,6 +881,57 @@ class LiveStreamReader:
         self.match_manager.reset_match(full_factory_reset=full_factory_reset)
         return self.sync_vision_and_lock_balls_now(
             seek_to_active_shot=False, rewind_to_start=True
+        )
+
+    def switch_video_source(self, filename_or_path: str) -> Dict[str, Any]:
+        """
+        사용자가 브라우저에서 선택한 녹화 영상 파일명(또는 경로)을 대용량 복사 없이
+        로컬/가상 드라이브(J:\\내 드라이브 등)에서 직접 찾아 OpenCV 본체 엔진에 즉시 마운트합니다.
+        """
+        raw_str = (filename_or_path or "").strip()
+        if not raw_str:
+            return {"mounted": False, "reason": "empty_filename"}
+
+        base_name = Path(raw_str).name
+        search_candidates = [
+            Path(raw_str),
+            Path(r"J:\내 드라이브") / base_name,
+            Path(__file__).resolve().parent.parent.parent / base_name,
+            Path(__file__).resolve().parent.parent / "data" / base_name,
+        ]
+        resolved_path: Optional[Path] = None
+        for cand in search_candidates:
+            try:
+                if cand.exists() and cand.is_file():
+                    resolved_path = cand
+                    break
+            except OSError:
+                continue
+
+        if resolved_path is None:
+            return {"mounted": False, "reason": f"file_not_found: {base_name}"}
+
+        if self._video_cap is not None:
+            try:
+                self._video_cap.release()
+            except Exception:
+                pass
+            self._video_cap = None
+
+        self.camera_index = None
+        self.video_path = str(resolved_path)
+        self._table_calibrated = False
+        self._cached_half_H = None
+        self._cached_quarter_H = None
+        self._init_video_capture(self.video_path)
+        payload = self.reset_match_and_vision(full_factory_reset=False)
+        return dict(
+            mounted=bool(self.is_real_video_loaded),
+            video_source=self.video_path,
+            video_width=self.video_width,
+            video_height=self.video_height,
+            video_fps=self.video_fps,
+            match=payload,
         )
 
     @staticmethod
@@ -2689,6 +2740,24 @@ async def get_replay_info() -> Dict[str, Any]:
     meta["video_width"] = stream_reader.video_width
     meta["video_height"] = stream_reader.video_height
     return meta
+
+
+class SwitchVideoSourceRequest(BaseModel):
+    """브라우저에서 선택한 녹화 영상을 파이썬 본체 엔진으로 즉시 전환하기 위한 요청 스키마"""
+
+    filename: str = Field(default="", description="선택한 동영상 파일명 또는 전체 경로")
+
+
+@app.post("/api/video/switch-source")
+async def switch_video_source_endpoint(req: SwitchVideoSourceRequest) -> Dict[str, Any]:
+    """
+    [📁 영상 업로드]에서 선택한 영상을 브라우저 간이 루프가 아닌
+    파이썬 본체 비전+물리 엔진(LiveStreamReader + CausalKissSafeFSM)에 직접 연결합니다.
+    """
+    res = stream_reader.switch_video_source(req.filename)
+    if res.get("mounted") and "match" in res:
+        await ws_manager.broadcast_event("SCORE_UPDATED", res["match"])
+    return res
 
 
 @app.post("/api/match/simulate-shot")

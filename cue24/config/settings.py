@@ -49,10 +49,10 @@ DEFAULT_SHOT_TIMER: int = 40
 # L: 명도(밝기), A: 초록(-) ~ 빨강(+), B: 파랑(-) ~ 노랑(+)
 # 색상 분류 임계값
 LAB_RED_A_TH: int = 146      # A 채널 값이 146 이상이면 적구(RED)로 판정
-LAB_YELLOW_B_TH: int = 142   # 적구가 아닌 공 중 B 채널 값이 142 이상이면 황구(YELLOW), 미만이면 백구(WHITE)로 판정
+LAB_YELLOW_B_TH: int = 165   # 적구가 아닌 공 중 B 채널 값이 165 이상이면 황구(YELLOW), 미만이면 백구(WHITE/아이보리)로 판정
 
 # 실시간 스코어보드 연동 기본 녹화 영상 경로
-DEFAULT_VIDEO_PATH: str = r"J:\내 드라이브\L-billiard.mp4"
+DEFAULT_VIDEO_PATH: str = r"J:\내 드라이브\99613_31738_261025150244.mp4"
 
 
 class Cue24Settings(BaseModel):
